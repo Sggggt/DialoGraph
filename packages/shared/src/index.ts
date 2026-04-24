@@ -1,0 +1,304 @@
+export type Visibility = "private";
+
+export type SourceType =
+  | "pdf"
+  | "ppt"
+  | "pptx"
+  | "docx"
+  | "markdown"
+  | "text"
+  | "image"
+  | "notebook"
+  | "html"
+  | "unknown";
+
+export type JobState =
+  | "queued"
+  | "parsing"
+  | "chunking"
+  | "embedding"
+  | "extracting_graph"
+  | "processing"
+  | "completed"
+  | "partial_failed"
+  | "failed"
+  | "skipped";
+
+export type AgentRoute =
+  | "direct_answer"
+  | "retrieve_notes"
+  | "retrieve_exercises"
+  | "retrieve_both"
+  | "clarify"
+  | "multi_hop_research";
+
+export type AgentRunState = "queued" | "running" | "needs_clarification" | "completed" | "failed";
+
+export interface SearchFilters {
+  chapter?: string;
+  tags?: string[];
+  difficulty?: string;
+  source_type?: SourceType;
+}
+
+export interface UploadFileResponse {
+  document_id: string;
+  job_id: string;
+  status: JobState;
+}
+
+export interface JobStatusResponse {
+  job_id: string;
+  state: JobState;
+  error?: string | null;
+  document_id?: string | null;
+  source_path?: string | null;
+  batch_id?: string | null;
+  stats?: Record<string, unknown>;
+}
+
+export interface SearchRequest {
+  query: string;
+  course_id?: string | null;
+  filters?: SearchFilters;
+  top_k?: number;
+}
+
+export interface Citation {
+  chunk_id: string;
+  document_id: string;
+  document_title: string;
+  source_path: string;
+  chapter?: string | null;
+  section?: string | null;
+  page_number?: number | null;
+  snippet: string;
+}
+
+export interface SearchResult {
+  chunk_id: string;
+  snippet: string;
+  score: number;
+  citations: Citation[];
+  metadata: Record<string, unknown>;
+  content?: string | null;
+  document_title?: string | null;
+  source_path?: string | null;
+  chapter?: string | null;
+  source_type?: string | null;
+}
+
+export interface SearchResponse {
+  query: string;
+  results: SearchResult[];
+  degraded_mode: boolean;
+}
+
+export interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+export interface QARequest {
+  question: string;
+  session_id?: string | null;
+  course_id?: string | null;
+  filters?: SearchFilters;
+  top_k?: number;
+  history?: ChatMessage[];
+}
+
+export interface QAResponse {
+  run_id?: string | null;
+  session_id?: string | null;
+  answer: string;
+  citations: Citation[];
+  used_chunks: Array<Record<string, unknown>>;
+  route?: AgentRoute | null;
+  trace?: AgentTraceEventPayload[];
+  degraded_mode: boolean;
+}
+
+export interface AgentRequest {
+  question: string;
+  session_id?: string | null;
+  course_id?: string | null;
+  filters?: SearchFilters;
+  top_k?: number;
+  history?: ChatMessage[];
+  stream_trace?: boolean;
+}
+
+export interface AgentTraceEventPayload {
+  id?: string | null;
+  run_id?: string | null;
+  node: string;
+  status: string;
+  input_summary?: string | null;
+  output_summary?: string | null;
+  document_ids: string[];
+  scores: Record<string, unknown>;
+  duration_ms: number;
+  error?: string | null;
+  created_at?: string | null;
+}
+
+export interface AgentResponse {
+  run_id: string;
+  session_id: string;
+  answer: string;
+  citations: Citation[];
+  used_chunks: Array<Record<string, unknown>>;
+  route: AgentRoute;
+  trace: AgentTraceEventPayload[];
+  degraded_mode: boolean;
+}
+
+export interface TaskStatusResponse {
+  run_id: string;
+  state: AgentRunState;
+  current_node?: string | null;
+  retry_count: number;
+  route?: AgentRoute | null;
+  error?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface SessionSummary {
+  id: string;
+  title?: string | null;
+  last_question?: string | null;
+  last_answer?: string | null;
+  transcript: Array<Record<string, unknown>>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SessionMessagesResponse {
+  session_id: string;
+  messages: Array<Record<string, unknown>>;
+}
+
+export interface RelatedConcept {
+  concept_id: string;
+  relation_type: string;
+  target_name: string;
+  confidence?: number | null;
+}
+
+export interface ConceptCard {
+  concept_id: string;
+  name: string;
+  aliases: string[];
+  summary: string;
+  chapter_refs: string[];
+  concept_type: string;
+  importance_score: number;
+  related_concepts: RelatedConcept[];
+}
+
+export interface GraphNode {
+  id: string;
+  name: string;
+  category: string;
+  value?: number;
+  chapter?: string | null;
+  importance_score?: number | null;
+  source_type?: string | null;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  label: string;
+  confidence?: number | null;
+  category?: string | null;
+  evidence_chunk_id?: string | null;
+}
+
+export interface GraphResponse {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  focus_chapter?: string | null;
+}
+
+export interface CourseTreeNode {
+  id: string;
+  title: string;
+  type: "course" | "chapter" | "document" | "concept";
+  children?: CourseTreeNode[];
+}
+
+export interface CourseSummary {
+  id: string;
+  name: string;
+  description?: string | null;
+  source_root: string;
+  document_count: number;
+  concept_count: number;
+  degraded_mode: boolean;
+}
+
+export interface CourseCreateRequest {
+  name: string;
+  description?: string | null;
+}
+
+export interface BatchError {
+  source_path: string;
+  message: string;
+}
+
+export interface IngestionBatchSummary {
+  batch_id: string;
+  state: JobState;
+  trigger_source: string;
+  source_root: string;
+  total_files: number;
+  processed_files: number;
+  success_count: number;
+  failure_count: number;
+  skipped_count: number;
+  coverage_by_source_type: Record<string, number>;
+  errors: BatchError[];
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface BatchStartResponse {
+  batch_id: string;
+  state: JobState;
+}
+
+export interface DashboardSnapshot {
+  course: CourseSummary;
+  tree: CourseTreeNode[];
+  graph: GraphResponse;
+  batch_status?: IngestionBatchSummary | null;
+  ingested_document_count: number;
+  graph_relation_count: number;
+  coverage_by_source_type: Record<string, number>;
+  degraded_mode: boolean;
+}
+
+export interface GraphNodeRelation {
+  relation_id: string;
+  relation_type: string;
+  target_concept_id?: string | null;
+  target_name: string;
+  confidence: number;
+  evidence?: Citation | null;
+}
+
+export interface GraphNodeDetail {
+  concept_id: string;
+  name: string;
+  normalized_name: string;
+  summary: string;
+  aliases: string[];
+  chapter_refs: string[];
+  concept_type: string;
+  importance_score: number;
+  relations: GraphNodeRelation[];
+}

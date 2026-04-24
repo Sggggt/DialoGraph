@@ -1,0 +1,15 @@
+{
+  "name": "course-knowledge-graph",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "packages/shared"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace web",
+    "build:web": "npm run build --workspace web",
+    "lint:web": "npm run lint --workspace web",
+    "typecheck:web": "npm run typecheck --workspace web"
+  }
+}

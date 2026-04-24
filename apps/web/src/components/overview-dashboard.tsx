@@ -1,0 +1,192 @@
+"use client";
+
+import Link from "next/link";
+import { useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { motion } from "framer-motion";
+import { ArrowRight, Orbit, Radar, Sparkles, Zap } from "lucide-react";
+
+import { fetchDashboard } from "@/lib/api";
+import { NetworkCanvas } from "@/components/network-canvas";
+import { ErrorBlock, LoadingBlock } from "@/components/query-state";
+import { useCourseContext } from "@/components/course-context";
+
+export function OverviewDashboard() {
+  const { selectedCourseId } = useCourseContext();
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["dashboard", selectedCourseId],
+    queryFn: () => fetchDashboard(selectedCourseId),
+    enabled: Boolean(selectedCourseId),
+  });
+
+  const stats = useMemo(() => {
+    if (!data) return [];
+    return [
+      { label: "文档原件", value: data.ingested_document_count },
+      { label: "知识概念", value: data.course.concept_count },
+      { label: "图谱关系", value: data.graph_relation_count },
+      { label: "章节数量", value: data.tree.length },
+    ];
+  }, [data]);
+
+  if (isLoading) {
+    return <LoadingBlock rows={4} />;
+  }
+  if (error) {
+    return <ErrorBlock message={(error as Error).message} />;
+  }
+  if (!data) {
+    return null;
+  }
+
+  return (
+    <div className="kg-page grid gap-6 xl:grid-rows-[auto_minmax(0,1fr)]">
+      <section className="grid items-stretch gap-6 xl:grid-cols-[minmax(560px,0.9fr)_minmax(0,1.1fr)]">
+        <motion.div
+          initial={{ opacity: 0, y: 16 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="glass-panel h-full min-w-0 rounded-[30px] p-5 lg:p-6"
+        >
+          <div className="space-y-5">
+            <div className="max-w-4xl space-y-4">
+              <p className="section-kicker">Course Materials / Knowledge Intelligence</p>
+              <h2 className="glow-text text-3xl font-semibold leading-tight text-white lg:text-4xl">课程知识图谱、向量检索与 RAG 联动。</h2>
+              <p className="max-w-3xl text-sm leading-7 text-cyan-50/72">围绕课程原件、章节脉络、概念关系和证据片段展开。新课件导入后自动解析、切块、向量化并更新图谱。</p>
+            </div>
+            <div className="flex flex-wrap gap-3">
+              <Link href="/upload" className="rounded-full border border-cyan-300/40 bg-cyan-300/12 px-4 py-2.5 text-xs uppercase tracking-[0.24em] text-white">
+                Start Ingestion
+              </Link>
+              <Link href="/graph" className="rounded-full border border-white/12 px-4 py-2.5 text-xs uppercase tracking-[0.24em] text-white/72 transition hover:text-white">
+                Open Graph
+              </Link>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              {stats.map((stat) => (
+                <div key={stat.label} className="metric-line rounded-[20px] border border-white/8 bg-white/[0.03] px-4 py-3">
+                  <p className="text-[11px] uppercase tracking-[0.28em] text-white/45">{stat.label}</p>
+                  <p className="mt-1.5 text-2xl font-semibold text-white">{stat.value}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </motion.div>
+
+        <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.08 }} className="glass-panel flex h-full min-w-0 flex-col rounded-[30px] p-3 lg:p-4">
+          <div className="mb-2 flex items-center justify-between">
+            <div>
+              <p className="section-kicker">Live Graph</p>
+              <h3 className="mt-1.5 text-xl font-semibold text-white">概念关系热区</h3>
+            </div>
+            <Orbit className="size-5 text-cyan-200" />
+          </div>
+          <div className="min-h-0 flex-1">
+            <NetworkCanvas graph={data.graph} height={340} />
+          </div>
+        </motion.div>
+      </section>
+
+      <section className="grid min-h-0 gap-6 lg:grid-cols-[0.8fr_1.2fr]">
+        <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.14 }} className="glass-panel kg-scroll-panel rounded-[28px] p-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="section-kicker">Ingestion Status</p>
+              <h3 className="mt-2 text-2xl font-semibold text-white">批次进度</h3>
+            </div>
+            <Zap className="size-5 text-cyan-200" />
+          </div>
+          <div className="mt-6 grid gap-4 sm:grid-cols-2">
+            <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
+              <p className="text-xs uppercase tracking-[0.28em] text-white/45">Latest Batch</p>
+              <p className="mt-3 text-2xl font-semibold text-white">{data.batch_status?.state ?? "idle"}</p>
+              <p className="mt-2 text-sm text-white/55">
+                {data.batch_status
+                  ? `${data.batch_status.processed_files} / ${data.batch_status.total_files} 已处理`
+                  : "尚未启动全量导入"}
+              </p>
+            </div>
+            <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
+              <p className="text-xs uppercase tracking-[0.28em] text-white/45">Embedding Mode</p>
+              <p className="mt-3 text-2xl font-semibold text-white">{data.degraded_mode ? "Fallback" : "DashScope"}</p>
+              <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实 embedding 与 Qwen 图谱抽取已启用"}</p>
+            </div>
+          </div>
+          <div className="mt-6 space-y-3">
+            {Object.entries(data.coverage_by_source_type).map(([type, count]) => (
+              <div key={type} className="space-y-2">
+                <div className="flex items-center justify-between text-sm text-white/68">
+                  <span className="uppercase tracking-[0.2em]">{type}</span>
+                  <span>{count}</span>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-white/6">
+                  <div className="h-full rounded-full bg-[linear-gradient(90deg,#61d9ff,#7b7cff)]" style={{ width: `${Math.min(100, count * 8)}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </motion.div>
+
+        <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }} className="grid min-h-0 gap-6 md:grid-cols-2">
+          <div className="glass-panel kg-scroll-panel rounded-[28px] p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="section-kicker">Course Tree</p>
+                <h3 className="mt-2 text-2xl font-semibold text-white">章节脉络</h3>
+              </div>
+              <Radar className="size-5 text-cyan-200" />
+            </div>
+            <div className="mt-6 space-y-4">
+              {data.tree.slice(0, 6).map((chapter) => (
+                <div key={chapter.id} className="rounded-[22px] border border-white/8 bg-white/[0.03] px-5 py-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="text-base font-medium text-white">{chapter.title}</p>
+                    <span className="text-xs uppercase tracking-[0.25em] text-white/45">{chapter.children?.length ?? 0} docs</span>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {(chapter.children ?? []).slice(0, 4).map((child) => (
+                      <span key={child.id} className="rounded-full border border-white/10 px-3 py-1 text-xs text-cyan-50/74">
+                        {child.title}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="glass-panel kg-scroll-panel rounded-[28px] p-6">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="section-kicker">Action Surface</p>
+                <h3 className="mt-2 text-2xl font-semibold text-white">高频入口</h3>
+              </div>
+              <Sparkles className="size-5 text-cyan-200" />
+            </div>
+            <div className="mt-6 space-y-4">
+              {[
+                { href: "/search", title: "Search Lab", description: "带过滤条件的向量检索与章节联动视图。" },
+                { href: "/qa", title: "Answer Lab", description: "流式回答、证据轨迹和命中片段并行展开。" },
+                { href: "/concepts", title: "Concept Browser", description: "概念列表、关系摘要、章节引用统一浏览。" },
+                { href: "/graph", title: "Graph Stage", description: "全屏关系画布，按章节聚焦图谱热区。" },
+              ].map((entry) => (
+                <Link
+                  key={entry.href}
+                  href={entry.href}
+                  className="group block rounded-[22px] border border-white/8 bg-white/[0.03] px-5 py-4 transition hover:border-cyan-300/35 hover:bg-cyan-300/[0.06]"
+                >
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <p className="text-base font-medium text-white">{entry.title}</p>
+                      <p className="mt-2 text-sm leading-6 text-white/58">{entry.description}</p>
+                    </div>
+                    <ArrowRight className="mt-1 size-4 text-cyan-100/70 transition group-hover:translate-x-1" />
+                  </div>
+                </Link>
+              ))}
+            </div>
+          </div>
+        </motion.div>
+      </section>
+    </div>
+  );
+}

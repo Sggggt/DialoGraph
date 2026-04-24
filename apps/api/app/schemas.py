@@ -1,0 +1,323 @@
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+JobState = Literal[
+    "queued",
+    "parsing",
+    "chunking",
+    "embedding",
+    "extracting_graph",
+    "processing",
+    "completed",
+    "partial_failed",
+    "failed",
+    "skipped",
+]
+SourceType = Literal["pdf", "ppt", "pptx", "docx", "markdown", "text", "image", "notebook", "html", "unknown"]
+AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
+AgentRunState = Literal["queued", "running", "needs_clarification", "completed", "failed"]
+
+
+class SearchFilters(BaseModel):
+    chapter: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    difficulty: str | None = None
+    source_type: SourceType | None = None
+
+
+class UploadFileResponse(BaseModel):
+    document_id: str
+    job_id: str
+    status: JobState
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    state: JobState
+    error: str | None = None
+    document_id: str | None = None
+    source_path: str | None = None
+    batch_id: str | None = None
+    stats: dict = Field(default_factory=dict)
+
+
+class Citation(BaseModel):
+    chunk_id: str
+    document_id: str
+    document_title: str
+    source_path: str
+    chapter: str | None = None
+    section: str | None = None
+    page_number: int | None = None
+    snippet: str
+
+
+class SearchRequest(BaseModel):
+    query: str
+    course_id: str | None = None
+    filters: SearchFilters = Field(default_factory=SearchFilters)
+    top_k: int = 6
+
+
+class SearchResult(BaseModel):
+    chunk_id: str
+    snippet: str
+    score: float
+    citations: list[Citation]
+    metadata: dict
+    content: str | None = None
+    document_title: str | None = None
+    source_path: str | None = None
+    chapter: str | None = None
+    source_type: str | None = None
+
+
+class SearchResponse(BaseModel):
+    query: str
+    results: list[SearchResult]
+    degraded_mode: bool = False
+
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class QARequest(BaseModel):
+    question: str
+    session_id: str | None = None
+    course_id: str | None = None
+    filters: SearchFilters = Field(default_factory=SearchFilters)
+    top_k: int = 6
+    history: list[ChatMessage] = Field(default_factory=list)
+
+
+class QAResponse(BaseModel):
+    run_id: str | None = None
+    session_id: str | None = None
+    answer: str
+    citations: list[Citation]
+    used_chunks: list[dict]
+    route: AgentRoute | None = None
+    trace: list["AgentTraceEventPayload"] = Field(default_factory=list)
+    degraded_mode: bool = False
+
+
+class AgentRequest(BaseModel):
+    question: str
+    session_id: str | None = None
+    course_id: str | None = None
+    filters: SearchFilters = Field(default_factory=SearchFilters)
+    top_k: int = 6
+    history: list[ChatMessage] = Field(default_factory=list)
+    stream_trace: bool = True
+
+
+class AgentTraceEventPayload(BaseModel):
+    id: str | None = None
+    run_id: str | None = None
+    node: str
+    status: str = "completed"
+    input_summary: str | None = None
+    output_summary: str | None = None
+    document_ids: list[str] = Field(default_factory=list)
+    scores: dict = Field(default_factory=dict)
+    duration_ms: int = 0
+    error: str | None = None
+    created_at: datetime | None = None
+
+
+class AgentResponse(BaseModel):
+    run_id: str
+    session_id: str
+    answer: str
+    citations: list[Citation]
+    used_chunks: list[dict]
+    route: AgentRoute
+    trace: list[AgentTraceEventPayload]
+    degraded_mode: bool = False
+
+
+class TaskStatusResponse(BaseModel):
+    run_id: str
+    state: AgentRunState
+    current_node: str | None = None
+    retry_count: int = 0
+    route: AgentRoute | None = None
+    error: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class SessionSummary(BaseModel):
+    id: str
+    title: str | None = None
+    last_question: str | None = None
+    last_answer: str | None = None
+    transcript: list[dict] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class SessionMessagesResponse(BaseModel):
+    session_id: str
+    messages: list[dict] = Field(default_factory=list)
+
+
+class RelatedConcept(BaseModel):
+    concept_id: str
+    relation_type: str
+    target_name: str
+    confidence: float | None = None
+
+
+class ConceptCard(BaseModel):
+    concept_id: str
+    name: str
+    aliases: list[str]
+    summary: str
+    chapter_refs: list[str]
+    concept_type: str = "concept"
+    importance_score: float = 0.0
+    related_concepts: list[RelatedConcept]
+
+
+class GraphNode(BaseModel):
+    id: str
+    name: str
+    category: str
+    value: int | float | None = None
+    chapter: str | None = None
+    importance_score: float | None = None
+    source_type: str | None = None
+
+
+class GraphEdge(BaseModel):
+    source: str
+    target: str
+    label: str
+    confidence: float | None = None
+    category: str | None = None
+    evidence_chunk_id: str | None = None
+
+
+class GraphResponse(BaseModel):
+    nodes: list[GraphNode]
+    edges: list[GraphEdge]
+    focus_chapter: str | None = None
+
+
+class CourseTreeNode(BaseModel):
+    id: str
+    title: str
+    type: Literal["course", "chapter", "document", "concept"]
+    children: list["CourseTreeNode"] = Field(default_factory=list)
+
+
+class CourseSummary(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    source_root: str
+    document_count: int
+    concept_count: int
+    degraded_mode: bool = False
+
+
+class CourseCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+
+
+class IngestionStats(BaseModel):
+    chunks: int = 0
+    concepts: int = 0
+    relations: int = 0
+
+
+class BatchError(BaseModel):
+    source_path: str
+    message: str
+
+
+class IngestionBatchSummary(BaseModel):
+    batch_id: str
+    state: JobState
+    trigger_source: str
+    source_root: str
+    total_files: int
+    processed_files: int
+    success_count: int
+    failure_count: int
+    skipped_count: int
+    coverage_by_source_type: dict[str, int] = Field(default_factory=dict)
+    errors: list[BatchError] = Field(default_factory=list)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class BatchStartResponse(BaseModel):
+    batch_id: str
+    state: JobState
+
+
+class DashboardSnapshot(BaseModel):
+    course: CourseSummary
+    tree: list[CourseTreeNode]
+    graph: GraphResponse
+    batch_status: IngestionBatchSummary | None = None
+    ingested_document_count: int = 0
+    graph_relation_count: int = 0
+    coverage_by_source_type: dict[str, int] = Field(default_factory=dict)
+    degraded_mode: bool = False
+
+
+class ChunkPayload(BaseModel):
+    id: str
+    document_id: str
+    document_title: str
+    source_path: str
+    source_type: str
+    chapter: str | None = None
+    section: str | None = None
+    page_number: int | None = None
+    snippet: str
+    content: str
+    metadata: dict = Field(default_factory=dict)
+
+
+class DocumentSummary(BaseModel):
+    id: str
+    title: str
+    source_path: str
+    source_type: str
+    chapter: str | None = None
+    updated_at: datetime
+
+
+class GraphNodeRelation(BaseModel):
+    relation_id: str
+    relation_type: str
+    target_concept_id: str | None = None
+    target_name: str
+    confidence: float
+    evidence: Citation | None = None
+
+
+class GraphNodeDetail(BaseModel):
+    concept_id: str
+    name: str
+    normalized_name: str
+    summary: str
+    aliases: list[str]
+    chapter_refs: list[str]
+    concept_type: str
+    importance_score: float
+    relations: list[GraphNodeRelation]
+
+
+CourseTreeNode.model_rebuild()
+QAResponse.model_rebuild()

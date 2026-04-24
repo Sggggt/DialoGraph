@@ -1,0 +1,645 @@
+"use client";
+
+import { createPortal } from "react-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { SearchResult, SourceType } from "@course-kg/shared";
+import { AnimatePresence, motion } from "framer-motion";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import {
+  Activity,
+  ArrowUpRight,
+  FileText,
+  Filter,
+  GitBranch,
+  Loader2,
+  Radar,
+  Search,
+  SlidersHorizontal,
+  Sparkles,
+  X,
+} from "lucide-react";
+
+import { ErrorBlock, LoadingBlock } from "@/components/query-state";
+import { MarkdownRenderer } from "@/components/markdown-renderer";
+import { NetworkCanvas } from "@/components/network-canvas";
+import { useCourseContext } from "@/components/course-context";
+import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { fetchChapterGraph, fetchDashboard, searchKnowledge } from "@/lib/api";
+import { cn } from "@/lib/utils";
+import { useLocalStorage } from "@/hooks/use-local-storage";
+
+const sourceOptions: SourceType[] = ["pdf", "notebook", "markdown", "text", "image", "docx", "pptx"];
+
+type HoverPreviewState = {
+  result: SearchResult;
+  top: number;
+  left: number;
+  width: number;
+};
+
+type HoverPreviewTimer = ReturnType<typeof setTimeout> | null;
+
+function scoreValue(result: SearchResult, key: string) {
+  const scores = result.metadata.scores as Record<string, number> | undefined;
+  const value = scores?.[key];
+  return typeof value === "number" ? value.toFixed(3) : "-";
+}
+
+function resultChapter(result: SearchResult) {
+  return result.chapter ?? (result.metadata.chapter as string | undefined) ?? result.citations[0]?.chapter ?? "General";
+}
+
+function resultSourceType(result: SearchResult) {
+  return result.source_type ?? (result.metadata.source_type as string | undefined) ?? "unknown";
+}
+
+function SearchHero({
+  query,
+  setQuery,
+  onSearch,
+  isSearching,
+  hitCount,
+}: {
+  query: string;
+  setQuery: (value: string) => void;
+  onSearch: () => void;
+  isSearching: boolean;
+  hitCount: number;
+}) {
+  return (
+    <section className="relative overflow-hidden rounded-[2rem] px-1 py-2">
+      <div className="pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-cyan-200/50 to-transparent" />
+      <div className="mx-auto flex max-w-5xl flex-col items-center gap-5 text-center">
+        <div className="kg-micro-chip rounded-full px-3 py-2 text-xs uppercase tracking-[0.22em]">
+          <Radar data-icon="inline-start" />
+          Hybrid Retrieval Surface
+        </div>
+        <div className="space-y-3">
+          <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">Search the knowledge signal</h2>
+          <p className="mx-auto max-w-2xl text-sm leading-7 text-cyan-50/58 lg:text-base">
+            Dense vectors, lexical recall, fused ranking, and graph context converge into one exploratory search canvas.
+          </p>
+        </div>
+
+        <div className={cn("kg-glass-line kg-scan-edge relative w-full rounded-[1.7rem] p-2", isSearching && "shadow-[0_0_42px_rgba(86,217,255,0.12)]")}>
+          <div className="flex items-center gap-3 rounded-[1.35rem] bg-black/18 px-4 py-3">
+            <Search className="text-cyan-100/70" />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  onSearch();
+                }
+              }}
+              className="h-12 min-w-0 flex-1 bg-transparent text-lg text-white outline-none placeholder:text-white/28"
+              placeholder="Ask for a concept, theorem, exercise, or relationship..."
+            />
+            <div className="hidden items-center gap-2 md:flex">
+              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{hitCount} hits</span>
+              {isSearching ? (
+                <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">
+                  <span className="tech-dot" />
+                  scanning
+                </span>
+              ) : null}
+            </div>
+            <Button type="button" size="lg" onClick={onSearch} disabled={isSearching || !query.trim()} className="rounded-full">
+              {isSearching ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Sparkles data-icon="inline-start" />}
+              {isSearching ? "Searching" : "Search"}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function SearchFilterBar({
+  chapter,
+  sourceType,
+  onOpenFilters,
+  onClearChapter,
+  onClearSource,
+  degradedMode,
+}: {
+  chapter: string;
+  sourceType: string;
+  onOpenFilters: () => void;
+  onClearChapter: () => void;
+  onClearSource: () => void;
+  degradedMode: boolean;
+}) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <button type="button" onClick={onOpenFilters} className="kg-micro-chip rounded-full px-3 py-2 text-xs uppercase tracking-[0.18em] transition hover:border-cyan-200/30 hover:text-white">
+          <SlidersHorizontal />
+          Filters
+        </button>
+        <button type="button" onClick={onClearChapter} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
+          Chapter: {chapter || "All"}
+          {chapter ? <X /> : null}
+        </button>
+        <button type="button" onClick={onClearSource} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
+          Source: {sourceType || "All"}
+          {sourceType ? <X /> : null}
+        </button>
+      </div>
+      <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
+        <Activity data-icon="inline-start" />
+        {degradedMode ? "Lexical fallback" : "Dense + lexical + RRF"}
+      </div>
+    </div>
+  );
+}
+
+function ResultSkeleton() {
+  return (
+    <div className="flex flex-col gap-3">
+      {[0, 1, 2, 3].map((item) => (
+        <div key={item} className="kg-shimmer rounded-2xl border border-white/7 bg-white/[0.035] p-5">
+          <div className="h-4 w-1/3 rounded-full bg-white/10" />
+          <div className="mt-4 h-3 w-4/5 rounded-full bg-white/8" />
+          <div className="mt-2 h-3 w-3/5 rounded-full bg-white/8" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ResultRow({
+  result,
+  active,
+  index,
+  onHover,
+  onSelect,
+}: {
+  result: SearchResult;
+  active: boolean;
+  index: number;
+  onHover: (result: SearchResult | null, anchor?: HTMLButtonElement | null) => void;
+  onSelect: (result: SearchResult) => void;
+}) {
+  return (
+    <motion.button
+      type="button"
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ delay: index * 0.035 }}
+      onPointerEnter={(event) => onHover(result, event.currentTarget)}
+      onPointerLeave={() => onHover(null)}
+      onFocus={(event) => onHover(result, event.currentTarget)}
+      onBlur={() => onHover(null)}
+      onClick={() => onSelect(result)}
+      className={cn(
+        "group relative w-full overflow-hidden rounded-2xl border px-5 py-4 text-left transition duration-200",
+        active
+          ? "border-cyan-200/36 bg-cyan-300/[0.075] shadow-[0_0_34px_rgba(86,217,255,0.08)]"
+          : "border-white/7 bg-white/[0.025] hover:border-cyan-200/24 hover:bg-white/[0.045]",
+      )}
+    >
+      <div className="absolute inset-y-4 left-0 w-px bg-gradient-to-b from-transparent via-cyan-200/60 to-transparent opacity-0 transition group-hover:opacity-100" />
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium text-white">{result.document_title ?? result.citations[0]?.document_title ?? "Course source"}</span>
+            <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultSourceType(result)}</span>
+            <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultChapter(result)}</span>
+          </div>
+          <MarkdownRenderer content={result.snippet} compact className="mt-3 line-clamp-2 text-white/62" />
+        </div>
+        <div className="flex shrink-0 flex-col items-end gap-2">
+          <span className="font-mono text-sm text-cyan-100">{result.score.toFixed(3)}</span>
+          <ArrowUpRight className="text-white/32 transition group-hover:text-cyan-100" />
+        </div>
+      </div>
+      <div className="mt-4 flex flex-wrap gap-2">
+        {["dense", "lexical", "fused", "grader_overlap"].map((key) => (
+          <span key={key} className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">
+            {key.replace("_overlap", "")} {scoreValue(result, key)}
+          </span>
+        ))}
+      </div>
+    </motion.button>
+  );
+}
+
+function ResultStream({
+  results,
+  activeChunkId,
+  isLoading,
+  onHover,
+  onSelect,
+}: {
+  results: SearchResult[];
+  activeChunkId: string | null;
+  isLoading: boolean;
+  onHover: (result: SearchResult | null, anchor?: HTMLButtonElement | null) => void;
+  onSelect: (result: SearchResult) => void;
+}) {
+  return (
+    <section className="kg-glass-line kg-scroll-shell flex min-h-0 min-w-0 flex-col overflow-hidden rounded-[2rem] p-2">
+      <div className="flex shrink-0 items-center justify-between gap-3 px-3 pb-4 pt-3">
+        <div>
+          <p className="section-kicker">Result Stream</p>
+          <h3 className="mt-1 text-xl font-semibold text-white">Ranked Knowledge Fragments</h3>
+        </div>
+        <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">{results.length} active</span>
+      </div>
+      <div className="kg-scroll-body min-h-0 flex-1 px-3 pb-3">
+        {isLoading ? (
+          <ResultSkeleton />
+        ) : results.length === 0 ? (
+          <div className="kg-glass-line rounded-3xl px-6 py-10 text-center">
+            <div className="mx-auto grid size-14 place-items-center rounded-2xl border border-cyan-200/15 bg-cyan-300/[0.06] text-cyan-100">
+              <Search />
+            </div>
+            <h4 className="mt-5 text-lg font-medium text-white">No retrieval signal yet</h4>
+            <p className="mx-auto mt-2 max-w-md text-sm leading-7 text-white/52">
+              Run a hybrid search to reveal ranked chunks, score channels, and linked graph context.
+            </p>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {results.map((result, index) => (
+              <ResultRow
+                key={result.chunk_id}
+                result={result}
+                index={index}
+                active={activeChunkId === result.chunk_id}
+                onHover={onHover}
+                onSelect={onSelect}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function HoverPreviewOverlay({ preview }: { preview: HoverPreviewState | null }) {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  return createPortal(
+    <AnimatePresence>
+      {preview ? (
+        <div className="pointer-events-none fixed inset-0 z-[120] overflow-hidden">
+          <motion.div
+            key={preview.result.chunk_id}
+            initial={{ opacity: 0, x: -10, y: 14, scale: 0.94 }}
+            animate={{ opacity: 1, x: 0, y: 0, scale: 1 }}
+            exit={{ opacity: 0, x: -8, y: 8, scale: 0.96 }}
+            transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
+            className="kg-glass-line absolute rounded-[1.5rem] p-4 shadow-[0_28px_80px_rgba(0,0,0,0.34)]"
+            style={{ top: preview.top, left: preview.left, width: preview.width }}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs uppercase tracking-[0.22em] text-cyan-100/55">Hover Preview</p>
+              <div className="flex flex-wrap gap-2">
+                <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultChapter(preview.result)}</span>
+                <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultSourceType(preview.result)}</span>
+              </div>
+            </div>
+            <p className="mt-3 text-sm font-medium text-white">
+              {preview.result.document_title ?? preview.result.citations[0]?.document_title ?? "Course source"}
+            </p>
+            <MarkdownRenderer content={preview.result.snippet} compact className="mt-3 line-clamp-4 text-white/76" />
+          </motion.div>
+        </div>
+      ) : null}
+    </AnimatePresence>,
+    document.body,
+  );
+}
+
+function GraphCanvasPanel({
+  selectedLabel,
+  selectedChapter,
+  selectedNodeId,
+  graph,
+  isLoading,
+  error,
+}: {
+  selectedLabel: string | null;
+  selectedChapter: string;
+  selectedNodeId: string | null;
+  graph: Awaited<ReturnType<typeof fetchChapterGraph>> | undefined;
+  isLoading: boolean;
+  error: Error | null;
+}) {
+  return (
+    <section className="kg-glass-line kg-scroll-shell relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-[2rem] bg-[rgba(4,8,22,0.28)]">
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_20%,rgba(86,217,255,0.11),transparent_38%),linear-gradient(rgba(120,180,255,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(120,180,255,0.035)_1px,transparent_1px)] bg-[size:auto,42px_42px,42px_42px]" />
+      <div className="relative z-10 flex items-center justify-between gap-3 px-5 py-4">
+        <div>
+          <p className="section-kicker">Knowledge Canvas</p>
+          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? selectedChapter ?? "Exploratory Graph"}</h3>
+          {selectedLabel && selectedChapter ? <p className="mt-1 text-sm text-white/42">{selectedChapter}</p> : null}
+        </div>
+        <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
+          <GitBranch data-icon="inline-start" />
+          Live graph
+        </span>
+      </div>
+      <div className="relative z-10 flex min-h-0 flex-1 px-2 pb-2">
+        {isLoading ? (
+          <div className="kg-shimmer mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] text-sm text-white/54">
+            Generating graph signal...
+          </div>
+        ) : error ? (
+          <div className="mx-3 flex min-h-0 w-full flex-1 items-stretch">
+            <ErrorBlock message={error.message} />
+          </div>
+        ) : graph ? (
+          <div className="mx-3 flex h-full min-h-0 w-full flex-1">
+            <NetworkCanvas graph={graph} height="100%" selectedNodeId={selectedNodeId} />
+          </div>
+        ) : (
+          <div className="mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] text-sm text-white/54">
+            Search results will focus the graph canvas.
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | null; open: boolean; onOpenChange: (open: boolean) => void }) {
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
+        <SheetHeader className="border-b border-white/8 p-6">
+          <SheetTitle>Result Detail</SheetTitle>
+          <SheetDescription>Chunk evidence, retrieval scores, and source metadata.</SheetDescription>
+        </SheetHeader>
+        {result ? (
+          <div className="custom-scrollbar flex-1 overflow-y-auto p-6">
+            <div className="flex flex-wrap gap-2">
+              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultChapter(result)}</span>
+              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultSourceType(result)}</span>
+              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">score {result.score.toFixed(3)}</span>
+            </div>
+            <h3 className="mt-5 text-2xl font-semibold text-white">{result.document_title ?? result.citations[0]?.document_title ?? "Course source"}</h3>
+            <p className="mt-3 flex items-center gap-2 truncate text-sm text-white/42">
+              <FileText />
+              {result.source_path ?? result.citations[0]?.source_path}
+            </p>
+            <div className="kg-flow-line my-6" />
+            <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-5">
+              <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Chunk Text</p>
+              <MarkdownRenderer content={result.content || result.snippet} className="mt-4 text-white/70" />
+            </div>
+            <div className="mt-5 grid grid-cols-2 gap-3">
+              {["dense", "lexical", "fused", "grader_overlap"].map((key) => (
+                <div key={key} className="rounded-2xl border border-white/8 bg-white/[0.025] p-4">
+                  <p className="text-xs uppercase tracking-[0.2em] text-white/38">{key.replace("_overlap", "")}</p>
+                  <p className="mt-2 font-mono text-lg text-cyan-100">{scoreValue(result, key)}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function AdvancedFilterDrawer({
+  open,
+  onOpenChange,
+  chapter,
+  setChapter,
+  sourceType,
+  setSourceType,
+  chapterOptions,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  chapter: string;
+  setChapter: (value: string) => void;
+  sourceType: string;
+  setSourceType: (value: string) => void;
+  chapterOptions: string[];
+}) {
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="right" className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-md">
+        <SheetHeader className="border-b border-white/8 p-6">
+          <SheetTitle>Advanced Filters</SheetTitle>
+          <SheetDescription>Scope retrieval by chapter and source channel.</SheetDescription>
+        </SheetHeader>
+        <div className="flex flex-col gap-6 p-6">
+          <label className="flex flex-col gap-2">
+            <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Chapter</span>
+            <select value={chapter} onChange={(event) => setChapter(event.target.value)} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none">
+              <option value="">All chapters</option>
+              {chapterOptions.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex flex-col gap-2">
+            <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Source</span>
+            <select value={sourceType} onChange={(event) => setSourceType(event.target.value)} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none">
+              <option value="">All sources</option>
+              {sourceOptions.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </label>
+          <Button type="button" onClick={() => onOpenChange(false)} className="rounded-full">
+            <Filter data-icon="inline-start" />
+            Apply Scope
+          </Button>
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | null }) {
+  const storageScope = selectedCourseId ?? "unassigned";
+  const dashboardQuery = useQuery({
+    queryKey: ["dashboard", selectedCourseId],
+    queryFn: () => fetchDashboard(selectedCourseId),
+    enabled: Boolean(selectedCourseId),
+  });
+  const [query, setQuery] = useLocalStorage(`search.query.${storageScope}`, "eigenvector centrality");
+  const [chapter, setChapter] = useLocalStorage(`search.chapter.${storageScope}`, "");
+  const [sourceType, setSourceType] = useLocalStorage(`search.sourceType.${storageScope}`, "");
+  const [selectedChapter, setSelectedChapter] = useLocalStorage(`search.selectedChapter.${storageScope}`, "");
+  const [activeChunkId, setActiveChunkId] = useLocalStorage<string | null>(`search.activeChunkId.${storageScope}`, null);
+  const [searchResults, setSearchResults] = useLocalStorage<{ results: SearchResult[]; degraded_mode: boolean } | null>(`search.results.${storageScope}`, null);
+  const [hoverPreview, setHoverPreview] = useState<HoverPreviewState | null>(null);
+  const [detailResult, setDetailResult] = useState<SearchResult | null>(null);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const hoverPreviewTimerRef = useRef<HoverPreviewTimer>(null);
+
+  const searchMutation = useMutation({
+    mutationFn: () =>
+      searchKnowledge({
+        course_id: selectedCourseId,
+        query,
+        top_k: 8,
+        filters: {
+          chapter: chapter || undefined,
+          source_type: (sourceType || undefined) as never,
+        },
+      }),
+    onSuccess: (data) => {
+      setSearchResults({ results: data.results, degraded_mode: Boolean(data.degraded_mode) });
+      const nextChapter = chapter || resultChapter(data.results[0]) || (dashboardQuery.data?.tree[0]?.title ?? "");
+      setSelectedChapter(nextChapter);
+      setActiveChunkId(data.results[0]?.chunk_id ?? null);
+    },
+  });
+
+  const chapterGraphQuery = useQuery({
+    queryKey: ["chapter-graph", selectedCourseId, selectedChapter],
+    queryFn: () => fetchChapterGraph(selectedChapter, selectedCourseId),
+    enabled: Boolean(selectedCourseId && selectedChapter),
+  });
+
+  const chapterOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title) ?? [], [dashboardQuery.data]);
+  const results = searchResults?.results ?? [];
+  const selectedResult = results.find((result) => result.chunk_id === activeChunkId) ?? null;
+  const focusChapter = selectedResult ? resultChapter(selectedResult) : selectedChapter;
+  const selectedNodeId = selectedResult?.citations[0]?.document_id ?? (focusChapter ? `chapter:${focusChapter}` : null);
+  const selectedLabel = selectedResult?.document_title ?? selectedResult?.citations[0]?.document_title ?? null;
+
+  useEffect(() => {
+    return () => {
+      if (hoverPreviewTimerRef.current) {
+        clearTimeout(hoverPreviewTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const dismissPreview = () => {
+      if (hoverPreviewTimerRef.current) {
+        clearTimeout(hoverPreviewTimerRef.current);
+        hoverPreviewTimerRef.current = null;
+      }
+      setHoverPreview(null);
+    };
+
+    window.addEventListener("scroll", dismissPreview, true);
+    window.addEventListener("resize", dismissPreview);
+
+    return () => {
+      window.removeEventListener("scroll", dismissPreview, true);
+      window.removeEventListener("resize", dismissPreview);
+    };
+  }, []);
+
+  const handleHoverPreview = (result: SearchResult | null, anchor?: HTMLButtonElement | null) => {
+    if (hoverPreviewTimerRef.current) {
+      clearTimeout(hoverPreviewTimerRef.current);
+      hoverPreviewTimerRef.current = null;
+    }
+
+    if (!result || !anchor) {
+      setHoverPreview(null);
+      return;
+    }
+
+    const rect = anchor.getBoundingClientRect();
+    const viewportWidth = document.documentElement.clientWidth;
+    const viewportHeight = window.innerHeight;
+    const width = Math.min(360, Math.max(300, viewportWidth - 32));
+    const gap = 20;
+    const preferredLeft = rect.right + gap;
+    const fallbackLeft = rect.left - width - gap;
+    const unclampedLeft = preferredLeft + width <= viewportWidth - 16 ? preferredLeft : fallbackLeft;
+    const left = Math.max(16, Math.min(unclampedLeft, viewportWidth - width - 16));
+    const top = Math.min(Math.max(16, rect.top - 8), Math.max(16, viewportHeight - 260));
+    const nextPreview = { result, top, left, width };
+
+    setHoverPreview(null);
+    hoverPreviewTimerRef.current = setTimeout(() => {
+      setHoverPreview(nextPreview);
+      hoverPreviewTimerRef.current = null;
+    }, 2000);
+  };
+
+  if (dashboardQuery.isLoading) {
+    return <LoadingBlock rows={4} />;
+  }
+  if (dashboardQuery.error) {
+    return <ErrorBlock message={(dashboardQuery.error as Error).message} />;
+  }
+
+  return (
+    <div className="kg-page flex flex-col gap-6">
+      <SearchHero
+        query={query}
+        setQuery={setQuery}
+        onSearch={() => searchMutation.mutate()}
+        isSearching={searchMutation.isPending}
+        hitCount={results.length}
+      />
+      <SearchFilterBar
+        chapter={chapter}
+        sourceType={sourceType}
+        onOpenFilters={() => setFiltersOpen(true)}
+        onClearChapter={() => setChapter("")}
+        onClearSource={() => setSourceType("")}
+        degradedMode={Boolean(searchResults?.degraded_mode)}
+      />
+
+      <section className="grid min-h-0 items-stretch gap-6 xl:grid-cols-[minmax(360px,0.78fr)_minmax(520px,1.22fr)]">
+        <ResultStream
+          results={results}
+          activeChunkId={activeChunkId}
+          isLoading={searchMutation.isPending}
+          onHover={handleHoverPreview}
+          onSelect={(result) => {
+            if (hoverPreviewTimerRef.current) {
+              clearTimeout(hoverPreviewTimerRef.current);
+              hoverPreviewTimerRef.current = null;
+            }
+            setHoverPreview(null);
+            setActiveChunkId(result.chunk_id);
+            setSelectedChapter(resultChapter(result));
+            setDetailResult(result);
+          }}
+        />
+        <GraphCanvasPanel
+          selectedLabel={selectedLabel}
+          selectedChapter={focusChapter}
+          selectedNodeId={selectedNodeId}
+          graph={chapterGraphQuery.data}
+          isLoading={chapterGraphQuery.isLoading || searchMutation.isPending}
+          error={(chapterGraphQuery.error as Error | null) ?? null}
+        />
+      </section>
+
+      <DetailDrawer result={detailResult} open={Boolean(detailResult)} onOpenChange={(open) => !open && setDetailResult(null)} />
+      <AdvancedFilterDrawer
+        open={filtersOpen}
+        onOpenChange={setFiltersOpen}
+        chapter={chapter}
+        setChapter={setChapter}
+        sourceType={sourceType}
+        setSourceType={setSourceType}
+        chapterOptions={chapterOptions}
+      />
+      <HoverPreviewOverlay preview={hoverPreview} />
+    </div>
+  );
+}
+
+export function SearchWorkspace() {
+  const { selectedCourseId } = useCourseContext();
+  return <SearchWorkspaceContent key={selectedCourseId ?? "unassigned"} selectedCourseId={selectedCourseId} />;
+}
