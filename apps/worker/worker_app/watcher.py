@@ -42,13 +42,13 @@ class CourseEventHandler(FileSystemEventHandler):
 
 def main() -> None:
     settings = get_settings()
-    source_root = settings.course_source_root_path
-    source_root.mkdir(parents=True, exist_ok=True)
+    storage_root = settings.storage_root_path
+    storage_root.mkdir(parents=True, exist_ok=True)
     observer = Observer()
     handler = CourseEventHandler()
-    observer.schedule(handler, str(source_root), recursive=True)
+    observer.schedule(handler, str(storage_root), recursive=True)
     observer.start()
-    print(f"Watching {source_root}")
+    print(f"Watching {storage_root}")
     try:
         while True:
             time.sleep(1)

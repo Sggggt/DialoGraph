@@ -20,9 +20,9 @@ export function SessionList({ sessions, activeSessionId, onSelect, onNew }: Sess
     <Card className="min-h-0 border-white/10 bg-white/[0.03] text-white">
       <CardHeader>
         <CardTitle className="flex items-center justify-between gap-3">
-          <span>Sessions</span>
+          <span>会话</span>
           <Button type="button" variant="outline" size="sm" onClick={onNew}>
-            New
+            新建
           </Button>
         </CardTitle>
       </CardHeader>
@@ -30,7 +30,7 @@ export function SessionList({ sessions, activeSessionId, onSelect, onNew }: Sess
         <ScrollArea className="h-[360px] pr-3">
           <div className="flex flex-col gap-2">
             {sessions.length === 0 ? (
-              <div className="rounded-lg border border-white/10 px-4 py-5 text-sm text-white/55">No saved sessions yet.</div>
+              <div className="rounded-lg border border-white/10 px-4 py-5 text-sm text-white/55">暂无保存的会话。</div>
             ) : (
               sessions.map((session) => (
                 <button
@@ -44,7 +44,7 @@ export function SessionList({ sessions, activeSessionId, onSelect, onNew }: Sess
                   }`}
                 >
                   <div className="flex items-center justify-between gap-3">
-                    <span className="min-w-0 truncate text-sm font-medium">{session.title ?? "Untitled session"}</span>
+                    <span className="min-w-0 truncate text-sm font-medium">{session.title ?? "未命名会话"}</span>
                     <Badge variant="outline">
                       <MessageSquare data-icon="inline-start" />
                       {session.transcript.length}

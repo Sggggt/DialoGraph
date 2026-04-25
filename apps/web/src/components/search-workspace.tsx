@@ -47,7 +47,7 @@ function scoreValue(result: SearchResult, key: string) {
 }
 
 function resultChapter(result: SearchResult) {
-  return result.chapter ?? (result.metadata.chapter as string | undefined) ?? result.citations[0]?.chapter ?? "General";
+  return result.chapter ?? (result.metadata.chapter as string | undefined) ?? result.citations[0]?.chapter ?? "通用";
 }
 
 function resultSourceType(result: SearchResult) {
@@ -60,13 +60,18 @@ function SearchHero({
   onSearch,
   isSearching,
   hitCount,
+  history,
+  onPickHistory,
 }: {
   query: string;
   setQuery: (value: string) => void;
   onSearch: () => void;
   isSearching: boolean;
   hitCount: number;
+  history: string[];
+  onPickHistory: (value: string) => void;
 }) {
+  const [historyOpen, setHistoryOpen] = useState(false);
   return (
     <section className="relative overflow-hidden rounded-[2rem] px-1 py-2">
       <div className="pointer-events-none absolute inset-x-10 top-0 h-px bg-gradient-to-r from-transparent via-cyan-200/50 to-transparent" />
@@ -82,12 +87,17 @@ function SearchHero({
           </p>
         </div>
 
-        <div className={cn("kg-glass-line kg-scan-edge relative w-full rounded-[1.7rem] p-2", isSearching && "shadow-[0_0_42px_rgba(86,217,255,0.12)]")}>
+        <div className={cn("kg-glass-line kg-scan-edge relative z-40 w-full rounded-[1.7rem] p-2", isSearching && "shadow-[0_0_42px_rgba(86,217,255,0.12)]")}>
           <div className="flex items-center gap-3 rounded-[1.35rem] bg-black/18 px-4 py-3">
             <Search className="text-cyan-100/70" />
             <input
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => {
+                setQuery(event.target.value);
+                setHistoryOpen(true);
+              }}
+              onFocus={() => setHistoryOpen(true)}
+              onBlur={() => window.setTimeout(() => setHistoryOpen(false), 140)}
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
                   onSearch();
@@ -107,9 +117,25 @@ function SearchHero({
             </div>
             <Button type="button" size="lg" onClick={onSearch} disabled={isSearching || !query.trim()} className="rounded-full">
               {isSearching ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Sparkles data-icon="inline-start" />}
-              {isSearching ? "Searching" : "Search"}
+              {isSearching ? "搜索中" : "搜索"}
             </Button>
           </div>
+          {historyOpen && history.length > 0 ? (
+            <div className="custom-scrollbar absolute left-4 right-4 top-[calc(100%+0.5rem)] z-[90] max-h-72 overflow-y-auto rounded-[1.35rem] border border-white/10 bg-[rgba(4,10,24,0.96)] p-2 text-left shadow-[0_24px_70px_rgba(0,0,0,0.42)] backdrop-blur-2xl">
+              {history.map((item) => (
+                <button
+                  key={item}
+                  type="button"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => onPickHistory(item)}
+                  className="flex w-full items-center gap-3 rounded-2xl px-3 py-2.5 text-sm text-white/70 transition hover:bg-cyan-300/[0.08] hover:text-white"
+                >
+                  <Search className="size-4 text-cyan-100/52" />
+                  <span className="min-w-0 truncate">{item}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
         </div>
       </div>
     </section>
@@ -136,14 +162,14 @@ function SearchFilterBar({
       <div className="flex flex-wrap items-center gap-2">
         <button type="button" onClick={onOpenFilters} className="kg-micro-chip rounded-full px-3 py-2 text-xs uppercase tracking-[0.18em] transition hover:border-cyan-200/30 hover:text-white">
           <SlidersHorizontal />
-          Filters
+          筛选
         </button>
         <button type="button" onClick={onClearChapter} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
-          Chapter: {chapter || "All"}
+          章节：{chapter || "全部"}
           {chapter ? <X /> : null}
         </button>
         <button type="button" onClick={onClearSource} className="kg-micro-chip rounded-full px-3 py-2 text-xs">
-          Source: {sourceType || "All"}
+          来源：{sourceType || "全部"}
           {sourceType ? <X /> : null}
         </button>
       </div>
@@ -204,7 +230,7 @@ function ResultRow({
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm font-medium text-white">{result.document_title ?? result.citations[0]?.document_title ?? "Course source"}</span>
+            <span className="text-sm font-medium text-white">{result.document_title ?? result.citations[0]?.document_title ?? "课程来源"}</span>
             <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultSourceType(result)}</span>
             <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultChapter(result)}</span>
           </div>
@@ -306,7 +332,7 @@ function HoverPreviewOverlay({ preview }: { preview: HoverPreviewState | null })
               </div>
             </div>
             <p className="mt-3 text-sm font-medium text-white">
-              {preview.result.document_title ?? preview.result.citations[0]?.document_title ?? "Course source"}
+              {preview.result.document_title ?? preview.result.citations[0]?.document_title ?? "课程来源"}
             </p>
             <MarkdownRenderer content={preview.result.snippet} compact className="mt-3 line-clamp-4 text-white/76" />
           </motion.div>
@@ -338,7 +364,7 @@ function GraphCanvasPanel({
       <div className="relative z-10 flex items-center justify-between gap-3 px-5 py-4">
         <div>
           <p className="section-kicker">Knowledge Canvas</p>
-          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? selectedChapter ?? "Exploratory Graph"}</h3>
+          <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? selectedChapter ?? "探索图谱"}</h3>
           {selectedLabel && selectedChapter ? <p className="mt-1 text-sm text-white/42">{selectedChapter}</p> : null}
         </div>
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
@@ -374,8 +400,8 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
         <SheetHeader className="border-b border-white/8 p-6">
-          <SheetTitle>Result Detail</SheetTitle>
-          <SheetDescription>Chunk evidence, retrieval scores, and source metadata.</SheetDescription>
+          <SheetTitle>结果详情</SheetTitle>
+          <SheetDescription>片段证据、检索分数和来源元数据。</SheetDescription>
         </SheetHeader>
         {result ? (
           <div className="custom-scrollbar flex-1 overflow-y-auto p-6">
@@ -384,7 +410,7 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultSourceType(result)}</span>
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">score {result.score.toFixed(3)}</span>
             </div>
-            <h3 className="mt-5 text-2xl font-semibold text-white">{result.document_title ?? result.citations[0]?.document_title ?? "Course source"}</h3>
+            <h3 className="mt-5 text-2xl font-semibold text-white">{result.document_title ?? result.citations[0]?.document_title ?? "课程来源"}</h3>
             <p className="mt-3 flex items-center gap-2 truncate text-sm text-white/42">
               <FileText />
               {result.source_path ?? result.citations[0]?.source_path}
@@ -430,14 +456,14 @@ function AdvancedFilterDrawer({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="right" className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-md">
         <SheetHeader className="border-b border-white/8 p-6">
-          <SheetTitle>Advanced Filters</SheetTitle>
-          <SheetDescription>Scope retrieval by chapter and source channel.</SheetDescription>
+          <SheetTitle>高级筛选</SheetTitle>
+          <SheetDescription>按章节和来源通道限定检索范围。</SheetDescription>
         </SheetHeader>
         <div className="flex flex-col gap-6 p-6">
           <label className="flex flex-col gap-2">
-            <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Chapter</span>
+            <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">章节</span>
             <select value={chapter} onChange={(event) => setChapter(event.target.value)} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none">
-              <option value="">All chapters</option>
+              <option value="">全部章节</option>
               {chapterOptions.map((option) => (
                 <option key={option} value={option}>
                   {option}
@@ -446,9 +472,9 @@ function AdvancedFilterDrawer({
             </select>
           </label>
           <label className="flex flex-col gap-2">
-            <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Source</span>
+            <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">来源</span>
             <select value={sourceType} onChange={(event) => setSourceType(event.target.value)} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 text-white outline-none">
-              <option value="">All sources</option>
+              <option value="">全部来源</option>
               {sourceOptions.map((option) => (
                 <option key={option} value={option}>
                   {option}
@@ -458,7 +484,7 @@ function AdvancedFilterDrawer({
           </label>
           <Button type="button" onClick={() => onOpenChange(false)} className="rounded-full">
             <Filter data-icon="inline-start" />
-            Apply Scope
+            应用范围
           </Button>
         </div>
       </SheetContent>
@@ -473,7 +499,8 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     queryFn: () => fetchDashboard(selectedCourseId),
     enabled: Boolean(selectedCourseId),
   });
-  const [query, setQuery] = useLocalStorage(`search.query.${storageScope}`, "eigenvector centrality");
+  const [query, setQuery] = useLocalStorage(`search.query.${storageScope}`, "");
+  const [searchHistory, setSearchHistory] = useLocalStorage<string[]>(`search.history.${storageScope}`, []);
   const [chapter, setChapter] = useLocalStorage(`search.chapter.${storageScope}`, "");
   const [sourceType, setSourceType] = useLocalStorage(`search.sourceType.${storageScope}`, "");
   const [selectedChapter, setSelectedChapter] = useLocalStorage(`search.selectedChapter.${storageScope}`, "");
@@ -485,18 +512,19 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const hoverPreviewTimerRef = useRef<HoverPreviewTimer>(null);
 
   const searchMutation = useMutation({
-    mutationFn: () =>
+    mutationFn: (searchText: string) =>
       searchKnowledge({
         course_id: selectedCourseId,
-        query,
+        query: searchText,
         top_k: 8,
         filters: {
           chapter: chapter || undefined,
           source_type: (sourceType || undefined) as never,
         },
       }),
-    onSuccess: (data) => {
+    onSuccess: (data, searchText) => {
       setSearchResults({ results: data.results, degraded_mode: Boolean(data.degraded_mode) });
+      setSearchHistory((current) => [searchText, ...current.filter((item) => item !== searchText)].slice(0, 50));
       const nextChapter = chapter || resultChapter(data.results[0]) || (dashboardQuery.data?.tree[0]?.title ?? "");
       setSelectedChapter(nextChapter);
       setActiveChunkId(data.results[0]?.chunk_id ?? null);
@@ -584,9 +612,19 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       <SearchHero
         query={query}
         setQuery={setQuery}
-        onSearch={() => searchMutation.mutate()}
+        onSearch={() => {
+          const searchText = query.trim();
+          if (searchText) {
+            searchMutation.mutate(searchText);
+          }
+        }}
         isSearching={searchMutation.isPending}
         hitCount={results.length}
+        history={searchHistory}
+        onPickHistory={(value) => {
+          setQuery(value);
+          searchMutation.mutate(value);
+        }}
       />
       <SearchFilterBar
         chapter={chapter}

@@ -27,13 +27,13 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     course_name: str = "Sample Course"
-    course_source_root: Path | None = None
     data_root: Path = Field(default=WORKSPACE_ROOT / "data")
     storage_root: Path | None = None
     ingestion_root: Path | None = None
 
     dashscope_api_key: str | None = None
     dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    dashscope_resolve_ip: str | None = None
     embedding_model: str = "text-embedding-v4"
     chat_model: str = "qwen-plus"
     embedding_dimensions: int = 1024
@@ -49,7 +49,6 @@ class Settings(BaseSettings):
         course_root = self.data_root / self.sanitize_course_dir_name(course_name)
         return {
             "course_root": course_root,
-            "source_root": course_root / "source",
             "storage_root": course_root / "storage",
             "ingestion_root": course_root / "ingestion",
         }
@@ -57,10 +56,6 @@ class Settings(BaseSettings):
     @property
     def course_data_root_path(self) -> Path:
         return self.course_paths_for_name(self.course_name)["course_root"]
-
-    @property
-    def course_source_root_path(self) -> Path:
-        return Path(self.course_source_root) if self.course_source_root else self.course_paths_for_name(self.course_name)["source_root"]
 
     @property
     def storage_root_path(self) -> Path:
@@ -76,7 +71,6 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.data_root.mkdir(parents=True, exist_ok=True)
     settings.course_data_root_path.mkdir(parents=True, exist_ok=True)
-    settings.course_source_root_path.mkdir(parents=True, exist_ok=True)
     settings.storage_root_path.mkdir(parents=True, exist_ok=True)
     settings.ingestion_root_path.mkdir(parents=True, exist_ok=True)
     return settings

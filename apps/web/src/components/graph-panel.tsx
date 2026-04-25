@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { GraphNodeDetail } from "@course-kg/shared";
 import { motion } from "framer-motion";
-import { Boxes, Expand, Lock, Minimize2, Move, RefreshCw, ScanSearch, Unlock } from "lucide-react";
+import { Boxes, ChevronDown, Expand, Lock, Minimize2, Move, RefreshCw, ScanSearch, Unlock } from "lucide-react";
 
 import { useCourseContext } from "@/components/course-context";
 import { fetchChapterGraph, fetchDashboard, fetchGraph, fetchGraphNode } from "@/lib/api";
@@ -25,6 +25,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
   const [detailNodeId, setDetailNodeId] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
+  const [chapterMenuOpen, setChapterMenuOpen] = useState(false);
   const canvasRef = useRef<NetworkCanvasHandle | null>(null);
   const fullscreenRef = useRef<HTMLDivElement | null>(null);
 
@@ -54,6 +55,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
     setSelectedNode(null);
     setDetailNodeId(null);
     setIsLocked(false);
+    setChapterMenuOpen(false);
   };
 
   const openDetail = (nodeId: string, category: string) => {
@@ -99,19 +101,36 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
             <Boxes className="size-5 shrink-0 text-cyan-200" />
           </div>
 
-          <div className="mt-5">
-            <select
-              value={selectedChapter}
-              onChange={(event) => handleChapterChange(event.target.value)}
-              className="h-11 w-full rounded-full border border-white/10 bg-white/[0.05] px-4 text-sm text-white outline-none"
+          <div className="relative mt-5">
+            <button
+              type="button"
+              onClick={() => setChapterMenuOpen((open) => !open)}
+              className="flex h-11 w-full items-center justify-between gap-3 rounded-full border border-white/10 bg-white/[0.05] px-4 text-left text-sm text-white outline-none transition hover:border-cyan-200/24"
             >
-              <option value="">全部章节</option>
-              {chapterOptions.map((chapter) => (
-                <option key={chapter} value={chapter}>
-                  {chapter}
-                </option>
-              ))}
-            </select>
+              <span className="min-w-0 truncate">{selectedChapter || "全部章节"}</span>
+              <ChevronDown className={`size-4 shrink-0 text-cyan-100/60 transition ${chapterMenuOpen ? "rotate-180" : ""}`} />
+            </button>
+            {chapterMenuOpen ? (
+              <div className="custom-scrollbar absolute left-0 right-0 top-[calc(100%+0.5rem)] z-[80] max-h-72 overflow-y-auto rounded-[1.25rem] border border-white/10 bg-[rgba(4,10,24,0.96)] p-2 shadow-[0_24px_70px_rgba(0,0,0,0.42)] backdrop-blur-2xl">
+                <button
+                  type="button"
+                  onClick={() => handleChapterChange("")}
+                  className="w-full rounded-2xl px-3 py-2.5 text-left text-sm text-white/70 transition hover:bg-cyan-300/[0.08] hover:text-white"
+                >
+                  全部章节
+                </button>
+                {chapterOptions.map((chapter) => (
+                  <button
+                    key={chapter}
+                    type="button"
+                    onClick={() => handleChapterChange(chapter)}
+                    className="w-full rounded-2xl px-3 py-2.5 text-left text-sm text-white/70 transition hover:bg-cyan-300/[0.08] hover:text-white"
+                  >
+                    {chapter}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
 
           <div className="mt-6 space-y-4">

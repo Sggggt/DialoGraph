@@ -65,10 +65,6 @@ const compactComponents: Components = {
   li: ({ className, ...props }) => <span className={cn("inline", className)} {...props} />,
   blockquote: ({ className, ...props }) => <span className={cn("inline", className)} {...props} />,
   pre: ({ className, ...props }) => <span className={cn("inline", className)} {...props} />,
-  table: ({ className, ...props }) => <span className={cn("inline", className)} {...props} />,
-  tr: ({ className, ...props }) => <span className={cn("inline", className)} {...props} />,
-  th: ({ className, ...props }) => <span className={cn("inline font-medium", className)} {...props} />,
-  td: ({ className, ...props }) => <span className={cn("inline", className)} {...props} />,
 };
 
 export function MarkdownRenderer({ content, className, compact = false }: MarkdownRendererProps) {

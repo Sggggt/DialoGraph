@@ -175,6 +175,13 @@ select {
   scrollbar-width: thin;
 }
 
+.kg-rounded-scrollbar {
+  --kg-scroll-radius: 1.5rem;
+  border-radius: var(--kg-scroll-radius);
+  background-clip: padding-box;
+  clip-path: inset(0 round var(--kg-scroll-radius));
+}
+
 .custom-scrollbar::-webkit-scrollbar {
   width: 10px;
   height: 10px;

@@ -16,6 +16,7 @@ JobState = Literal[
     "failed",
     "skipped",
 ]
+CourseFileStatus = Literal["pending", "parsing", "parsed", "failed", "skipped"]
 SourceType = Literal["pdf", "ppt", "pptx", "docx", "markdown", "text", "image", "notebook", "html", "unknown"]
 AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
 AgentRunState = Literal["queued", "running", "needs_clarification", "completed", "failed"]
@@ -30,8 +31,13 @@ class SearchFilters(BaseModel):
 
 class UploadFileResponse(BaseModel):
     document_id: str
-    job_id: str
+    job_id: str | None = None
     status: JobState
+    source_path: str
+
+
+class ParseUploadedFilesRequest(BaseModel):
+    file_paths: list[str] = Field(default_factory=list)
 
 
 class JobStatusResponse(BaseModel):
@@ -167,6 +173,38 @@ class SessionMessagesResponse(BaseModel):
     messages: list[dict] = Field(default_factory=list)
 
 
+class DeleteResponse(BaseModel):
+    deleted: bool
+
+
+class RefreshResponse(BaseModel):
+    course_id: str
+    refreshed_at: datetime
+
+
+class ModelSettingsResponse(BaseModel):
+    provider: Literal["dashscope_compatible"] = "dashscope_compatible"
+    dashscope_base_url: str
+    embedding_model: str
+    chat_model: str
+    embedding_dimensions: int
+    enable_fake_embeddings: bool
+    enable_fake_chat: bool
+    has_dashscope_api_key: bool
+    degraded_mode: bool
+
+
+class ModelSettingsUpdate(BaseModel):
+    dashscope_api_key: str | None = None
+    clear_dashscope_api_key: bool = False
+    dashscope_base_url: str | None = None
+    embedding_model: str | None = None
+    chat_model: str | None = None
+    embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
+    enable_fake_embeddings: bool | None = None
+    enable_fake_chat: bool | None = None
+
+
 class RelatedConcept(BaseModel):
     concept_id: str
     relation_type: str
@@ -222,6 +260,7 @@ class CourseSummary(BaseModel):
     name: str
     description: str | None = None
     source_root: str
+    storage_root: str
     document_count: int
     concept_count: int
     degraded_mode: bool = False
@@ -296,6 +335,21 @@ class DocumentSummary(BaseModel):
     source_type: str
     chapter: str | None = None
     updated_at: datetime
+
+
+class CourseFileSummary(BaseModel):
+    id: str
+    document_id: str | None = None
+    title: str
+    source_path: str
+    source_type: str = "unknown"
+    chapter: str | None = None
+    status: CourseFileStatus
+    job_state: JobState | None = None
+    batch_id: str | None = None
+    error: str | None = None
+    chunk_count: int = 0
+    updated_at: datetime | None = None
 
 
 class GraphNodeRelation(BaseModel):

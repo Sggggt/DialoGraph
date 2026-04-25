@@ -4,29 +4,51 @@ import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { motion } from "framer-motion";
-import { BookOpenText, BrainCircuit, FolderPlus, Home, Search, Share2, Sparkles, TerminalSquare, Upload } from "lucide-react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { BookOpenText, BrainCircuit, FolderPlus, Home, RefreshCw, Search, Settings, Share2, Sparkles, TerminalSquare, Upload } from "lucide-react";
 
 import { AmbientCanvas } from "@/components/ambient-canvas";
 import { useCourseContext } from "@/components/course-context";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { refreshCourse } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const navigation = [
-  { href: "/", label: "Overview", caption: "Home", icon: Home },
-  { href: "/upload", label: "Ingest", caption: "Ingest", icon: Upload },
-  { href: "/search", label: "Search", caption: "Search", icon: Search },
-  { href: "/qa", label: "Answer", caption: "Chat", icon: BrainCircuit },
-  { href: "/concepts", label: "Concepts", caption: "Concepts", icon: BookOpenText },
-  { href: "/graph", label: "Graph", caption: "Graph", icon: Share2 },
+  { href: "/", label: "概览", caption: "首页", icon: Home },
+  { href: "/upload", label: "导入", caption: "导入", icon: Upload },
+  { href: "/search", label: "搜索", caption: "搜索", icon: Search },
+  { href: "/qa", label: "问答", caption: "对话", icon: BrainCircuit },
+  { href: "/concepts", label: "概念", caption: "概念", icon: BookOpenText },
+  { href: "/graph", label: "图谱", caption: "图谱", icon: Share2 },
+  { href: "/settings", label: "设置", caption: "模型", icon: Settings },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  const queryClient = useQueryClient();
   const { courses, selectedCourse, selectedCourseId, setSelectedCourseId, createCourseSpace, isCreating } = useCourseContext();
   const [createOpen, setCreateOpen] = useState(false);
   const [nextCourseName, setNextCourseName] = useState("");
+  const [refreshDone, setRefreshDone] = useState(false);
+  const refreshMutation = useMutation({
+    mutationFn: () => refreshCourse(selectedCourseId),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["courses"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] }),
+        queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] }),
+        queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] }),
+        queryClient.invalidateQueries({ queryKey: ["chapter-graph"] }),
+        queryClient.invalidateQueries({ queryKey: ["graph-node"] }),
+        queryClient.invalidateQueries({ queryKey: ["concepts", selectedCourseId] }),
+        queryClient.invalidateQueries({ queryKey: ["sessions", selectedCourseId] }),
+      ]);
+      setRefreshDone(true);
+      window.setTimeout(() => setRefreshDone(false), 1600);
+    },
+  });
 
   return (
     <div className="kg-future-field relative min-h-screen overflow-x-hidden bg-[#030714] text-foreground">
@@ -73,9 +95,27 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <div className="min-w-0">
               <p className="text-[10px] uppercase tracking-[0.34em] text-cyan-100/42">Course Knowledge Base</p>
               <h1 className="mt-1 break-words text-lg font-semibold text-white lg:text-xl">General Course Intelligence Surface</h1>
-              <p className="mt-1 text-xs text-white/45">{selectedCourse?.name ?? "Select a course workspace"}</p>
+              <p className="mt-1 text-xs text-white/45">{selectedCourse?.name ?? "选择课程空间"}</p>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
+              <div className="relative">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  className="rounded-full"
+                  aria-label="刷新当前课程"
+                  onClick={() => refreshMutation.mutate()}
+                  disabled={!selectedCourseId || refreshMutation.isPending}
+                >
+                  <RefreshCw className={cn("size-4", refreshMutation.isPending && "animate-spin")} />
+                </Button>
+                {refreshDone ? (
+                  <span className="absolute right-0 top-full z-50 mt-2 whitespace-nowrap rounded-full border border-emerald-200/20 bg-[rgba(4,17,24,0.94)] px-3 py-1 text-xs text-emerald-100 shadow-[0_12px_32px_rgba(0,0,0,0.35)]">
+                    已刷新
+                  </span>
+                ) : null}
+              </div>
               <div className="flex items-center gap-2 rounded-full border border-cyan-300/16 bg-cyan-300/[0.06] px-3 py-2 text-xs text-white/75 shadow-[0_0_24px_rgba(85,215,255,0.06)]">
                 <BookOpenText className="size-4 text-cyan-100/78" />
                 <select
@@ -86,7 +126,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 >
                   {courses.length === 0 ? (
                     <option value="" className="bg-[#081126] text-white">
-                      No course yet
+                      暂无课程
                     </option>
                   ) : null}
                   {courses.map((course) => (
@@ -98,7 +138,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </div>
               <Button type="button" variant="outline" className="rounded-full" onClick={() => setCreateOpen(true)}>
                 <FolderPlus data-icon="inline-start" />
-                New Course
+                新建课程
               </Button>
               <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
                 <Sparkles data-icon="inline-start" />
@@ -120,8 +160,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.88)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
           <DialogHeader className="border-b border-white/8 px-6 py-5">
-            <DialogTitle>Create Course Workspace</DialogTitle>
-            <DialogDescription>Each course gets its own folder under `data/course-name/` and its own dashboard, graph, search, and chat context.</DialogDescription>
+            <DialogTitle>新建课程空间</DialogTitle>
+            <DialogDescription>创建课程看板、图谱、搜索和问答上下文。课程文件会统一进入本课程 storage 文件夹。</DialogDescription>
           </DialogHeader>
           <form
             className="space-y-4 px-6 py-5"
@@ -137,21 +177,21 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             }}
           >
             <label className="flex flex-col gap-2">
-              <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Course Name</span>
+              <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">课程名称</span>
               <Input
                 value={nextCourseName}
                 onChange={(event) => setNextCourseName(event.target.value)}
-                placeholder="Linear Algebra"
+                placeholder="线性代数"
                 className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white placeholder:text-white/28"
               />
             </label>
             <div className="flex items-center justify-end gap-2">
               <Button type="button" variant="outline" className="rounded-full" onClick={() => setCreateOpen(false)}>
-                Cancel
+                取消
               </Button>
               <Button type="submit" className="rounded-full" disabled={isCreating || !nextCourseName.trim()}>
                 <FolderPlus data-icon="inline-start" />
-                {isCreating ? "Creating" : "Create"}
+                {isCreating ? "创建中" : "创建"}
               </Button>
             </div>
           </form>

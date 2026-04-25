@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -12,17 +11,85 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.models import Chunk, Concept, Course, Document, DocumentVersion, IngestionBatch, IngestionJob
 from app.services.chunking import chunk_sections
-from app.services.concept_graph import get_concept_cards, get_graph_payload, upsert_concepts_from_chunk
+from app.services.concept_graph import get_concept_cards, get_graph_payload, graph_extraction_provider, rebuild_course_graph
 from app.services.embeddings import EmbeddingProvider, is_degraded_mode
+from app.services.ingestion_logs import emit_ingestion_log
 from app.services.parsers import derive_chapter, parse_document, sections_to_json
 from app.services.storage import compute_checksum, copy_source_file
 from app.services.vector_store import VectorStore
 
 
-ALLOWED_SUFFIXES = {".pdf", ".ipynb", ".md", ".markdown", ".txt", ".docx", ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".bmp"}
+ALLOWED_SUFFIXES = {".pdf", ".ipynb", ".md", ".markdown", ".txt", ".docx", ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".bmp", ".html", ".htm"}
 EXCLUDED_PARTS = {"output", "tmp", "scripts", ".ipynb_checkpoints", "__pycache__"}
 IGNORED_NAMES = {".ds_store"}
 TERMINAL_STATES = {"completed", "failed", "partial_failed", "skipped"}
+
+
+def embedding_audit_payload(provider: str, external_called: bool, fallback_reason: str | None, vector_count: int) -> dict:
+    return {
+        "embedding_provider": provider,
+        "embedding_external_called": external_called,
+        "embedding_fallback_reason": fallback_reason,
+        "embedding_vector_count": vector_count,
+        "graph_embedding_external_called": False,
+        "graph_extraction_provider": graph_extraction_provider(),
+    }
+
+
+def configured_embedding_provider() -> str:
+    settings = get_settings()
+    return "fake" if not settings.dashscope_api_key or settings.enable_fake_embeddings else "dashscope"
+
+
+def embedding_fallback_reason() -> str | None:
+    settings = get_settings()
+    if settings.enable_fake_embeddings:
+        return "fake_embeddings_enabled"
+    if not settings.dashscope_api_key:
+        return "missing_dashscope_api_key"
+    return None
+
+
+def emit_model_audit_log(batch_id: str) -> None:
+    settings = get_settings()
+    embedding_provider = configured_embedding_provider()
+    fallback_reason = embedding_fallback_reason()
+    fallback_method = "deterministic_local_hash_embedding" if embedding_provider == "fake" else None
+    graph_provider = graph_extraction_provider()
+    emit_ingestion_log(
+        batch_id,
+        "model_audit",
+        f"Embedding model: {embedding_provider}" + (f" fallback={fallback_method}" if fallback_method else ""),
+        embedding_provider=embedding_provider,
+        embedding_model=settings.embedding_model,
+        embedding_external_called=False,
+        embedding_fallback_reason=fallback_reason,
+        embedding_fallback_method=fallback_method,
+        graph_embedding_external_called=False,
+        graph_extraction_provider=graph_provider,
+        graph_extraction_model=settings.chat_model if graph_provider == "dashscope_chat" else "heuristic",
+    )
+
+
+def source_type_from_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in {".ppt", ".pptx"}:
+        return suffix.lstrip(".")
+    if suffix == ".docx":
+        return "docx"
+    if suffix in {".md", ".markdown"}:
+        return "markdown"
+    if suffix == ".txt":
+        return "text"
+    if suffix == ".ipynb":
+        return "notebook"
+    if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
+        return "image"
+    if suffix in {".html", ".htm"}:
+        return "html"
+    return "unknown"
 
 
 def get_course_paths(course_name: str) -> dict[str, Path]:
@@ -32,86 +99,22 @@ def get_course_paths(course_name: str) -> dict[str, Path]:
 
 def ensure_course_directories(course_name: str) -> dict[str, Path]:
     paths = get_course_paths(course_name)
-    for key in ("course_root", "source_root", "storage_root", "ingestion_root"):
+    for key in ("course_root", "storage_root", "ingestion_root"):
         paths[key].mkdir(parents=True, exist_ok=True)
     return paths
 
 
-def copy_tree_contents(source_root: Path, target_root: Path) -> None:
-    if not source_root.exists():
-        return
-    target_root.mkdir(parents=True, exist_ok=True)
-    for item in source_root.iterdir():
-        destination = target_root / item.name
-        if item.is_dir():
-            shutil.copytree(item, destination, dirs_exist_ok=True)
-        else:
-            shutil.copy2(item, destination)
-
-
-def migrate_legacy_course_layout(db: Session, course: Course, paths: dict[str, Path]) -> None:
-    legacy_source_root = Path(course.source_root)
-    canonical_source_root = paths["source_root"]
-    storage_root = paths["storage_root"]
-    ingestion_root = paths["ingestion_root"]
-    settings = get_settings()
-
-    configured_source_root = settings.course_source_root_path if course.name == settings.course_name and settings.course_source_root else None
-    if configured_source_root and configured_source_root != canonical_source_root and configured_source_root.exists():
-        legacy_source_root = configured_source_root
-
-    legacy_shared_storage = Path(settings.storage_root) if settings.storage_root else None
-    legacy_shared_ingestion = Path(settings.ingestion_root) if settings.ingestion_root else None
-
-    if legacy_source_root != canonical_source_root and legacy_source_root.exists():
-        copy_tree_contents(legacy_source_root, canonical_source_root)
-
-    if legacy_shared_storage and legacy_shared_storage.exists() and legacy_shared_storage != storage_root:
-        copy_tree_contents(legacy_shared_storage, storage_root)
-
-    if legacy_shared_ingestion and legacy_shared_ingestion.exists() and legacy_shared_ingestion != ingestion_root:
-        copy_tree_contents(legacy_shared_ingestion, ingestion_root)
-
-    old_source_prefix = str(legacy_source_root)
-    new_source_prefix = str(canonical_source_root)
-    old_storage_prefix = str(legacy_shared_storage) if legacy_shared_storage else None
-    new_storage_prefix = str(storage_root)
-    old_ingestion_prefix = str(legacy_shared_ingestion) if legacy_shared_ingestion else None
-    new_ingestion_prefix = str(ingestion_root)
-
-    for document in db.scalars(select(Document).where(Document.course_id == course.id)).all():
-        if document.source_path.startswith(old_source_prefix):
-            document.source_path = document.source_path.replace(old_source_prefix, new_source_prefix, 1)
-
-    for version in db.scalars(
-        select(DocumentVersion).join(Document, Document.id == DocumentVersion.document_id).where(Document.course_id == course.id)
-    ).all():
-        if old_storage_prefix and version.storage_path.startswith(old_storage_prefix):
-            version.storage_path = version.storage_path.replace(old_storage_prefix, new_storage_prefix, 1)
-        if version.extracted_path and old_ingestion_prefix and version.extracted_path.startswith(old_ingestion_prefix):
-            version.extracted_path = version.extracted_path.replace(old_ingestion_prefix, new_ingestion_prefix, 1)
-
-    for batch in db.scalars(select(IngestionBatch).where(IngestionBatch.course_id == course.id)).all():
-        if batch.source_root.startswith(old_source_prefix):
-            batch.source_root = batch.source_root.replace(old_source_prefix, new_source_prefix, 1)
-
-    for job in db.scalars(select(IngestionJob).where(IngestionJob.course_id == course.id)).all():
-        if job.source_path and job.source_path.startswith(old_source_prefix):
-            job.source_path = job.source_path.replace(old_source_prefix, new_source_prefix, 1)
-
-    course.source_root = new_source_prefix
-    db.commit()
-    db.refresh(course)
-
-
 def summarize_course(db: Session, course: Course) -> dict:
-    document_count = db.query(Document).filter(Document.course_id == course.id, Document.is_active.is_(True)).count()
+    paths = get_course_paths(course.name)
+    storage_root = paths["storage_root"]
+    document_count = len(collect_source_documents(storage_root)) if storage_root.exists() else db.query(Document).filter(Document.course_id == course.id, Document.is_active.is_(True)).count()
     concept_count = db.query(Concept).filter(Concept.course_id == course.id).count()
     return {
         "id": course.id,
         "name": course.name,
         "description": course.description,
-        "source_root": course.source_root,
+        "source_root": str(storage_root),
+        "storage_root": str(storage_root),
         "document_count": document_count,
         "concept_count": concept_count,
         "degraded_mode": is_degraded_mode(),
@@ -123,16 +126,19 @@ def create_course_space(db: Session, name: str, description: str | None = None) 
     if not normalized_name:
         raise ValueError("Course name cannot be empty")
     paths = ensure_course_directories(normalized_name)
+    storage_root = paths["storage_root"]
     course = db.scalar(select(Course).where(Course.name == normalized_name))
     if course is None:
-        course = Course(name=normalized_name, description=description, source_root=str(paths["source_root"]))
+        course = Course(name=normalized_name, description=description, source_root=str(storage_root))
         db.add(course)
         db.commit()
         db.refresh(course)
         return course
     if description is not None:
         course.description = description
-    migrate_legacy_course_layout(db, course, paths)
+    course.source_root = str(storage_root)
+    db.commit()
+    db.refresh(course)
     return course
 
 
@@ -148,8 +154,10 @@ def resolve_course(db: Session, course_id: str | None = None) -> Course:
     if course is None:
         raise LookupError(f"Course not found: {course_id}")
     paths = ensure_course_directories(course.name)
-    if course.source_root != str(paths["source_root"]):
-        migrate_legacy_course_layout(db, course, paths)
+    if course.source_root != str(paths["storage_root"]):
+        course.source_root = str(paths["storage_root"])
+        db.commit()
+        db.refresh(course)
     return course
 
 
@@ -205,14 +213,74 @@ def set_job_state(db: Session, job: IngestionJob, state: str, *, error: str | No
         batch.status = state
         batch.started_at = batch.started_at or datetime.utcnow()
     db.commit()
+    if batch_id:
+        emit_ingestion_log(batch_id, "job_state", f"{Path(job.source_path or '').name or job.id}: {state}", job_id=job.id, source_path=job.source_path, state=state)
 
 
-def create_sync_batch(db: Session, course_id: str, source_root: Path, trigger_source: str = "sync") -> IngestionBatch:
-    batch = IngestionBatch(course_id=course_id, source_root=str(source_root), trigger_source=trigger_source, status="queued")
+def create_sync_batch(db: Session, course_id: str, root: Path, trigger_source: str = "sync") -> IngestionBatch:
+    batch = IngestionBatch(course_id=course_id, source_root=str(root), trigger_source=trigger_source, status="queued")
     db.add(batch)
     db.commit()
     db.refresh(batch)
     return batch
+
+
+def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path]) -> IngestionBatch:
+    storage_batch_root = str(files[0].parent) if files else "storage files"
+    batch = IngestionBatch(course_id=course_id, source_root=storage_batch_root, trigger_source="upload", status="queued")
+    batch.total_files = len(files)
+    batch.stats = {"uploaded_files": [str(path) for path in files], "coverage_by_source_type": {}, "errors": []}
+    db.add(batch)
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
+def register_uploaded_file(db: Session, course: Course, source_path: Path) -> tuple[Document, IngestionJob]:
+    checksum = compute_checksum(source_path)
+    document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(source_path)))
+    if document is None:
+        document = Document(
+            course_id=course.id,
+            title=source_path.stem,
+            source_path=str(source_path),
+            source_type=source_type_from_path(source_path),
+            checksum=checksum,
+            tags=[],
+            visibility="private",
+            is_active=True,
+        )
+        db.add(document)
+        db.flush()
+    else:
+        document.title = source_path.stem
+        document.source_type = source_type_from_path(source_path)
+        document.checksum = checksum
+        document.is_active = True
+
+    job = db.scalar(
+        select(IngestionJob)
+        .where(IngestionJob.course_id == course.id, IngestionJob.source_path == str(source_path))
+        .order_by(IngestionJob.updated_at.desc())
+    )
+    if job is None or job.status not in {"queued", "failed", "skipped"}:
+        job = IngestionJob(
+            course_id=course.id,
+            document_id=document.id,
+            source_path=str(source_path),
+            trigger_source="upload",
+            status="queued",
+        )
+        db.add(job)
+    else:
+        job.document_id = document.id
+        job.status = "queued"
+        job.error_message = None
+        job.stats = {}
+    db.commit()
+    db.refresh(document)
+    db.refresh(job)
+    return document, job
 
 
 def summarize_batch(batch: IngestionBatch) -> dict:
@@ -255,6 +323,52 @@ def get_batch_status(db: Session, batch_id: str) -> dict | None:
     return summarize_batch(batch)
 
 
+def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
+    document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == source_path))
+    jobs = db.scalars(select(IngestionJob).where(IngestionJob.course_id == course.id, IngestionJob.source_path == source_path)).all()
+    removed = False
+
+    if document is not None:
+        document.is_active = False
+        db.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).update({"is_active": False})
+        db.query(Chunk).filter(Chunk.document_id == document.id).update({"is_active": False})
+        removed = True
+
+    for job in jobs:
+        if job.status not in TERMINAL_STATES:
+            job.status = "skipped"
+            job.error_message = "Removed by user before parsing completed"
+        job.stats = {**(job.stats or {}), "removed": True}
+        removed = True
+
+    if not jobs:
+        tombstone = IngestionJob(
+            course_id=course.id,
+            document_id=document.id if document else None,
+            source_path=source_path,
+            trigger_source="remove",
+            status="skipped",
+            error_message="Removed by user",
+            stats={"removed": True},
+        )
+        db.add(tombstone)
+        removed = True
+
+    course_paths = get_course_paths(course.name)
+    storage_root = course_paths["storage_root"].resolve()
+    try:
+        resolved_path = Path(source_path).resolve()
+        if resolved_path.exists() and resolved_path.is_file() and (resolved_path == storage_root or storage_root in resolved_path.parents):
+            resolved_path.unlink()
+            removed = True
+    except OSError:
+        pass
+
+    if removed:
+        db.commit()
+    return removed
+
+
 def create_or_update_document(
     db: Session,
     course: Course,
@@ -264,8 +378,9 @@ def create_or_update_document(
     checksum: str,
     tags: list[str] | None = None,
     difficulty: str | None = None,
-) -> tuple[Document, int]:
+) -> tuple[Document, int, list[str]]:
     document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(source_path)))
+    stale_chunk_ids: list[str] = []
     if document is None:
         document = Document(
             course_id=course.id,
@@ -281,6 +396,13 @@ def create_or_update_document(
         db.flush()
         version_number = 1
     else:
+        stale_chunk_ids = [
+            chunk_id
+            for (chunk_id,) in db.query(Chunk.id)
+            .filter(Chunk.document_id == document.id, Chunk.is_active.is_(True))
+            .all()
+        ]
+        document.is_active = True
         document.checksum = checksum
         document.title = title
         document.source_type = source_type
@@ -291,7 +413,7 @@ def create_or_update_document(
         db.query(Chunk).filter(Chunk.document_id == document.id).update({"is_active": False})
     db.commit()
     db.refresh(document)
-    return document, version_number
+    return document, version_number, stale_chunk_ids
 
 
 async def ingest_file(
@@ -301,6 +423,7 @@ async def ingest_file(
     existing_job_id: str | None = None,
     batch_id: str | None = None,
     course_id: str | None = None,
+    rebuild_graph: bool = True,
 ) -> dict:
     job = db.get(IngestionJob, existing_job_id) if existing_job_id else None
     course = resolve_course(db, job.course_id if job is not None else course_id)
@@ -326,13 +449,16 @@ async def ingest_file(
         db.commit()
 
     if active_version and active_version.checksum == checksum:
+        chunk_count = db.query(Chunk).filter(Chunk.document_id == existing_document.id, Chunk.is_active.is_(True)).count() if existing_document else 0
         job.document_id = existing_document.id if existing_document else None
         job.status = "skipped"
         job.stats = {
-            "chunks": db.query(Chunk).filter(Chunk.document_id == existing_document.id, Chunk.is_active.is_(True)).count() if existing_document else 0,
+            "chunks": chunk_count,
             "concepts": 0,
             "relations": 0,
             "source_type": existing_document.source_type if existing_document else "unknown",
+            "graph_rebuilt": False,
+            **embedding_audit_payload(configured_embedding_provider(), False, "unchanged_checksum", 0),
         }
         db.commit()
         return {
@@ -350,7 +476,7 @@ async def ingest_file(
         raise RuntimeError(f"No readable content extracted from {source_path.name}")
 
     chapter = derive_chapter(source_path)
-    document, version_number = create_or_update_document(
+    document, version_number, stale_chunk_ids = create_or_update_document(
         db=db,
         course=course,
         source_path=source_path,
@@ -361,6 +487,8 @@ async def ingest_file(
     )
     job.document_id = document.id
     db.commit()
+    vector_store = VectorStore(course_name=course.name)
+    vector_store.delete(stale_chunk_ids)
 
     version = DocumentVersion(
         document_id=document.id,
@@ -400,8 +528,18 @@ async def ingest_file(
 
     set_job_state(db, job, "embedding", batch_id=batch_id)
     embedder = EmbeddingProvider()
-    vector_store = VectorStore(course_name=course.name)
-    embeddings = await embedder.embed_texts([chunk.content for chunk in created_chunks], text_type="document")
+    embedding_result = await embedder.embed_texts_with_meta([chunk.content for chunk in created_chunks], text_type="document")
+    embeddings = embedding_result.vectors
+    emit_ingestion_log(
+        batch_id or job.id,
+        "embedding_audit",
+        f"Embedding provider: {embedding_result.provider}, vectors: {len(embeddings)}",
+        provider=embedding_result.provider,
+        model=embedder.settings.embedding_model,
+        external_called=embedding_result.external_called,
+        fallback_reason=embedding_result.fallback_reason,
+        vector_count=len(embeddings),
+    )
     vector_points = []
     for chunk, vector in zip(created_chunks, embeddings):
         chunk.embedding_status = "ready"
@@ -430,23 +568,35 @@ async def ingest_file(
     vector_store.upsert(vector_points)
 
     set_job_state(db, job, "extracting_graph", batch_id=batch_id)
-    concept_count = 0
-    relation_count = 0
-    llm_chunk_ids = choose_llm_graph_chunks(created_chunks, limit=3)
-    for chunk in created_chunks:
-        created, relations = await upsert_concepts_from_chunk(db, course.id, chunk, use_llm=chunk.id in llm_chunk_ids)
-        concept_count += created
-        relation_count += relations
+    graph_stats = (
+        await rebuild_course_graph(db, course.id)
+        if rebuild_graph
+        else {
+            "graph_rebuilt": False,
+            "concepts": 0,
+            "relations": 0,
+            "graph_nodes": 0,
+            "graph_edges": 0,
+            "graph_extraction_provider": graph_extraction_provider(),
+        }
+    )
 
     job.status = "completed"
     job.error_message = None
     job.stats = {
         "chunks": len(created_chunks),
-        "concepts": concept_count,
-        "relations": relation_count,
+        "concepts": graph_stats["concepts"],
+        "relations": graph_stats["relations"],
         "source_type": source_type,
         "chapter": chapter,
         "version": version.version,
+        **graph_stats,
+        **embedding_audit_payload(
+            embedding_result.provider,
+            embedding_result.external_called,
+            embedding_result.fallback_reason,
+            len(embeddings),
+        ),
     }
     db.commit()
     db.refresh(job)
@@ -472,12 +622,15 @@ async def run_batch_ingestion(batch_id: str) -> dict:
         root = Path(batch.source_root)
         if not root.exists():
             batch.status = "failed"
-            batch.last_error = f"Source root not found: {root}"
+            batch.last_error = f"Storage root not found: {root}"
             batch.completed_at = datetime.utcnow()
             session.commit()
+            emit_ingestion_log(batch_id, "batch_failed", batch.last_error)
             return summarize_batch(batch)
 
         files = collect_source_documents(root)
+        emit_model_audit_log(batch_id)
+        emit_ingestion_log(batch_id, "batch_started", f"Scanning course storage: {root}")
         batch.total_files = len(files)
         batch.processed_files = 0
         batch.success_count = 0
@@ -491,7 +644,9 @@ async def run_batch_ingestion(batch_id: str) -> dict:
         session.commit()
 
         course = resolve_course(session, batch.course_id)
-        for path in files:
+        emit_ingestion_log(batch_id, "batch_files", f"Found {len(files)} files to parse", total_files=len(files))
+        for index, path in enumerate(files, start=1):
+            emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] Parsing {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
             job = create_job(
                 session,
                 course_id=course.id,
@@ -507,12 +662,15 @@ async def run_batch_ingestion(batch_id: str) -> dict:
                     trigger_source=batch.trigger_source,
                     existing_job_id=job.id,
                     batch_id=batch.id,
+                    rebuild_graph=False,
                 )
                 coverage[result.get("source_type", "unknown")] += 1
                 if result["status"] == "skipped":
                     batch.skipped_count += 1
+                    emit_ingestion_log(batch_id, "file_skipped", f"Skipped {path.name}", source_path=str(path))
                 else:
                     batch.success_count += 1
+                    emit_ingestion_log(batch_id, "file_completed", f"Completed {path.name}", source_path=str(path), stats=result.get("stats", {}))
             except Exception as exc:
                 failed_job = session.get(IngestionJob, job.id)
                 if failed_job is not None:
@@ -521,6 +679,7 @@ async def run_batch_ingestion(batch_id: str) -> dict:
                 batch.failure_count += 1
                 batch.last_error = str(exc)
                 errors.append({"source_path": str(path), "message": str(exc)})
+                emit_ingestion_log(batch_id, "file_failed", f"Failed {path.name}: {exc}", source_path=str(path), error=str(exc))
                 session.commit()
             finally:
                 batch = session.get(IngestionBatch, batch_id)
@@ -528,20 +687,178 @@ async def run_batch_ingestion(batch_id: str) -> dict:
                     break
                 batch.processed_files += 1
                 batch.stats = {"coverage_by_source_type": dict(coverage), "errors": errors}
+                emit_ingestion_log(
+                    batch_id,
+                    "batch_progress",
+                    f"Progress {batch.processed_files}/{batch.total_files}",
+                    processed_files=batch.processed_files,
+                    total_files=batch.total_files,
+                    success_count=batch.success_count,
+                    failure_count=batch.failure_count,
+                    skipped_count=batch.skipped_count,
+                )
                 session.commit()
 
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} disappeared")
-        batch.stats = {"coverage_by_source_type": dict(coverage), "errors": errors, "degraded_mode": is_degraded_mode()}
+        graph_stats = await rebuild_course_graph(session, batch.course_id) if batch.success_count > 0 or batch.skipped_count > 0 else {
+            "graph_rebuilt": False,
+            "graph_nodes": 0,
+            "graph_edges": 0,
+            "concepts": 0,
+            "relations": 0,
+            "graph_extraction_provider": graph_extraction_provider(),
+        }
+        batch.stats = {
+            "coverage_by_source_type": dict(coverage),
+            "errors": errors,
+            "degraded_mode": is_degraded_mode(),
+            **graph_stats,
+        }
         if batch.failure_count == batch.total_files and batch.total_files > 0:
             batch.status = "failed"
+            terminal_event = "batch_failed"
         elif batch.failure_count > 0:
             batch.status = "partial_failed"
+            terminal_event = "batch_partial_failed"
         else:
             batch.status = "completed"
+            terminal_event = "batch_completed"
         batch.completed_at = datetime.utcnow()
         session.commit()
+        emit_ingestion_log(batch_id, "graph_rebuilt", f"Graph rebuilt: {graph_stats.get('graph_nodes', 0)} nodes, {graph_stats.get('graph_edges', 0)} edges", **graph_stats)
+        emit_ingestion_log(batch_id, terminal_event, f"Batch {batch.status}: {batch.success_count} succeeded, {batch.failure_count} failed, {batch.skipped_count} skipped")
+        return summarize_batch(batch)
+    finally:
+        session.close()
+
+
+async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str]) -> dict:
+    from app.db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        batch = session.get(IngestionBatch, batch_id)
+        if batch is None:
+            raise RuntimeError(f"Batch {batch_id} not found")
+        files = [Path(path) for path in file_paths]
+        batch.total_files = len(files)
+        batch.processed_files = 0
+        batch.success_count = 0
+        batch.failure_count = 0
+        batch.skipped_count = 0
+        batch.status = "queued"
+        batch.started_at = datetime.utcnow()
+        batch.completed_at = None
+        coverage: Counter[str] = Counter()
+        errors: list[dict] = []
+        session.commit()
+
+        course = resolve_course(session, batch.course_id)
+        emit_model_audit_log(batch_id)
+        emit_ingestion_log(batch_id, "batch_started", f"Parsing {len(files)} files", total_files=len(files))
+        for index, path in enumerate(files, start=1):
+            emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] Parsing {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
+            job = session.scalar(
+                select(IngestionJob)
+                .where(IngestionJob.course_id == course.id, IngestionJob.source_path == str(path))
+                .order_by(IngestionJob.updated_at.desc())
+            )
+            if job is None:
+                document = session.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(path)))
+                job = create_job(
+                    session,
+                    course_id=course.id,
+                    document_id=document.id if document else None,
+                    trigger_source="upload",
+                    batch_id=batch.id,
+                    source_path=str(path),
+                )
+            else:
+                job.batch_id = batch.id
+                job.trigger_source = "upload"
+                job.status = "queued"
+                job.error_message = None
+                session.commit()
+            try:
+                if not path.exists():
+                    raise RuntimeError(f"File not found: {path}")
+                result = await ingest_file(
+                    session,
+                    path,
+                    trigger_source="upload",
+                    existing_job_id=job.id,
+                    batch_id=batch.id,
+                    course_id=course.id,
+                    rebuild_graph=False,
+                )
+                coverage[result.get("source_type", "unknown")] += 1
+                if result["status"] == "skipped":
+                    batch.skipped_count += 1
+                    emit_ingestion_log(batch_id, "file_skipped", f"Skipped {path.name}", source_path=str(path))
+                else:
+                    batch.success_count += 1
+                    emit_ingestion_log(batch_id, "file_completed", f"Completed {path.name}", source_path=str(path), stats=result.get("stats", {}))
+            except Exception as exc:
+                failed_job = session.get(IngestionJob, job.id)
+                if failed_job is not None:
+                    failed_job.status = "failed"
+                    failed_job.error_message = str(exc)
+                batch.failure_count += 1
+                batch.last_error = str(exc)
+                errors.append({"source_path": str(path), "message": str(exc)})
+                emit_ingestion_log(batch_id, "file_failed", f"Failed {path.name}: {exc}", source_path=str(path), error=str(exc))
+                session.commit()
+            finally:
+                batch = session.get(IngestionBatch, batch_id)
+                if batch is None:
+                    break
+                batch.processed_files += 1
+                batch.stats = {"uploaded_files": file_paths, "coverage_by_source_type": dict(coverage), "errors": errors}
+                emit_ingestion_log(
+                    batch_id,
+                    "batch_progress",
+                    f"Progress {batch.processed_files}/{batch.total_files}",
+                    processed_files=batch.processed_files,
+                    total_files=batch.total_files,
+                    success_count=batch.success_count,
+                    failure_count=batch.failure_count,
+                    skipped_count=batch.skipped_count,
+                )
+                session.commit()
+
+        batch = session.get(IngestionBatch, batch_id)
+        if batch is None:
+            raise RuntimeError(f"Batch {batch_id} disappeared")
+        graph_stats = await rebuild_course_graph(session, batch.course_id) if batch.success_count > 0 or batch.skipped_count > 0 else {
+            "graph_rebuilt": False,
+            "graph_nodes": 0,
+            "graph_edges": 0,
+            "concepts": 0,
+            "relations": 0,
+            "graph_extraction_provider": graph_extraction_provider(),
+        }
+        batch.stats = {
+            "uploaded_files": file_paths,
+            "coverage_by_source_type": dict(coverage),
+            "errors": errors,
+            "degraded_mode": is_degraded_mode(),
+            **graph_stats,
+        }
+        if batch.failure_count == batch.total_files and batch.total_files > 0:
+            batch.status = "failed"
+            terminal_event = "batch_failed"
+        elif batch.failure_count > 0:
+            batch.status = "partial_failed"
+            terminal_event = "batch_partial_failed"
+        else:
+            batch.status = "completed"
+            terminal_event = "batch_completed"
+        batch.completed_at = datetime.utcnow()
+        session.commit()
+        emit_ingestion_log(batch_id, "graph_rebuilt", f"Graph rebuilt: {graph_stats.get('graph_nodes', 0)} nodes, {graph_stats.get('graph_edges', 0)} edges", **graph_stats)
+        emit_ingestion_log(batch_id, terminal_event, f"Batch {batch.status}: {batch.success_count} succeeded, {batch.failure_count} failed, {batch.skipped_count} skipped")
         return summarize_batch(batch)
     finally:
         session.close()

@@ -2,15 +2,55 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Chunk, Concept, ConceptRelation, Course, Document, IngestionBatch, IngestionJob
+from app.core.config import get_settings
+from app.models import Chunk, Concept, ConceptRelation, Course, Document, DocumentVersion, IngestionBatch, IngestionJob
 from app.schemas import Citation, SearchFilters
 from app.services.concept_graph import get_graph_payload
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode
 from app.services.vector_store import VectorStore
+
+
+STORAGE_ALLOWED_SUFFIXES = {
+    ".pdf",
+    ".ipynb",
+    ".md",
+    ".markdown",
+    ".txt",
+    ".docx",
+    ".pptx",
+    ".ppt",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".html",
+    ".htm",
+}
+STORAGE_EXCLUDED_PARTS = {"output", "tmp", "scripts", ".ipynb_checkpoints", "__pycache__"}
+STORAGE_IGNORED_NAMES = {".ds_store"}
+TERMINAL_BATCH_STATES = {"completed", "failed", "partial_failed", "skipped"}
+
+
+def should_include_storage_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    if path.name.lower() in STORAGE_IGNORED_NAMES or path.name.startswith("~$"):
+        return False
+    if path.suffix.lower() not in STORAGE_ALLOWED_SUFFIXES:
+        return False
+    return not any(part.lower() in STORAGE_EXCLUDED_PARTS for part in path.parts)
+
+
+def collect_course_storage_paths(course: Course) -> list[Path]:
+    root = get_settings().course_paths_for_name(course.name)["storage_root"]
+    if not root.exists():
+        return []
+    return sorted((path for path in root.rglob("*") if should_include_storage_file(path)), key=lambda item: str(item).lower())
 
 
 def score_chunk_bonus(chunk: Chunk, document: Document, query: str) -> float:
@@ -183,6 +223,7 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
                 "name": "Course Workspace",
                 "description": None,
                 "source_root": "",
+                "storage_root": "",
                 "document_count": 0,
                 "concept_count": 0,
                 "degraded_mode": is_degraded_mode(),
@@ -197,16 +238,17 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
         }
 
     documents = db.scalars(select(Document).where(Document.course_id == course.id, Document.is_active.is_(True))).all()
+    file_items = list_course_files(db, course.id)
     concepts = db.scalars(select(Concept).where(Concept.course_id == course.id)).all()
     relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course.id)).all()
     batches = db.scalars(select(IngestionBatch).where(IngestionBatch.course_id == course.id).order_by(IngestionBatch.created_at.desc())).all()
 
-    chapter_map: dict[str, list[Document]] = defaultdict(list)
+    chapter_map: dict[str, list[dict]] = defaultdict(list)
     source_coverage = Counter()
-    for document in documents:
-        chapter = document.tags[0] if document.tags else "General"
-        chapter_map[chapter].append(document)
-        source_coverage[document.source_type] += 1
+    for item in file_items:
+        chapter = item.get("chapter") or "General"
+        chapter_map[chapter].append(item)
+        source_coverage[item.get("source_type") or "unknown"] += 1
 
     tree = [
         {
@@ -214,21 +256,22 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
             "title": chapter,
             "type": "chapter",
             "children": [
-                {"id": document.id, "title": document.title, "type": "document", "children": []}
-                for document in sorted(entries, key=lambda item: item.title)
+                {"id": item["document_id"] or item["id"], "title": item["title"], "type": "document", "children": []}
+                for item in sorted(entries, key=lambda item: item["title"])
             ],
         }
         for chapter, entries in sorted(chapter_map.items())
     ]
-    latest_batch = batches[0] if batches else None
+    latest_batch = next((batch for batch in batches if batch.status not in TERMINAL_BATCH_STATES), None)
     graph_payload = get_graph_payload(db, course.id)
     return {
         "course": {
             "id": course.id,
             "name": course.name,
             "description": course.description,
-            "source_root": course.source_root,
-            "document_count": len(documents),
+            "source_root": str(get_settings().course_paths_for_name(course.name)["storage_root"]),
+            "storage_root": str(get_settings().course_paths_for_name(course.name)["storage_root"]),
+            "document_count": len(file_items),
             "concept_count": len(concepts),
             "degraded_mode": is_degraded_mode(),
         },
@@ -251,11 +294,155 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
             "started_at": latest_batch.started_at,
             "completed_at": latest_batch.completed_at,
         },
-        "ingested_document_count": len(documents),
+        "ingested_document_count": len(file_items),
         "graph_relation_count": len(relations),
         "coverage_by_source_type": dict(source_coverage),
         "degraded_mode": is_degraded_mode(),
     }
+
+
+ACTIVE_FILE_STATES = {"parsing", "chunking", "embedding", "extracting_graph", "processing"}
+
+
+def source_type_from_path(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in {".ppt", ".pptx"}:
+        return suffix.lstrip(".")
+    if suffix == ".docx":
+        return "docx"
+    if suffix in {".md", ".markdown"}:
+        return "markdown"
+    if suffix == ".txt":
+        return "text"
+    if suffix == ".ipynb":
+        return "notebook"
+    if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
+        return "image"
+    if suffix in {".html", ".htm"}:
+        return "html"
+    return "unknown"
+
+
+def file_status_from_job(job: IngestionJob | None, has_parsed_chunks: bool) -> str:
+    if job is None:
+        return "parsed" if has_parsed_chunks else "pending"
+    if job.status in ACTIVE_FILE_STATES:
+        return "parsing"
+    if job.status == "queued":
+        return "parsed" if has_parsed_chunks else "pending"
+    if job.status == "failed":
+        return "failed"
+    if job.status == "skipped":
+        return "parsed" if has_parsed_chunks else "skipped"
+    if job.status == "completed":
+        return "parsed" if has_parsed_chunks else "pending"
+    return "parsed" if has_parsed_chunks else "pending"
+
+
+def list_course_files(db: Session, course_id: str) -> list[dict]:
+    course = db.get(Course, course_id)
+    documents = db.scalars(select(Document).where(Document.course_id == course_id, Document.is_active.is_(True))).all()
+    storage_root = get_settings().course_paths_for_name(course.name)["storage_root"] if course is not None else None
+    storage_paths = {str(path) for path in collect_course_storage_paths(course)} if course is not None else set()
+    document_versions = db.scalars(
+        select(DocumentVersion)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(Document.course_id == course_id, Document.is_active.is_(True), DocumentVersion.is_active.is_(True))
+    ).all()
+    documents_by_id = {document.id: document for document in documents}
+    documents_by_storage_path = {
+        version.storage_path: documents_by_id[version.document_id]
+        for version in document_versions
+        if version.document_id in documents_by_id and version.storage_path
+    }
+    jobs = db.scalars(select(IngestionJob).where(IngestionJob.course_id == course_id).order_by(IngestionJob.updated_at.desc())).all()
+    latest_jobs: dict[str, IngestionJob] = {}
+    removed_paths: set[str] = set()
+    for job in jobs:
+        is_removed = (job.error_message or "").startswith("Removed by user") or (job.trigger_source == "remove" and (job.stats or {}).get("removed"))
+        if is_removed:
+            if job.source_path:
+                removed_paths.add(job.source_path)
+            continue
+        if job.source_path and job.source_path not in latest_jobs:
+            latest_jobs[job.source_path] = job
+
+    items: dict[str, dict] = {}
+    if course is not None:
+        for path in sorted((Path(path_string) for path_string in storage_paths), key=lambda item: str(item).lower()):
+            path_string = str(path)
+            if path_string in removed_paths:
+                continue
+            if path_string in items:
+                continue
+            job = latest_jobs.get(path_string)
+            document = documents_by_storage_path.get(path_string)
+            chunk_count = db.query(Chunk).filter(Chunk.document_id == document.id, Chunk.is_active.is_(True)).count() if document else 0
+            items[path_string] = {
+                "id": document.id if document else path_string,
+                "document_id": document.id if document else None,
+                "title": document.title if document else path.stem or path.name,
+                "source_path": path_string,
+                "source_type": document.source_type if document else source_type_from_path(path_string),
+                "chapter": document.tags[0] if document and document.tags else path.parent.name if storage_root is not None and path.parent != storage_root else None,
+                "status": file_status_from_job(job, has_parsed_chunks=chunk_count > 0),
+                "job_state": job.status if job else None,
+                "batch_id": job.batch_id if job else None,
+                "error": job.error_message if job and job.status == "failed" else None,
+                "chunk_count": chunk_count,
+                "updated_at": document.updated_at if document else job.updated_at if job else None,
+            }
+
+    for path, job in latest_jobs.items():
+        if path in removed_paths:
+            continue
+        if path in items:
+            continue
+        if storage_root is not None:
+            continue
+        items[path] = {
+            "id": job.id,
+            "document_id": job.document_id,
+            "title": Path(path).stem or Path(path).name,
+            "source_path": path,
+            "source_type": source_type_from_path(path),
+            "chapter": None,
+            "status": file_status_from_job(job, has_parsed_chunks=False),
+            "job_state": job.status,
+            "batch_id": job.batch_id,
+            "error": job.error_message,
+            "chunk_count": 0,
+            "updated_at": job.updated_at,
+        }
+
+    latest_batch = db.scalar(select(IngestionBatch).where(IngestionBatch.course_id == course_id).order_by(IngestionBatch.created_at.desc()))
+    uploaded_paths = (latest_batch.stats or {}).get("uploaded_files", []) if latest_batch else []
+    for path in uploaded_paths:
+        if path in removed_paths:
+            continue
+        if path in items:
+            continue
+        if storage_root is not None:
+            continue
+        items[path] = {
+            "id": path,
+            "document_id": None,
+            "title": Path(path).stem or Path(path).name,
+            "source_path": path,
+            "source_type": source_type_from_path(path),
+            "chapter": None,
+            "status": "pending",
+            "job_state": None,
+            "batch_id": latest_batch.id,
+            "error": None,
+            "chunk_count": 0,
+            "updated_at": latest_batch.created_at,
+        }
+
+    status_rank = {"parsing": 0, "pending": 1, "failed": 2, "parsed": 3, "skipped": 4}
+    return sorted(items.values(), key=lambda item: (status_rank.get(item["status"], 9), item["title"].lower()))
 
 
 def get_job_status(db: Session, job_id: str) -> dict | None:

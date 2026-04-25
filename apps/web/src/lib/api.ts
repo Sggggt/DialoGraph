@@ -3,15 +3,21 @@ import type {
   AgentTraceEventPayload,
   BatchStartResponse,
   ConceptCard,
+  CourseFileSummary,
   CourseCreateRequest,
   CourseSummary,
   DashboardSnapshot,
+  DeleteResponse,
   GraphNodeDetail,
   GraphResponse,
   IngestionBatchSummary,
   JobStatusResponse,
+  ModelSettingsResponse,
+  ModelSettingsUpdate,
+  ParseUploadedFilesRequest,
   QARequest,
   QAResponse,
+  RefreshResponse,
   SearchRequest,
   SearchResponse,
   SessionMessagesResponse,
@@ -59,6 +65,39 @@ export async function createCourse(payload: CourseCreateRequest): Promise<Course
 export async function fetchDashboard(courseId?: string | null): Promise<DashboardSnapshot> {
   const response = await fetch(buildApiUrl("/courses/current/dashboard", { course_id: courseId }), { cache: "no-store" });
   return parseResponse<DashboardSnapshot>(response);
+}
+
+export async function refreshCourse(courseId?: string | null): Promise<RefreshResponse> {
+  const response = await fetch(buildApiUrl("/courses/current/refresh", { course_id: courseId }), {
+    method: "POST",
+  });
+  return parseResponse<RefreshResponse>(response);
+}
+
+export async function fetchModelSettings(): Promise<ModelSettingsResponse> {
+  const response = await fetch(buildApiUrl("/settings/model"), { cache: "no-store" });
+  return parseResponse<ModelSettingsResponse>(response);
+}
+
+export async function updateModelSettings(payload: ModelSettingsUpdate): Promise<ModelSettingsResponse> {
+  const response = await fetch(buildApiUrl("/settings/model"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<ModelSettingsResponse>(response);
+}
+
+export async function fetchCourseFiles(courseId?: string | null): Promise<CourseFileSummary[]> {
+  const response = await fetch(buildApiUrl("/course-files", { course_id: courseId }), { cache: "no-store" });
+  return parseResponse<CourseFileSummary[]>(response);
+}
+
+export async function removeCourseFile(sourcePath: string, courseId?: string | null): Promise<{ removed: boolean }> {
+  const response = await fetch(buildApiUrl("/course-files", { course_id: courseId, source_path: sourcePath }), {
+    method: "DELETE",
+  });
+  return parseResponse<{ removed: boolean }>(response);
 }
 
 export async function fetchGraph(courseId?: string | null): Promise<GraphResponse> {
@@ -118,17 +157,23 @@ export async function uploadFile(file: File, courseId?: string | null): Promise<
   return parseResponse<UploadFileResponse>(response);
 }
 
+export async function parseUploadedFiles(filePaths: string[], courseId?: string | null): Promise<BatchStartResponse> {
+  const payload: ParseUploadedFilesRequest = { file_paths: filePaths };
+  const response = await fetch(buildApiUrl("/ingestion/parse-uploaded-files", { course_id: courseId }), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return parseResponse<BatchStartResponse>(response);
+}
+
+export function getBatchLogUrl(batchId: string): string {
+  return buildApiUrl(`/ingestion/batches/${batchId}/logs`);
+}
+
 export async function fetchJobStatus(jobId: string): Promise<JobStatusResponse> {
   const response = await fetch(`${API_BASE_URL}/jobs/${jobId}`, { cache: "no-store" });
   return parseResponse<JobStatusResponse>(response);
-}
-
-export async function startSourceSync(courseId?: string | null): Promise<BatchStartResponse> {
-  const response = await fetch(buildApiUrl("/ingestion/sync-source", { course_id: courseId }), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-  });
-  return parseResponse<BatchStartResponse>(response);
 }
 
 export async function fetchBatchStatus(batchId: string): Promise<IngestionBatchSummary> {
@@ -149,6 +194,11 @@ export async function fetchSessions(courseId?: string | null): Promise<SessionSu
 export async function fetchSessionMessages(sessionId: string): Promise<SessionMessagesResponse> {
   const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`, { cache: "no-store" });
   return parseResponse<SessionMessagesResponse>(response);
+}
+
+export async function deleteSession(sessionId: string): Promise<DeleteResponse> {
+  const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}`, { method: "DELETE" });
+  return parseResponse<DeleteResponse>(response);
 }
 
 export async function streamAnswer(

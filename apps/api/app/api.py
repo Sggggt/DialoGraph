@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
@@ -10,21 +11,28 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import AgentRun, QASession
+from app.models import AgentRun, AgentTraceEvent, QASession
+from app.core.config import get_settings
 from app.schemas import (
     AgentRequest,
     AgentResponse,
     BatchStartResponse,
     ConceptCard,
+    CourseFileSummary,
     CourseCreateRequest,
     CourseSummary,
     DashboardSnapshot,
+    DeleteResponse,
     GraphNodeDetail,
     GraphResponse,
     IngestionBatchSummary,
     JobStatusResponse,
+    ModelSettingsResponse,
+    ModelSettingsUpdate,
+    ParseUploadedFilesRequest,
     QARequest,
     QAResponse,
+    RefreshResponse,
     SearchRequest,
     SearchResponse,
     SessionMessagesResponse,
@@ -37,16 +45,23 @@ from app.services.embeddings import is_degraded_mode
 from app.services.agent_graph import run_agent, run_to_task_status, stream_agent_events
 from app.services.ingestion import (
     create_course_space,
+    collect_source_documents,
+    create_uploaded_files_batch,
     create_job,
     create_sync_batch,
     get_batch_status,
     list_course_summaries,
+    register_uploaded_file,
     resolve_course,
     run_batch_ingestion,
     run_ingestion_job,
+    run_uploaded_files_ingestion,
+    remove_course_file,
     summarize_course,
 )
-from app.services.retrieval import get_dashboard_snapshot, get_job_status, search_chunks
+from app.services.ingestion_logs import TERMINAL_LOG_EVENTS, subscribe_ingestion_logs, unsubscribe_ingestion_logs
+from app.services.retrieval import get_dashboard_snapshot, get_job_status, list_course_files, search_chunks
+from app.services.runtime_settings import model_settings_payload, update_model_settings
 from app.services.storage import save_upload
 
 router = APIRouter()
@@ -62,6 +77,16 @@ def get_requested_course(db: Session, course_id: str | None = None):
 @router.get("/health")
 def healthcheck() -> dict:
     return {"status": "ok", "degraded_mode": is_degraded_mode()}
+
+
+@router.get("/settings/model", response_model=ModelSettingsResponse)
+def get_model_settings() -> dict:
+    return model_settings_payload()
+
+
+@router.put("/settings/model", response_model=ModelSettingsResponse)
+def save_model_settings(request: ModelSettingsUpdate) -> dict:
+    return update_model_settings(request.model_dump())
 
 
 @router.get("/courses", response_model=list[CourseSummary])
@@ -83,6 +108,26 @@ def create_course(request: CourseCreateRequest, db: Session = Depends(get_db)) -
 def course_dashboard(course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
     course = get_requested_course(db, course_id)
     return get_dashboard_snapshot(db, course.id)
+
+
+@router.post("/courses/current/refresh", response_model=RefreshResponse)
+def refresh_current_course(course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, course_id)
+    return {"course_id": course.id, "refreshed_at": datetime.utcnow()}
+
+
+@router.get("/course-files", response_model=list[CourseFileSummary])
+def course_files(course_id: str | None = None, db: Session = Depends(get_db)) -> list[dict]:
+    course = get_requested_course(db, course_id)
+    return list_course_files(db, course.id)
+
+
+@router.delete("/course-files")
+def delete_course_file(source_path: str, course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, course_id)
+    if not remove_course_file(db, course, source_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return {"removed": True}
 
 
 @router.get("/courses/current/graph", response_model=GraphResponse)
@@ -131,27 +176,59 @@ def enqueue_batch(batch_id: str) -> None:
         asyncio.run(run_batch_ingestion(batch_id))
 
 
+def enqueue_uploaded_batch(batch_id: str, file_paths: list[str]) -> None:
+    asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths))
+
+
 @router.post("/files/upload", response_model=UploadFileResponse)
 async def upload_file(
-    background_tasks: BackgroundTasks,
     course_id: str | None = None,
     upload: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> dict:
     course = get_requested_course(db, course_id)
     stored_path = await save_upload(upload, course.name)
-    job = create_job(db, course.id, None, "upload", source_path=str(stored_path))
-    background_tasks.add_task(enqueue_ingestion, job.id, str(stored_path), "upload")
-    return {"document_id": "", "job_id": job.id, "status": "queued"}
+    document, job = register_uploaded_file(db, course, stored_path)
+    return {"document_id": document.id, "job_id": job.id, "status": "queued", "source_path": str(stored_path)}
 
 
-@router.post("/ingestion/sync-source", response_model=BatchStartResponse)
-async def sync_source_directory(background_tasks: BackgroundTasks, course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+@router.post("/ingestion/parse-uploaded-files", response_model=BatchStartResponse)
+async def parse_uploaded_files(
+    request: ParseUploadedFilesRequest,
+    background_tasks: BackgroundTasks,
+    course_id: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
     course = get_requested_course(db, course_id)
-    root = Path(course.source_root)
+    storage_root = Path(get_settings().course_paths_for_name(course.name)["storage_root"]).resolve()
+    requested_paths = request.file_paths or [str(path) for path in collect_source_documents(storage_root)]
+    if not requested_paths:
+        raise HTTPException(status_code=400, detail="No files found in course storage")
+    file_paths = []
+    seen_paths: set[Path] = set()
+    for raw_path in requested_paths:
+        path = Path(raw_path).resolve()
+        if not path.exists() or not path.is_file():
+            raise HTTPException(status_code=404, detail=f"File not found: {path}")
+        if storage_root not in path.parents and path != storage_root:
+            raise HTTPException(status_code=400, detail=f"File is outside course storage: {path}")
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        file_paths.append(path)
+    batch = create_uploaded_files_batch(db, course.id, file_paths)
+    background_tasks.add_task(enqueue_uploaded_batch, batch.id, [str(path) for path in file_paths])
+    return {"batch_id": batch.id, "state": "queued"}
+
+
+@router.post("/ingestion/parse-storage", response_model=BatchStartResponse)
+@router.post("/ingestion/sync-source", response_model=BatchStartResponse, include_in_schema=False)
+async def parse_storage_directory(background_tasks: BackgroundTasks, course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, course_id)
+    root = Path(get_settings().course_paths_for_name(course.name)["storage_root"])
     if not root.exists():
-        raise HTTPException(status_code=404, detail=f"Source root not found: {root}")
-    batch = create_sync_batch(db, course.id, root, trigger_source="sync")
+        raise HTTPException(status_code=404, detail=f"Storage root not found: {root}")
+    batch = create_sync_batch(db, course.id, root, trigger_source="storage")
     background_tasks.add_task(enqueue_batch, batch.id)
     return {"batch_id": batch.id, "state": "queued"}
 
@@ -162,6 +239,30 @@ def batch_status(batch_id: str, db: Session = Depends(get_db)) -> dict:
     if batch is None:
         raise HTTPException(status_code=404, detail="Batch not found")
     return batch
+
+
+@router.get("/ingestion/batches/{batch_id}/logs")
+async def batch_logs(batch_id: str):
+    async def event_stream():
+        history, subscriber = subscribe_ingestion_logs(batch_id)
+        try:
+            for item in history:
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                if item.get("event") in TERMINAL_LOG_EVENTS:
+                    return
+            while True:
+                try:
+                    item = await asyncio.to_thread(subscriber.get, True, 15)
+                except Exception:
+                    yield ": heartbeat\n\n"
+                    continue
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                if item.get("event") in TERMINAL_LOG_EVENTS:
+                    return
+        finally:
+            unsubscribe_ingestion_logs(batch_id, subscriber)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
@@ -257,3 +358,17 @@ def get_session_messages(session_id: str, db: Session = Depends(get_db)) -> dict
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"session_id": session.id, "messages": session.transcript or []}
+
+
+@router.delete("/sessions/{session_id}", response_model=DeleteResponse)
+def delete_session(session_id: str, db: Session = Depends(get_db)) -> dict:
+    session = db.get(QASession, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    run_ids = [run.id for run in db.scalars(select(AgentRun).where(AgentRun.session_id == session_id)).all()]
+    if run_ids:
+        db.query(AgentTraceEvent).filter(AgentTraceEvent.run_id.in_(run_ids)).delete(synchronize_session=False)
+        db.query(AgentRun).filter(AgentRun.id.in_(run_ids)).delete(synchronize_session=False)
+    db.delete(session)
+    db.commit()
+    return {"deleted": True}

@@ -26,7 +26,10 @@ export function CourseProvider({ children }: { children: React.ReactNode }) {
   const coursesQuery = useQuery({ queryKey: ["courses"], queryFn: fetchCourses });
 
   useEffect(() => {
-    const courses = coursesQuery.data ?? [];
+    if (!coursesQuery.data) {
+      return;
+    }
+    const courses = coursesQuery.data;
     if (courses.length === 0) {
       if (selectedCourseId !== null) {
         setSelectedCourseId(null);

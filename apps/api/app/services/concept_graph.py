@@ -6,6 +6,7 @@ from collections import defaultdict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models import Chunk, Concept, ConceptAlias, ConceptRelation, Course, Document
 from app.schemas import Citation
 from app.services.embeddings import ChatProvider
@@ -81,6 +82,11 @@ STOP_CONCEPTS = {
     "for",
 }
 CONCEPT_PATTERN = re.compile(r"\b[A-Z][A-Za-z0-9\-]+(?:\s+[A-Z][A-Za-z0-9\-]+){0,4}\b")
+
+
+def graph_extraction_provider() -> str:
+    settings = get_settings()
+    return "dashscope_chat" if settings.dashscope_api_key and not settings.enable_fake_chat else "heuristic"
 
 
 def normalize_concept_name(name: str) -> str:
@@ -223,7 +229,7 @@ def get_or_create_concept(
     normalized = normalize_concept_name(name)
     alias_match = db.scalar(select(ConceptAlias).where(ConceptAlias.normalized_alias == normalized))
     concept = None
-    if alias_match and alias_match.concept.course_id == course_id:
+    if alias_match and alias_match.concept and alias_match.concept.course_id == course_id:
         concept = alias_match.concept
     if concept is None:
         concept = db.scalar(select(Concept).where(Concept.course_id == course_id, Concept.normalized_name == normalized))
@@ -323,6 +329,53 @@ async def upsert_concepts_from_chunk(db: Session, course_id: str, chunk: Chunk, 
         )
         relation_count += 1
     return created_count, relation_count
+
+
+def choose_llm_graph_chunks(chunks: list[Chunk], limit: int = 3) -> set[str]:
+    priority = {"markdown": 4, "pdf_page": 4, "doc_section": 4, "slide": 4, "text": 3, "html": 3, "ocr": 3, "code": 0, "output": 0}
+    ranked = sorted(
+        chunks,
+        key=lambda chunk: (
+            priority.get((chunk.metadata_json or {}).get("content_kind", "text"), 2),
+            len(chunk.content),
+            1 if chunk.source_type == "notebook" else 2,
+        ),
+        reverse=True,
+    )
+    return {chunk.id for chunk in ranked[:limit]}
+
+
+async def rebuild_course_graph(db: Session, course_id: str) -> dict:
+    db.query(ConceptRelation).filter(ConceptRelation.course_id == course_id).delete(synchronize_session=False)
+    concept_ids = [concept.id for concept in db.scalars(select(Concept).where(Concept.course_id == course_id)).all()]
+    if concept_ids:
+        db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(concept_ids)).delete(synchronize_session=False)
+        db.query(Concept).filter(Concept.id.in_(concept_ids)).delete(synchronize_session=False)
+    db.commit()
+
+    chunks = db.scalars(
+        select(Chunk)
+        .join(Document, Document.id == Chunk.document_id)
+        .where(Chunk.course_id == course_id, Chunk.is_active.is_(True), Document.is_active.is_(True))
+        .order_by(Chunk.created_at.asc())
+    ).all()
+    llm_chunk_ids = choose_llm_graph_chunks(chunks, limit=3)
+    concept_count = 0
+    relation_count = 0
+    for chunk in chunks:
+        created, relations = await upsert_concepts_from_chunk(db, course_id, chunk, use_llm=chunk.id in llm_chunk_ids)
+        concept_count += created
+        relation_count += relations
+    db.commit()
+    graph = get_graph_payload(db, course_id)
+    return {
+        "graph_rebuilt": True,
+        "concepts": concept_count,
+        "relations": relation_count,
+        "graph_nodes": len(graph.get("nodes", [])),
+        "graph_edges": len(graph.get("edges", [])),
+        "graph_extraction_provider": graph_extraction_provider(),
+    }
 
 
 def get_concept_cards(db: Session, course_id: str) -> list[dict]:

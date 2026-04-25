@@ -17,6 +17,7 @@ import {
   Send,
   ShieldCheck,
   Sparkles,
+  Trash2,
   Waypoints,
 } from "lucide-react";
 
@@ -28,7 +29,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
-import { fetchDashboard, fetchSessionMessages, fetchSessions, streamAnswer } from "@/lib/api";
+import { deleteSession, fetchDashboard, fetchSessionMessages, fetchSessions, streamAnswer } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
@@ -40,12 +41,24 @@ type ChatTurn = {
   citations?: Citation[];
 };
 
-const suggestions = [
-  "Compare adjacency matrix and Laplacian matrix",
-  "Explain eigenvector centrality with a course citation",
-  "Find exercise-style material about PageRank",
-  "How does algebraic connectivity relate to network robustness?",
+const fallbackSuggestions = [
+  "总结这门课最核心的知识结构",
+  "结合课程材料解释一个重要概念",
+  "找出本课程中容易混淆的概念并比较",
+  "基于课程引用给我一份复习路线",
 ];
+
+function buildCourseSuggestions(tree: Array<{ title: string; children?: Array<{ title: string }> }> | undefined): string[] {
+  const chapters = tree?.map((node) => node.title).filter(Boolean) ?? [];
+  const documents = tree?.flatMap((node) => node.children?.map((child) => child.title) ?? []).filter(Boolean) ?? [];
+  const suggestions = [
+    chapters[0] ? `总结 ${chapters[0]} 的核心内容` : "",
+    chapters[1] ? `比较 ${chapters[0]} 和 ${chapters[1]} 的联系` : "",
+    documents[0] ? `根据 ${documents[0]} 生成复习提纲` : "",
+    chapters[0] ? `从课程材料中找出 ${chapters[0]} 的关键概念` : "",
+  ].filter(Boolean);
+  return suggestions.length ? suggestions.slice(0, 4) : fallbackSuggestions;
+}
 
 function normalizeMessages(messages: Array<Record<string, unknown>>): ChatTurn[] {
   return messages
@@ -84,23 +97,23 @@ function ChatHeader({
       <div className="flex flex-wrap items-center gap-2">
         <Button type="button" variant="outline" className="rounded-full" onClick={onOpenSessions}>
           <History data-icon="inline-start" />
-          Sessions
+          会话
         </Button>
         <Button type="button" variant="outline" className="rounded-full" onClick={onOpenTrace}>
           <Waypoints data-icon="inline-start" />
-          Trace
+          轨迹
         </Button>
         <Button type="button" variant="outline" className="rounded-full" onClick={onOpenCitations}>
           <FileText data-icon="inline-start" />
-          Citations {citationsCount}
+          引用 {citationsCount}
         </Button>
       </div>
       <div className="flex w-full flex-wrap gap-2">
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           <ShieldCheck data-icon="inline-start" />
-          {grounded ? "Grounded" : "Fallback"}
+          {grounded ? "已接入证据" : "降级模式"}
         </span>
-        <span className="kg-micro-chip max-w-full truncate rounded-full px-3 py-2 text-xs">Chapters: {chapterList || "waiting"}</span>
+        <span className="kg-micro-chip max-w-full truncate rounded-full px-3 py-2 text-xs">章节：{chapterList || "等待中"}</span>
         {latestRun?.route ? (
           <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
             <BrainCircuit data-icon="inline-start" />
@@ -112,7 +125,7 @@ function ChatHeader({
   );
 }
 
-function SuggestionChips({ onPick }: { onPick: (value: string) => void }) {
+function SuggestionChips({ suggestions, onPick }: { suggestions: string[]; onPick: (value: string) => void }) {
   return (
     <div className="mx-auto flex max-w-3xl flex-wrap justify-center gap-2">
       {suggestions.map((suggestion) => (
@@ -131,7 +144,7 @@ function SuggestionChips({ onPick }: { onPick: (value: string) => void }) {
   );
 }
 
-function EmptyChatState({ onPick }: { onPick: (value: string) => void }) {
+function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick: (value: string) => void }) {
   return (
     <div className="grid min-h-[calc(100dvh-21rem)] place-items-center px-4 pb-44 pt-12 text-center">
       <div className="-translate-y-24">
@@ -143,7 +156,7 @@ function EmptyChatState({ onPick }: { onPick: (value: string) => void }) {
           The agent will route your question, retrieve course fragments, grade evidence, generate an answer, and verify citations.
         </p>
         <div className="mt-7">
-          <SuggestionChips onPick={onPick} />
+          <SuggestionChips suggestions={suggestions} onPick={onPick} />
         </div>
       </div>
     </div>
@@ -175,7 +188,7 @@ function MessageBubble({ turn, index, onOpenCitations }: { turn: ChatTurn; index
         {!isUser && turn.citations?.length ? (
           <button type="button" onClick={onOpenCitations} className="kg-micro-chip mt-4 rounded-full px-3 py-2 text-xs transition hover:border-cyan-200/30 hover:text-white">
             <FileText />
-            {turn.citations.length} verified sources
+            {turn.citations.length} 条已验证来源
           </button>
         ) : null}
       </div>
@@ -189,7 +202,7 @@ function GeneratingBubble({ content }: { content: string }) {
       <div className="w-full max-w-[min(860px,92%)] border-l border-cyan-200/18 px-5 py-4 text-white">
         <div className="mb-3 flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-cyan-100/50">
           <span className="tech-dot" />
-          Generating
+          生成中
         </div>
         {content ? (
           <div className="relative">
@@ -204,7 +217,7 @@ function GeneratingBubble({ content }: { content: string }) {
               <span />
               <span />
             </span>
-            Routing, retrieving, and checking evidence...
+            正在路由、检索并检查证据...
           </div>
         )}
       </div>
@@ -218,12 +231,14 @@ function MessageList({
   draftAnswer,
   onPickSuggestion,
   onOpenCitations,
+  suggestions,
 }: {
   turns: ChatTurn[];
   isGenerating: boolean;
   draftAnswer: string;
   onPickSuggestion: (value: string) => void;
   onOpenCitations: () => void;
+  suggestions: string[];
 }) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
@@ -234,7 +249,7 @@ function MessageList({
   return (
     <div className="relative min-h-[calc(100dvh-21rem)]">
       {turns.length === 0 && !isGenerating ? (
-        <EmptyChatState onPick={onPickSuggestion} />
+        <EmptyChatState suggestions={suggestions} onPick={onPickSuggestion} />
       ) : (
         <div className="mx-auto flex max-w-5xl flex-col gap-8 px-1 pb-52 pt-4">
           {turns.map((turn, index) => (
@@ -278,10 +293,10 @@ function ChatComposer({
             <div className="flex flex-wrap items-center gap-2 px-1">
               <span className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">
                 <Layers3 />
-                Course context
+                课程上下文
               </span>
               <span className="kg-micro-chip max-w-full truncate rounded-full px-2.5 py-1 text-[11px]">
-                Session {activeSessionId ? activeSessionId.slice(0, 8) : "new"}
+                会话 {activeSessionId ? activeSessionId.slice(0, 8) : "新建"}
               </span>
             </div>
             <div className="flex items-end gap-3">
@@ -299,7 +314,7 @@ function ChatComposer({
               />
               <Button type="button" size="icon-lg" className="rounded-full" onClick={onSubmit} disabled={isPending || !value.trim()}>
                 {isPending ? <Loader2 className="animate-spin" /> : <Send />}
-                <span className="sr-only">Ask Agent</span>
+                <span className="sr-only">提问</span>
               </Button>
             </div>
           </div>
@@ -315,6 +330,7 @@ function SessionsDrawer({
   sessions,
   activeSessionId,
   onSelect,
+  onDelete,
   onNew,
 }: {
   open: boolean;
@@ -322,14 +338,15 @@ function SessionsDrawer({
   sessions: SessionSummary[];
   activeSessionId: string | null;
   onSelect: (sessionId: string) => void | Promise<void>;
+  onDelete: (sessionId: string) => void | Promise<void>;
   onNew: () => void;
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="left" className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-md">
         <SheetHeader className="border-b border-white/8 p-6">
-          <SheetTitle>Sessions</SheetTitle>
-          <SheetDescription>Conversation memory for the course agent.</SheetDescription>
+          <SheetTitle>会话</SheetTitle>
+          <SheetDescription>课程智能体的对话记忆。</SheetDescription>
         </SheetHeader>
         <div className="p-5">
           <Button
@@ -341,30 +358,42 @@ function SessionsDrawer({
             }}
           >
             <Plus data-icon="inline-start" />
-            New session
+            新建会话
           </Button>
         </div>
         <ScrollArea className="h-[calc(100dvh-10rem)] px-5 pb-5">
           <div className="flex flex-col gap-2">
             {sessions.map((session) => (
-              <button
+              <div
                 key={session.id}
-                type="button"
-                onClick={() => {
-                  onSelect(session.id);
-                  onOpenChange(false);
-                }}
                 className={cn(
-                  "rounded-2xl border px-4 py-3 text-left transition",
+                  "flex items-start gap-2 rounded-2xl border px-3 py-3 transition",
                   session.id === activeSessionId ? "border-cyan-200/28 bg-cyan-300/[0.075]" : "border-white/7 bg-white/[0.025] hover:border-cyan-200/22",
                 )}
               >
-                <div className="flex items-center justify-between gap-3">
-                  <span className="min-w-0 truncate text-sm font-medium text-white">{session.title ?? "Untitled session"}</span>
-                  <ChevronRight className="text-white/35" />
-                </div>
-                {session.last_question ? <p className="mt-2 line-clamp-2 text-xs leading-5 text-white/45">{session.last_question}</p> : null}
-              </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onSelect(session.id);
+                    onOpenChange(false);
+                  }}
+                  className="min-w-0 flex-1 text-left"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="min-w-0 truncate text-sm font-medium text-white">{session.title ?? "未命名会话"}</span>
+                    <ChevronRight className="text-white/35" />
+                  </div>
+                  {session.last_question ? <p className="mt-2 line-clamp-2 text-xs leading-5 text-white/45">{session.last_question}</p> : null}
+                </button>
+                <button
+                  type="button"
+                  aria-label="删除会话"
+                  onClick={() => onDelete(session.id)}
+                  className="grid size-8 shrink-0 place-items-center rounded-full border border-white/8 text-white/45 transition hover:border-rose-200/30 hover:bg-rose-300/[0.08] hover:text-rose-100"
+                >
+                  <Trash2 className="size-4" />
+                </button>
+              </div>
             ))}
           </div>
         </ScrollArea>
@@ -418,8 +447,8 @@ function TraceDrawer({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
         <SheetHeader className="border-b border-white/8 p-6">
-          <SheetTitle>Agent Trace</SheetTitle>
-          <SheetDescription>Routing, retrieval, grading, generation, and citation checks.</SheetDescription>
+          <SheetTitle>智能体轨迹</SheetTitle>
+          <SheetDescription>路由、检索、评分、生成和引用检查。</SheetDescription>
         </SheetHeader>
         <ScrollArea className="h-[calc(100dvh-8rem)] p-6">
           <TraceTimeline trace={trace} isRunning={isRunning} />
@@ -442,15 +471,15 @@ function CitationsDrawer({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
         <SheetHeader className="border-b border-white/8 p-6">
-          <SheetTitle>Citations</SheetTitle>
-          <SheetDescription>Verified evidence cards used by the agent answer.</SheetDescription>
+          <SheetTitle>引用</SheetTitle>
+          <SheetDescription>智能体回答使用的已验证证据卡片。</SheetDescription>
         </SheetHeader>
         <ScrollArea className="h-[calc(100dvh-8rem)] p-6">
           <div className="flex flex-col gap-3">
             {citations.length === 0 ? (
               <div className="kg-glass-line rounded-3xl px-6 py-10 text-center text-sm text-white/55">
                 <Archive className="mx-auto mb-4 text-cyan-100/70" />
-                Citations will appear after a grounded answer completes.
+                有证据回答完成后会显示引用。
               </div>
             ) : (
               citations.map((citation, index) => <CitationCard key={`${citation.chunk_id}-${index}`} citation={citation} index={index} />)
@@ -477,11 +506,11 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
   });
   const [question, setQuestion] = useLocalStorage(`qa.question.${storageScope}`, "");
   const [activeSessionId, setActiveSessionId] = useLocalStorage<string | null>(`qa.sessionId.${storageScope}`, null);
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
-  const [draftAnswer, setDraftAnswer] = useState("");
-  const [citations, setCitations] = useState<Citation[]>([]);
-  const [trace, setTrace] = useState<AgentTraceEventPayload[]>([]);
-  const [latestRun, setLatestRun] = useState<AgentResponse | null>(null);
+  const [turns, setTurns] = useLocalStorage<ChatTurn[]>(`qa.turns.${storageScope}`, []);
+  const [draftAnswer, setDraftAnswer] = useLocalStorage(`qa.draftAnswer.${storageScope}`, "");
+  const [citations, setCitations] = useLocalStorage<Citation[]>(`qa.citations.${storageScope}`, []);
+  const [trace, setTrace] = useLocalStorage<AgentTraceEventPayload[]>(`qa.trace.${storageScope}`, []);
+  const [latestRun, setLatestRun] = useLocalStorage<AgentResponse | null>(`qa.latestRun.${storageScope}`, null);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [traceOpen, setTraceOpen] = useState(false);
@@ -530,7 +559,24 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
     },
   });
 
+  const deleteSessionMutation = useMutation({
+    mutationFn: (sessionId: string) => deleteSession(sessionId),
+    onSuccess: async (_data, sessionId) => {
+      if (sessionId === activeSessionId) {
+        setActiveSessionId(null);
+        setTurns([]);
+        setDraftAnswer("");
+        setCitations([]);
+        setTrace([]);
+        setLatestRun(null);
+        setQuestion("");
+      }
+      await queryClient.invalidateQueries({ queryKey: ["sessions", selectedCourseId] });
+    },
+  });
+
   const chapterList = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title).join(" / ") ?? "", [dashboardQuery.data]);
+  const suggestions = useMemo(() => buildCourseSuggestions(dashboardQuery.data?.tree), [dashboardQuery.data?.tree]);
 
   if (dashboardQuery.isLoading) {
     return <LoadingBlock rows={4} />;
@@ -562,6 +608,7 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
             draftAnswer={draftAnswer}
             onPickSuggestion={setQuestion}
             onOpenCitations={() => setCitationsOpen(true)}
+            suggestions={suggestions}
           />
         </main>
 
@@ -579,6 +626,7 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
         onOpenChange={setSessionsOpen}
         sessions={sessionsQuery.data ?? []}
         activeSessionId={activeSessionId}
+        onDelete={(sessionId) => deleteSessionMutation.mutate(sessionId)}
         onSelect={async (sessionId) => {
           setActiveSessionId(sessionId);
           setDraftAnswer("");

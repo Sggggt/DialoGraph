@@ -3,12 +3,25 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
 
 from app.core.config import get_settings
+
+
+_VECTOR_FILE_LOCKS: dict[Path, Lock] = {}
+_VECTOR_FILE_LOCKS_GUARD = Lock()
+
+
+def vector_file_lock(path: Path) -> Lock:
+    resolved = path.resolve()
+    with _VECTOR_FILE_LOCKS_GUARD:
+        if resolved not in _VECTOR_FILE_LOCKS:
+            _VECTOR_FILE_LOCKS[resolved] = Lock()
+        return _VECTOR_FILE_LOCKS[resolved]
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -26,20 +39,40 @@ class FallbackVectorStore:
     def _read(self) -> list[dict]:
         if not self.backing_file.exists():
             return []
-        return json.loads(self.backing_file.read_text(encoding="utf-8"))
+        text = self.backing_file.read_text(encoding="utf-8")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                data, _ = json.JSONDecoder().raw_decode(text)
+            except json.JSONDecodeError:
+                return []
+        return data if isinstance(data, list) else []
 
     def _write(self, data: list[dict]) -> None:
-        self.backing_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary_file = self.backing_file.with_suffix(f"{self.backing_file.suffix}.tmp")
+        temporary_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary_file.replace(self.backing_file)
 
     def upsert(self, points: list[dict]) -> None:
-        current = self._read()
-        indexed = {item["id"]: item for item in current}
-        for point in points:
-            indexed[point["id"]] = point
-        self._write(list(indexed.values()))
+        with vector_file_lock(self.backing_file):
+            current = self._read()
+            indexed = {item["id"]: item for item in current}
+            for point in points:
+                indexed[point["id"]] = point
+            self._write(list(indexed.values()))
+
+    def delete(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        id_set = set(ids)
+        with vector_file_lock(self.backing_file):
+            current = self._read()
+            self._write([item for item in current if item.get("id") not in id_set])
 
     def search(self, vector: list[float], limit: int, filters: dict[str, Any]) -> list[dict]:
-        points = self._read()
+        with vector_file_lock(self.backing_file):
+            points = self._read()
         results = []
         for point in points:
             payload = point.get("payload", {})
@@ -90,6 +123,16 @@ class VectorStore:
             )
         else:
             self.fallback.upsert(points)
+
+    def delete(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        if self.client:
+            self.client.delete(
+                collection_name=self.collection,
+                points_selector=rest.PointIdsList(points=ids),
+            )
+        self.fallback.delete(ids)
 
     def search(self, vector: list[float], limit: int, filters: dict[str, Any] | None = None) -> list[dict]:
         filters = {key: value for key, value in (filters or {}).items() if value not in (None, "", [], {})}

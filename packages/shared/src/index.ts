@@ -24,6 +24,8 @@ export type JobState =
   | "failed"
   | "skipped";
 
+export type CourseFileStatus = "pending" | "parsing" | "parsed" | "failed" | "skipped";
+
 export type AgentRoute =
   | "direct_answer"
   | "retrieve_notes"
@@ -43,8 +45,9 @@ export interface SearchFilters {
 
 export interface UploadFileResponse {
   document_id: string;
-  job_id: string;
+  job_id?: string | null;
   status: JobState;
+  source_path: string;
 }
 
 export interface JobStatusResponse {
@@ -180,6 +183,38 @@ export interface SessionMessagesResponse {
   messages: Array<Record<string, unknown>>;
 }
 
+export interface DeleteResponse {
+  deleted: boolean;
+}
+
+export interface RefreshResponse {
+  course_id: string;
+  refreshed_at: string;
+}
+
+export interface ModelSettingsResponse {
+  provider: "dashscope_compatible";
+  dashscope_base_url: string;
+  embedding_model: string;
+  chat_model: string;
+  embedding_dimensions: number;
+  enable_fake_embeddings: boolean;
+  enable_fake_chat: boolean;
+  has_dashscope_api_key: boolean;
+  degraded_mode: boolean;
+}
+
+export interface ModelSettingsUpdate {
+  dashscope_api_key?: string | null;
+  clear_dashscope_api_key?: boolean;
+  dashscope_base_url?: string | null;
+  embedding_model?: string | null;
+  chat_model?: string | null;
+  embedding_dimensions?: number | null;
+  enable_fake_embeddings?: boolean | null;
+  enable_fake_chat?: boolean | null;
+}
+
 export interface RelatedConcept {
   concept_id: string;
   relation_type: string;
@@ -235,6 +270,7 @@ export interface CourseSummary {
   name: string;
   description?: string | null;
   source_root: string;
+  storage_root: string;
   document_count: number;
   concept_count: number;
   degraded_mode: boolean;
@@ -271,6 +307,10 @@ export interface BatchStartResponse {
   state: JobState;
 }
 
+export interface ParseUploadedFilesRequest {
+  file_paths: string[];
+}
+
 export interface DashboardSnapshot {
   course: CourseSummary;
   tree: CourseTreeNode[];
@@ -280,6 +320,21 @@ export interface DashboardSnapshot {
   graph_relation_count: number;
   coverage_by_source_type: Record<string, number>;
   degraded_mode: boolean;
+}
+
+export interface CourseFileSummary {
+  id: string;
+  document_id?: string | null;
+  title: string;
+  source_path: string;
+  source_type: string;
+  chapter?: string | null;
+  status: CourseFileStatus;
+  job_state?: JobState | null;
+  batch_id?: string | null;
+  error?: string | null;
+  chunk_count: number;
+  updated_at?: string | null;
 }
 
 export interface GraphNodeRelation {

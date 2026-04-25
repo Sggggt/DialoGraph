@@ -327,15 +327,27 @@ class AnswerGenerator:
             used_chunks = []
         else:
             used_chunks = state.get("graded_documents", [])
-            answer = await ChatProvider().answer_question(state["question"], used_chunks, state.get("history", []))
+            chat_result = await ChatProvider().answer_question_with_meta(state["question"], used_chunks, state.get("history", []))
+            answer = chat_result.answer
+            state["answer_model_audit"] = {
+                "provider": chat_result.provider,
+                "model": chat_result.model,
+                "external_called": chat_result.external_called,
+                "fallback_reason": chat_result.fallback_reason,
+            }
             citations = [citation for item in used_chunks for citation in item["citations"]]
+        audit = state.get("answer_model_audit", {})
         _set_run_state(db, state["run_id"], "running", current_node="answer_generator")
         _trace(
             db,
             state["run_id"],
             "answer_generator",
             input_summary=state["question"],
-            output_summary=_summarize(answer),
+            output_summary=(
+                f"model={audit.get('model')} provider={audit.get('provider')} "
+                f"external_called={audit.get('external_called')} fallback={audit.get('fallback_reason')}\n"
+                f"{_summarize(answer)}"
+            ),
             document_ids=[item["chunk_id"] for item in state.get("graded_documents", [])],
             duration_ms=int((time.perf_counter() - start) * 1000),
         )

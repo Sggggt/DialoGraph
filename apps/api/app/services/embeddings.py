@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -21,11 +22,35 @@ class EmbeddingProvider:
         self.settings = get_settings()
 
     async def embed_texts(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
+        return (await self.embed_texts_with_meta(texts, text_type=text_type)).vectors
+
+    async def embed_texts_with_meta(self, texts: list[str], text_type: str = "document") -> "EmbeddingCallResult":
         if not texts:
-            return []
-        if not self.settings.dashscope_api_key or self.settings.enable_fake_embeddings:
-            return [self._fake_embedding(text) for text in texts]
-        return await self._dashscope_embeddings(texts, text_type=text_type)
+            return EmbeddingCallResult(vectors=[], provider="fake", external_called=False, fallback_reason=None)
+        if self.settings.enable_fake_embeddings:
+            return EmbeddingCallResult(
+                vectors=[self._fake_embedding(text) for text in texts],
+                provider="fake",
+                external_called=False,
+                fallback_reason="fake_embeddings_enabled",
+            )
+        if not self.settings.dashscope_api_key:
+            return EmbeddingCallResult(
+                vectors=[self._fake_embedding(text) for text in texts],
+                provider="fake",
+                external_called=False,
+                fallback_reason="missing_dashscope_api_key",
+            )
+        try:
+            vectors = await self._dashscope_embeddings(texts, text_type=text_type)
+            return EmbeddingCallResult(vectors=vectors, provider="dashscope", external_called=True, fallback_reason=None)
+        except Exception as exc:
+            return EmbeddingCallResult(
+                vectors=[self._fake_embedding(text) for text in texts],
+                provider="fake",
+                external_called=True,
+                fallback_reason=f"{type(exc).__name__}: {exc}",
+            )
 
     async def _dashscope_embeddings(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
         payload: dict[str, Any] = {
@@ -38,14 +63,11 @@ class EmbeddingProvider:
             "Authorization": f"Bearer {self.settings.dashscope_api_key}",
             "Content-Type": "application/json",
         }
-        try:
-            async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
-                response = await client.post(f"{self.settings.dashscope_base_url}/embeddings", json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-                return [item["embedding"] for item in data["data"]]
-        except Exception:
-            return [self._fake_embedding(text) for text in texts]
+        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+            response = await client.post(f"{self.settings.dashscope_base_url}/embeddings", json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            return [item["embedding"] for item in data["data"]]
 
     def _fake_embedding(self, text: str) -> list[float]:
         vector = []
@@ -57,16 +79,65 @@ class EmbeddingProvider:
         return [value / magnitude for value in vector]
 
 
+@dataclass(frozen=True)
+class EmbeddingCallResult:
+    vectors: list[list[float]]
+    provider: str
+    external_called: bool
+    fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ChatCallResult:
+    answer: str
+    provider: str
+    model: str
+    external_called: bool
+    fallback_reason: str | None = None
+
+
 class ChatProvider:
     def __init__(self) -> None:
         self.settings = get_settings()
 
     async def answer_question(self, question: str, contexts: list[dict], history: list[dict] | None = None) -> str:
+        return (await self.answer_question_with_meta(question, contexts, history)).answer
+
+    async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None) -> ChatCallResult:
         if not contexts:
-            return "I could not find enough reliable course context to answer this question with citations."
+            return ChatCallResult(
+                answer="I could not find enough reliable course context to answer this question with citations.",
+                provider="none",
+                model=self.settings.chat_model,
+                external_called=False,
+                fallback_reason="no_contexts",
+            )
         if not self.settings.dashscope_api_key or self.settings.enable_fake_chat:
-            return self._extractive_answer(question, contexts)
-        return await self._dashscope_chat(question, contexts, history or [])
+            fallback_reason = "fake_chat_enabled" if self.settings.enable_fake_chat else "missing_dashscope_api_key"
+            return ChatCallResult(
+                answer=self._extractive_answer(question, contexts),
+                provider="extractive_fallback",
+                model="local_extractive_template",
+                external_called=False,
+                fallback_reason=fallback_reason,
+            )
+        try:
+            answer = await self._dashscope_chat(question, contexts, history or [])
+            return ChatCallResult(
+                answer=answer,
+                provider="dashscope_chat",
+                model=self.settings.chat_model,
+                external_called=True,
+                fallback_reason=None,
+            )
+        except Exception as exc:
+            return ChatCallResult(
+                answer=self._extractive_answer(question, contexts),
+                provider="extractive_fallback",
+                model="local_extractive_template",
+                external_called=True,
+                fallback_reason=f"{type(exc).__name__}: {exc}",
+            )
 
     async def extract_graph_payload(self, text: str, chapter: str | None, source_type: str) -> dict[str, Any]:
         if not self.settings.dashscope_api_key or self.settings.enable_fake_chat:
@@ -149,10 +220,7 @@ class ChatProvider:
             {"role": "user", "content": f"Question: {question}\n\nCourse excerpts:\n{citations}"},
         ]
         payload = {"model": self.settings.chat_model, "messages": messages, "temperature": 0.2}
-        try:
-            return await self._post_chat_text(payload)
-        except Exception:
-            return self._extractive_answer(question, contexts)
+        return await self._post_chat_text(payload)
 
     async def _post_chat_text(self, payload: dict[str, Any]) -> str:
         headers = {
