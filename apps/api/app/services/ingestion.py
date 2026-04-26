@@ -38,15 +38,15 @@ def embedding_audit_payload(provider: str, external_called: bool, fallback_reaso
 
 def configured_embedding_provider() -> str:
     settings = get_settings()
-    return "fake" if not settings.dashscope_api_key or settings.enable_fake_embeddings else "dashscope"
+    if settings.openai_api_key:
+        return "openai_compatible"
+    return "fake" if settings.enable_model_fallback else "unavailable"
 
 
 def embedding_fallback_reason() -> str | None:
     settings = get_settings()
-    if settings.enable_fake_embeddings:
-        return "fake_embeddings_enabled"
-    if not settings.dashscope_api_key:
-        return "missing_dashscope_api_key"
+    if not settings.openai_api_key:
+        return "missing_openai_api_key"
     return None
 
 
@@ -59,7 +59,11 @@ def emit_model_audit_log(batch_id: str) -> None:
     emit_ingestion_log(
         batch_id,
         "model_audit",
-        f"Embedding model: {embedding_provider}" + (f" fallback={fallback_method}" if fallback_method else ""),
+        f"Embedding model: {settings.embedding_model} via {embedding_provider}" + (f" fallback={fallback_method}" if fallback_method else ""),
+        api_provider="openai_compatible",
+        api_base_url=settings.openai_base_url,
+        api_resolve_ip=settings.openai_resolve_ip,
+        fallback_enabled=settings.enable_model_fallback,
         embedding_provider=embedding_provider,
         embedding_model=settings.embedding_model,
         embedding_external_called=False,
@@ -67,7 +71,7 @@ def emit_model_audit_log(batch_id: str) -> None:
         embedding_fallback_method=fallback_method,
         graph_embedding_external_called=False,
         graph_extraction_provider=graph_provider,
-        graph_extraction_model=settings.chat_model if graph_provider == "dashscope_chat" else "heuristic",
+        graph_extraction_model=settings.chat_model if graph_provider == "openai_compatible_chat" else graph_provider,
     )
 
 

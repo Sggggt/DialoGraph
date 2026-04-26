@@ -31,14 +31,13 @@ class Settings(BaseSettings):
     storage_root: Path | None = None
     ingestion_root: Path | None = None
 
-    dashscope_api_key: str | None = None
-    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    dashscope_resolve_ip: str | None = None
+    openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_resolve_ip: str | None = None
     embedding_model: str = "text-embedding-v4"
     chat_model: str = "qwen-plus"
     embedding_dimensions: int = 1024
-    enable_fake_embeddings: bool = False
-    enable_fake_chat: bool = False
+    enable_model_fallback: bool = False
 
     def sanitize_course_dir_name(self, course_name: str) -> str:
         value = INVALID_COURSE_DIR_CHARS.sub("-", course_name).strip()

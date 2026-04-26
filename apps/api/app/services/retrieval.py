@@ -137,11 +137,16 @@ async def search_chunks(db: Session, course_id: str, query: str, filters: Search
 
 
 async def hybrid_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
+    settings = get_settings()
     dense_results: list[dict] = []
+    if is_degraded_mode() and not settings.enable_model_fallback:
+        raise RuntimeError("OPENAI_API_KEY is required for search because ENABLE_MODEL_FALLBACK is false")
     if not is_degraded_mode():
         try:
             dense_results = await dense_search_chunks(db, course_id, query, filters, max(top_k * 4, top_k))
         except Exception:
+            if not settings.enable_model_fallback:
+                raise
             dense_results = []
     lexical_results = lexical_search_chunks(db, course_id, query, filters, max(top_k * 4, top_k))
     if not dense_results:

@@ -86,7 +86,9 @@ CONCEPT_PATTERN = re.compile(r"\b[A-Z][A-Za-z0-9\-]+(?:\s+[A-Z][A-Za-z0-9\-]+){0
 
 def graph_extraction_provider() -> str:
     settings = get_settings()
-    return "dashscope_chat" if settings.dashscope_api_key and not settings.enable_fake_chat else "heuristic"
+    if settings.openai_api_key:
+        return "openai_compatible_chat"
+    return "heuristic" if settings.enable_model_fallback else "unavailable"
 
 
 def normalize_concept_name(name: str) -> str:
@@ -272,9 +274,11 @@ def get_or_create_concept(
 
 
 async def upsert_concepts_from_chunk(db: Session, course_id: str, chunk: Chunk, use_llm: bool = True) -> tuple[int, int]:
-    fallback = heuristic_extract_graph(chunk.content)
+    settings = get_settings()
+    fallback = heuristic_extract_graph(chunk.content) if settings.enable_model_fallback else {"concepts": [], "relations": []}
     llm_payload = await ChatProvider().extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type) if use_llm else {"concepts": [], "relations": []}
     extracted = merge_graph_candidates(llm_payload, fallback)
+    extraction_method = "llm+rules" if settings.enable_model_fallback and llm_payload.get("concepts") else "llm" if llm_payload.get("concepts") else "heuristic"
 
     concept_map: dict[str, Concept] = {}
     created_count = 0
@@ -323,7 +327,7 @@ async def upsert_concepts_from_chunk(db: Session, course_id: str, chunk: Chunk, 
                 relation_type=relation_data["relation_type"],
                 evidence_chunk_id=chunk.id,
                 confidence=confidence,
-                extraction_method="llm+rules" if llm_payload.get("concepts") else "heuristic",
+                extraction_method=extraction_method,
                 is_validated=confidence >= 0.82,
             )
         )

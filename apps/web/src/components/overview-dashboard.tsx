@@ -107,8 +107,8 @@ export function OverviewDashboard() {
             </div>
             <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
               <p className="text-xs uppercase tracking-[0.28em] text-white/45">Embedding Mode</p>
-              <p className="mt-3 text-2xl font-semibold text-white">{data.degraded_mode ? "Fallback" : "DashScope"}</p>
-              <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实 embedding 与 Qwen 图谱抽取已启用"}</p>
+              <p className="mt-3 text-2xl font-semibold text-white">{data.degraded_mode ? "Fallback" : "OpenAI Compatible"}</p>
+              <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实 embedding 与外部图谱抽取已启用"}</p>
             </div>
           </div>
           <div className="mt-6 space-y-3">

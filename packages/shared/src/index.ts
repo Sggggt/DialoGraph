@@ -193,26 +193,24 @@ export interface RefreshResponse {
 }
 
 export interface ModelSettingsResponse {
-  provider: "dashscope_compatible";
-  dashscope_base_url: string;
+  provider: "openai_compatible";
+  base_url: string;
+  resolve_ip?: string | null;
   embedding_model: string;
   chat_model: string;
   embedding_dimensions: number;
-  enable_fake_embeddings: boolean;
-  enable_fake_chat: boolean;
-  has_dashscope_api_key: boolean;
+  has_api_key: boolean;
   degraded_mode: boolean;
 }
 
 export interface ModelSettingsUpdate {
-  dashscope_api_key?: string | null;
-  clear_dashscope_api_key?: boolean;
-  dashscope_base_url?: string | null;
+  api_key?: string | null;
+  clear_api_key?: boolean;
+  base_url?: string | null;
+  resolve_ip?: string | null;
   embedding_model?: string | null;
   chat_model?: string | null;
   embedding_dimensions?: number | null;
-  enable_fake_embeddings?: boolean | null;
-  enable_fake_chat?: boolean | null;
 }
 
 export interface RelatedConcept {

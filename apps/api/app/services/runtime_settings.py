@@ -11,15 +11,14 @@ ENV_PATH = WORKSPACE_ROOT / ".env"
 def model_settings_payload() -> dict:
     settings = get_settings()
     return {
-        "provider": "dashscope_compatible",
-        "dashscope_base_url": settings.dashscope_base_url,
+        "provider": "openai_compatible",
+        "base_url": settings.openai_base_url,
+        "resolve_ip": settings.openai_resolve_ip,
         "embedding_model": settings.embedding_model,
         "chat_model": settings.chat_model,
         "embedding_dimensions": settings.embedding_dimensions,
-        "enable_fake_embeddings": settings.enable_fake_embeddings,
-        "enable_fake_chat": settings.enable_fake_chat,
-        "has_dashscope_api_key": bool(settings.dashscope_api_key),
-        "degraded_mode": (not settings.dashscope_api_key) or settings.enable_fake_embeddings or settings.enable_fake_chat,
+        "has_api_key": bool(settings.openai_api_key),
+        "degraded_mode": not settings.openai_api_key,
     }
 
 
@@ -63,23 +62,26 @@ def _update_env_file(updates: dict[str, str | int | bool | None]) -> None:
 
 def update_model_settings(payload: dict) -> dict:
     updates: dict[str, str | int | bool | None] = {}
-    for key in (
-        "dashscope_base_url",
-        "embedding_model",
-        "chat_model",
-        "embedding_dimensions",
-        "enable_fake_embeddings",
-        "enable_fake_chat",
-    ):
+    key_map = {
+        "base_url": "openai_base_url",
+        "resolve_ip": "openai_resolve_ip",
+        "embedding_model": "embedding_model",
+        "chat_model": "chat_model",
+        "embedding_dimensions": "embedding_dimensions",
+    }
+    for key, env_key in key_map.items():
         value = payload.get(key)
         if value is not None:
-            updates[key] = value
+            if key == "resolve_ip" and isinstance(value, str) and not value.strip():
+                updates[env_key] = None
+            else:
+                updates[env_key] = value.strip() if isinstance(value, str) else value
 
-    api_key = payload.get("dashscope_api_key")
-    if payload.get("clear_dashscope_api_key"):
-        updates["dashscope_api_key"] = None
+    api_key = payload.get("api_key")
+    if payload.get("clear_api_key"):
+        updates["openai_api_key"] = None
     elif isinstance(api_key, str) and api_key.strip():
-        updates["dashscope_api_key"] = api_key.strip()
+        updates["openai_api_key"] = api_key.strip()
 
     if updates:
         _update_env_file(updates)

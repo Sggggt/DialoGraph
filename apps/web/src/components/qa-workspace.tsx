@@ -75,38 +75,16 @@ function ChatHeader({
   grounded,
   chapterList,
   latestRun,
-  onOpenSessions,
-  onOpenTrace,
-  onOpenCitations,
-  citationsCount,
 }: {
   grounded: boolean;
   chapterList: string;
   latestRun: AgentResponse | null;
-  onOpenSessions: () => void;
-  onOpenTrace: () => void;
-  onOpenCitations: () => void;
-  citationsCount: number;
 }) {
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-1">
       <div className="min-w-0">
         <p className="section-kicker">Agentic Course Chat</p>
         <h2 className="mt-1 text-2xl font-semibold text-white lg:text-3xl">Ask the reasoning graph</h2>
-      </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <Button type="button" variant="outline" className="rounded-full" onClick={onOpenSessions}>
-          <History data-icon="inline-start" />
-          会话
-        </Button>
-        <Button type="button" variant="outline" className="rounded-full" onClick={onOpenTrace}>
-          <Waypoints data-icon="inline-start" />
-          轨迹
-        </Button>
-        <Button type="button" variant="outline" className="rounded-full" onClick={onOpenCitations}>
-          <FileText data-icon="inline-start" />
-          引用 {citationsCount}
-        </Button>
       </div>
       <div className="flex w-full flex-wrap gap-2">
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
@@ -121,6 +99,40 @@ function ChatHeader({
           </span>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+function ChatActionRail({
+  onOpenSessions,
+  onOpenTrace,
+  onOpenCitations,
+  citationsCount,
+}: {
+  onOpenSessions: () => void;
+  onOpenTrace: () => void;
+  onOpenCitations: () => void;
+  citationsCount: number;
+}) {
+  const actions = [
+    { label: "会话", icon: History, onClick: onOpenSessions },
+    { label: "轨迹", icon: Waypoints, onClick: onOpenTrace },
+    { label: `引用 ${citationsCount}`, icon: FileText, onClick: onOpenCitations },
+  ];
+
+  return (
+    <div className="fixed bottom-[11.5rem] right-4 z-40 flex flex-col gap-2 lg:bottom-auto lg:right-7 lg:top-[10rem]">
+      {actions.map(({ label, icon: Icon, onClick }) => (
+        <button
+          key={label}
+          type="button"
+          onClick={onClick}
+          className="group flex h-11 items-center justify-end gap-2 rounded-full border border-cyan-200/14 bg-[rgba(7,13,31,0.88)] px-3 text-xs text-white/68 shadow-[0_16px_44px_rgba(0,0,0,0.28),0_0_28px_rgba(86,217,255,0.06)] backdrop-blur-2xl transition hover:border-cyan-200/32 hover:bg-cyan-300/[0.08] hover:text-white"
+        >
+          <span className="hidden whitespace-nowrap sm:inline">{label}</span>
+          <Icon className="size-4 text-cyan-100/72 transition group-hover:text-cyan-100" />
+        </button>
+      ))}
     </div>
   );
 }
@@ -251,12 +263,12 @@ function MessageList({
       {turns.length === 0 && !isGenerating ? (
         <EmptyChatState suggestions={suggestions} onPick={onPickSuggestion} />
       ) : (
-        <div className="mx-auto flex max-w-5xl flex-col gap-8 px-1 pb-52 pt-4">
+        <div className="mx-auto flex max-w-5xl flex-col gap-8 px-1 pb-6 pt-4">
           {turns.map((turn, index) => (
             <MessageBubble key={`${turn.role}-${index}-${turn.run_id ?? "local"}`} turn={turn} index={index} onOpenCitations={onOpenCitations} />
           ))}
           {isGenerating ? <GeneratingBubble content={draftAnswer} /> : null}
-          <div ref={bottomRef} />
+          <div ref={bottomRef} className="h-52 shrink-0 md:h-56" />
         </div>
       )}
     </div>
@@ -280,12 +292,12 @@ function ChatComposer({
     <motion.div
       initial={{ opacity: 0, y: 18 }}
       animate={{ opacity: 1, y: 0 }}
-      className="pointer-events-none fixed inset-x-4 bottom-4 z-30 lg:left-[calc(76px+1.75rem)] lg:right-7"
+      className="pointer-events-none fixed inset-x-4 bottom-4 z-[45] lg:left-[calc(76px+1.75rem)] lg:right-7"
     >
       <div className="pointer-events-auto mx-auto w-full max-w-5xl">
         <div
           className={cn(
-            "kg-scan-edge rounded-[1.7rem] border border-cyan-200/16 bg-[rgba(7,13,31,0.68)] p-2 shadow-[0_20px_70px_rgba(0,0,0,0.34),0_0_42px_rgba(86,217,255,0.08)] backdrop-blur-2xl",
+            "kg-scan-edge rounded-[1.7rem] border border-cyan-200/16 bg-[rgba(7,13,31,0.94)] p-2 shadow-[0_20px_70px_rgba(0,0,0,0.42),0_0_42px_rgba(86,217,255,0.08)] backdrop-blur-2xl",
             isPending && "border-cyan-100/24 shadow-[0_20px_70px_rgba(0,0,0,0.34),0_0_58px_rgba(86,217,255,0.14)]",
           )}
         >
@@ -594,6 +606,8 @@ function QAWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | n
           grounded={!dashboardQuery.data?.degraded_mode}
           chapterList={chapterList}
           latestRun={latestRun}
+        />
+        <ChatActionRail
           onOpenSessions={() => setSessionsOpen(true)}
           onOpenTrace={() => setTraceOpen(true)}
           onOpenCitations={() => setCitationsOpen(true)}

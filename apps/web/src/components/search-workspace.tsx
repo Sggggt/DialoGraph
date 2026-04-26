@@ -87,7 +87,7 @@ function SearchHero({
           </p>
         </div>
 
-        <div className={cn("kg-glass-line kg-scan-edge relative z-40 w-full rounded-[1.7rem] p-2", isSearching && "shadow-[0_0_42px_rgba(86,217,255,0.12)]")}>
+        <div className={cn("kg-glass-line kg-scan-edge relative z-20 w-full rounded-[1.7rem] p-2", isSearching && "shadow-[0_0_42px_rgba(86,217,255,0.12)]")}>
           <div className="flex items-center gap-3 rounded-[1.35rem] bg-black/18 px-4 py-3">
             <Search className="text-cyan-100/70" />
             <input
@@ -121,7 +121,7 @@ function SearchHero({
             </Button>
           </div>
           {historyOpen && history.length > 0 ? (
-            <div className="custom-scrollbar absolute left-4 right-4 top-[calc(100%+0.5rem)] z-[90] max-h-72 overflow-y-auto rounded-[1.35rem] border border-white/10 bg-[rgba(4,10,24,0.96)] p-2 text-left shadow-[0_24px_70px_rgba(0,0,0,0.42)] backdrop-blur-2xl">
+            <div className="custom-scrollbar absolute left-4 right-4 top-[calc(100%+0.5rem)] z-20 max-h-72 overflow-y-auto rounded-[1.35rem] border border-white/10 bg-[rgba(4,10,24,0.96)] p-2 text-left shadow-[0_24px_70px_rgba(0,0,0,0.42)] backdrop-blur-2xl">
               {history.map((item) => (
                 <button
                   key={item}

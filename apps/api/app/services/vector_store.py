@@ -95,6 +95,8 @@ class VectorStore:
             self.client = QdrantClient(url=self.settings.qdrant_url, timeout=5.0)
             self._ensure_collection()
         except Exception:
+            if not self.settings.enable_model_fallback:
+                raise
             self.client = None
 
     def _ensure_collection(self) -> None:
@@ -122,6 +124,8 @@ class VectorStore:
                 ],
             )
         else:
+            if not self.settings.enable_model_fallback:
+                raise RuntimeError("Qdrant is unavailable and ENABLE_MODEL_FALLBACK is false")
             self.fallback.upsert(points)
 
     def delete(self, ids: list[str]) -> None:
@@ -132,7 +136,8 @@ class VectorStore:
                 collection_name=self.collection,
                 points_selector=rest.PointIdsList(points=ids),
             )
-        self.fallback.delete(ids)
+        if self.settings.enable_model_fallback:
+            self.fallback.delete(ids)
 
     def search(self, vector: list[float], limit: int, filters: dict[str, Any] | None = None) -> list[dict]:
         filters = {key: value for key, value in (filters or {}).items() if value not in (None, "", [], {})}
@@ -140,11 +145,23 @@ class VectorStore:
             qdrant_filter = rest.Filter(
                 must=[rest.FieldCondition(key=key, match=rest.MatchValue(value=value)) for key, value in filters.items()]
             ) if filters else None
-            results = self.client.search(
-                collection_name=self.collection,
-                query_vector=vector,
-                limit=limit,
-                query_filter=qdrant_filter,
-            )
+            if hasattr(self.client, "query_points"):
+                response = self.client.query_points(
+                    collection_name=self.collection,
+                    query=vector,
+                    limit=limit,
+                    query_filter=qdrant_filter,
+                    with_payload=True,
+                )
+                results = response.points
+            else:
+                results = self.client.search(
+                    collection_name=self.collection,
+                    query_vector=vector,
+                    limit=limit,
+                    query_filter=qdrant_filter,
+                )
             return [{"id": item.id, "score": item.score, "payload": item.payload} for item in results]
+        if not self.settings.enable_model_fallback:
+            raise RuntimeError("Qdrant is unavailable and ENABLE_MODEL_FALLBACK is false")
         return self.fallback.search(vector=vector, limit=limit, filters=filters)

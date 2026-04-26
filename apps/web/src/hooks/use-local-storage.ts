@@ -72,7 +72,8 @@ export function useLocalStorage<T>(key: string, initialValue: T) {
 
   const setValue = (value: T | ((val: T) => T)) => {
     try {
-      const valueToStore = value instanceof Function ? value(storedValue) : value;
+      const currentValue = readLocalStorageValue(key, initialValue);
+      const valueToStore = value instanceof Function ? value(currentValue) : value;
       if (typeof window !== "undefined") {
         const serialized = JSON.stringify(valueToStore);
         window.localStorage.setItem(key, serialized);

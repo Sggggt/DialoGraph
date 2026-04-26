@@ -183,26 +183,24 @@ class RefreshResponse(BaseModel):
 
 
 class ModelSettingsResponse(BaseModel):
-    provider: Literal["dashscope_compatible"] = "dashscope_compatible"
-    dashscope_base_url: str
+    provider: Literal["openai_compatible"] = "openai_compatible"
+    base_url: str
+    resolve_ip: str | None = None
     embedding_model: str
     chat_model: str
     embedding_dimensions: int
-    enable_fake_embeddings: bool
-    enable_fake_chat: bool
-    has_dashscope_api_key: bool
+    has_api_key: bool
     degraded_mode: bool
 
 
 class ModelSettingsUpdate(BaseModel):
-    dashscope_api_key: str | None = None
-    clear_dashscope_api_key: bool = False
-    dashscope_base_url: str | None = None
+    api_key: str | None = None
+    clear_api_key: bool = False
+    base_url: str | None = None
+    resolve_ip: str | None = None
     embedding_model: str | None = None
     chat_model: str | None = None
     embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
-    enable_fake_embeddings: bool | None = None
-    enable_fake_chat: bool | None = None
 
 
 class RelatedConcept(BaseModel):

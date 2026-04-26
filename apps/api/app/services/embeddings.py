@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import math
+import os
 import re
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 from app.core.config import get_settings
 
 
+class FallbackDisabledError(RuntimeError):
+    pass
+
+
 def is_degraded_mode() -> bool:
     settings = get_settings()
-    return (not settings.dashscope_api_key) or settings.enable_fake_embeddings or settings.enable_fake_chat
+    return not settings.openai_api_key
 
 
 class EmbeddingProvider:
@@ -26,25 +35,22 @@ class EmbeddingProvider:
 
     async def embed_texts_with_meta(self, texts: list[str], text_type: str = "document") -> "EmbeddingCallResult":
         if not texts:
-            return EmbeddingCallResult(vectors=[], provider="fake", external_called=False, fallback_reason=None)
-        if self.settings.enable_fake_embeddings:
+            return EmbeddingCallResult(vectors=[], provider="none", external_called=False, fallback_reason=None)
+        if not self.settings.openai_api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
             return EmbeddingCallResult(
                 vectors=[self._fake_embedding(text) for text in texts],
                 provider="fake",
                 external_called=False,
-                fallback_reason="fake_embeddings_enabled",
-            )
-        if not self.settings.dashscope_api_key:
-            return EmbeddingCallResult(
-                vectors=[self._fake_embedding(text) for text in texts],
-                provider="fake",
-                external_called=False,
-                fallback_reason="missing_dashscope_api_key",
+                fallback_reason="missing_openai_api_key",
             )
         try:
-            vectors = await self._dashscope_embeddings(texts, text_type=text_type)
-            return EmbeddingCallResult(vectors=vectors, provider="dashscope", external_called=True, fallback_reason=None)
+            vectors = await self._openai_compatible_embeddings(texts, text_type=text_type)
+            return EmbeddingCallResult(vectors=vectors, provider="openai_compatible", external_called=True, fallback_reason=None)
         except Exception as exc:
+            if not self.settings.enable_model_fallback:
+                raise
             return EmbeddingCallResult(
                 vectors=[self._fake_embedding(text) for text in texts],
                 provider="fake",
@@ -52,7 +58,7 @@ class EmbeddingProvider:
                 fallback_reason=f"{type(exc).__name__}: {exc}",
             )
 
-    async def _dashscope_embeddings(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
+    async def _openai_compatible_embeddings(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
         payload: dict[str, Any] = {
             "model": self.settings.embedding_model,
             "input": texts,
@@ -60,14 +66,17 @@ class EmbeddingProvider:
             "dimensions": self.settings.embedding_dimensions,
         }
         headers = {
-            "Authorization": f"Bearer {self.settings.dashscope_api_key}",
+            "Authorization": f"Bearer {self.settings.openai_api_key}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
-            response = await client.post(f"{self.settings.dashscope_base_url}/embeddings", json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            return [item["embedding"] for item in data["data"]]
+        data = await post_openai_compatible_json(
+            f"{self.settings.openai_base_url.rstrip('/')}/embeddings",
+            payload,
+            headers,
+            timeout=60.0,
+            resolve_ip=self.settings.openai_resolve_ip,
+        )
+        return [item["embedding"] for item in data["data"]]
 
     def _fake_embedding(self, text: str) -> list[float]:
         vector = []
@@ -112,25 +121,28 @@ class ChatProvider:
                 external_called=False,
                 fallback_reason="no_contexts",
             )
-        if not self.settings.dashscope_api_key or self.settings.enable_fake_chat:
-            fallback_reason = "fake_chat_enabled" if self.settings.enable_fake_chat else "missing_dashscope_api_key"
+        if not self.settings.openai_api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
             return ChatCallResult(
                 answer=self._extractive_answer(question, contexts),
                 provider="extractive_fallback",
                 model="local_extractive_template",
                 external_called=False,
-                fallback_reason=fallback_reason,
+                fallback_reason="missing_openai_api_key",
             )
         try:
-            answer = await self._dashscope_chat(question, contexts, history or [])
+            answer = await self._openai_compatible_chat(question, contexts, history or [])
             return ChatCallResult(
                 answer=answer,
-                provider="dashscope_chat",
+                provider="openai_compatible_chat",
                 model=self.settings.chat_model,
                 external_called=True,
                 fallback_reason=None,
             )
         except Exception as exc:
+            if not self.settings.enable_model_fallback:
+                raise
             return ChatCallResult(
                 answer=self._extractive_answer(question, contexts),
                 provider="extractive_fallback",
@@ -140,7 +152,9 @@ class ChatProvider:
             )
 
     async def extract_graph_payload(self, text: str, chapter: str | None, source_type: str) -> dict[str, Any]:
-        if not self.settings.dashscope_api_key or self.settings.enable_fake_chat:
+        if not self.settings.openai_api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
             return {"concepts": [], "relations": []}
         system_prompt = (
             "You extract a compact course knowledge graph from teaching material. "
@@ -166,10 +180,14 @@ class ChatProvider:
         try:
             return await self._post_chat_json(payload)
         except Exception:
+            if not self.settings.enable_model_fallback:
+                raise
             return {"concepts": [], "relations": []}
 
     async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict[str, Any]) -> dict[str, Any]:
-        if not self.settings.dashscope_api_key or self.settings.enable_fake_chat:
+        if not self.settings.openai_api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
             return fallback
         payload: dict[str, Any] = {
             "model": self.settings.chat_model,
@@ -180,10 +198,14 @@ class ChatProvider:
         try:
             return await self._post_chat_json(payload)
         except Exception:
+            if not self.settings.enable_model_fallback:
+                raise
             return fallback
 
     async def rewrite_question(self, question: str, history: list[dict] | None = None) -> str:
-        if not self.settings.dashscope_api_key or self.settings.enable_fake_chat:
+        if not self.settings.openai_api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
             return question
         history_text = "\n".join(f"{item.get('role')}: {item.get('content')}" for item in (history or [])[-6:])
         payload: dict[str, Any] = {
@@ -200,9 +222,11 @@ class ChatProvider:
         try:
             return (await self._post_chat_text(payload)).strip() or question
         except Exception:
+            if not self.settings.enable_model_fallback:
+                raise
             return question
 
-    async def _dashscope_chat(self, question: str, contexts: list[dict], history: list[dict]) -> str:
+    async def _openai_compatible_chat(self, question: str, contexts: list[dict], history: list[dict]) -> str:
         citations = "\n\n".join(
             f"[{idx + 1}] {item['document_title']} / {item.get('chapter') or 'General'}\n{item['content']}"
             for idx, item in enumerate(contexts)
@@ -224,14 +248,17 @@ class ChatProvider:
 
     async def _post_chat_text(self, payload: dict[str, Any]) -> str:
         headers = {
-            "Authorization": f"Bearer {self.settings.dashscope_api_key}",
+            "Authorization": f"Bearer {self.settings.openai_api_key}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            response = await client.post(f"{self.settings.dashscope_base_url}/chat/completions", json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
+        data = await post_openai_compatible_json(
+            f"{self.settings.openai_base_url.rstrip('/')}/chat/completions",
+            payload,
+            headers,
+            timeout=90.0,
+            resolve_ip=self.settings.openai_resolve_ip,
+        )
+        return data["choices"][0]["message"]["content"]
 
     async def _post_chat_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._parse_json_object(await self._post_chat_text(payload))
@@ -259,3 +286,70 @@ class ChatProvider:
                 return json.loads(match.group(0))
             except json.JSONDecodeError:
                 return {}
+
+
+async def post_openai_compatible_json(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    *,
+    timeout: float,
+    resolve_ip: str | None = None,
+) -> dict[str, Any]:
+    if resolve_ip:
+        return await asyncio.to_thread(_post_json_with_curl_resolve, url, payload, headers, timeout, resolve_ip)
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        response = await client.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+
+def _post_json_with_curl_resolve(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float,
+    resolve_ip: str,
+) -> dict[str, Any]:
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        raise ValueError(f"Invalid OpenAI-compatible URL: {url}")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    payload_path = None
+    config_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json") as payload_file:
+            json.dump(payload, payload_file, ensure_ascii=False)
+            payload_path = payload_file.name
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".curl") as config_file:
+            payload_ref = payload_path.replace("\\", "/")
+            config_file.write(f'url = "{url}"\n')
+            config_file.write("request = POST\n")
+            config_file.write(f'connect-timeout = {min(int(timeout), 30)}\n')
+            config_file.write(f'max-time = {int(timeout)}\n')
+            config_file.write(f'resolve = "{parsed.hostname}:{port}:{resolve_ip}"\n')
+            config_file.write(f'header = "Authorization: {headers["Authorization"]}"\n')
+            config_file.write('header = "Content-Type: application/json"\n')
+            config_file.write(f'data-binary = "@{payload_ref}"\n')
+            config_path = config_file.name
+        result = subprocess.run(
+            ["curl.exe", "-sS", "-K", config_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout + 10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or f"curl exited with {result.returncode}")
+        data = json.loads(result.stdout)
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(json.dumps(data["error"], ensure_ascii=False))
+        return data
+    finally:
+        for path in (payload_path, config_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass

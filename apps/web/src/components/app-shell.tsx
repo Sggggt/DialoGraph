@@ -90,7 +90,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </aside>
 
       <div className="relative min-h-screen lg:pl-[76px]">
-        <header className="sticky top-0 z-30 border-b border-white/6 bg-[rgba(3,7,20,0.36)] backdrop-blur-2xl">
+        <header className="fixed inset-x-0 top-0 z-30 border-b border-white/6 bg-[rgba(3,7,20,0.78)] backdrop-blur-2xl lg:left-[76px]">
           <div className="flex flex-wrap items-center justify-between gap-4 px-5 py-3 lg:px-7">
             <div className="min-w-0">
               <p className="text-[10px] uppercase tracking-[0.34em] text-cyan-100/42">Course Knowledge Base</p>
@@ -152,7 +152,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </div>
         </header>
 
-        <main className="px-4 py-5 lg:px-7 lg:py-7">
+        <main className="px-4 pb-5 pt-[9.5rem] lg:px-7 lg:pb-7 lg:pt-[8.5rem]">
           <div className="flex w-full flex-col gap-8">{children}</div>
         </main>
       </div>
