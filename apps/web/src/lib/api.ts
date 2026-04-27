@@ -157,8 +157,8 @@ export async function uploadFile(file: File, courseId?: string | null): Promise<
   return parseResponse<UploadFileResponse>(response);
 }
 
-export async function parseUploadedFiles(filePaths: string[], courseId?: string | null): Promise<BatchStartResponse> {
-  const payload: ParseUploadedFilesRequest = { file_paths: filePaths };
+export async function parseUploadedFiles(filePaths: string[], courseId?: string | null, force = false): Promise<BatchStartResponse> {
+  const payload: ParseUploadedFilesRequest = { file_paths: filePaths, force };
   const response = await fetch(buildApiUrl("/ingestion/parse-uploaded-files", { course_id: courseId }), {
     method: "POST",
     headers: { "Content-Type": "application/json" },

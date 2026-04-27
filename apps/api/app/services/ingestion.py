@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.utils import source_type_from_path
 from app.models import Chunk, Concept, Course, Document, DocumentVersion, IngestionBatch, IngestionJob
 from app.services.chunking import chunk_sections
 from app.services.concept_graph import get_concept_cards, get_graph_payload, graph_extraction_provider, rebuild_course_graph
@@ -23,6 +24,48 @@ ALLOWED_SUFFIXES = {".pdf", ".ipynb", ".md", ".markdown", ".txt", ".docx", ".ppt
 EXCLUDED_PARTS = {"output", "tmp", "scripts", ".ipynb_checkpoints", "__pycache__"}
 IGNORED_NAMES = {".ds_store"}
 TERMINAL_STATES = {"completed", "failed", "partial_failed", "skipped"}
+
+
+def finalize_graph_generation_failure(session: Session, batch_id: str, exc: Exception, stats: dict) -> dict:
+    batch = session.get(IngestionBatch, batch_id)
+    if batch is None:
+        raise RuntimeError(f"Batch {batch_id} disappeared") from exc
+    graph_stats = {
+        "graph_rebuilt": False,
+        "graph_nodes": 0,
+        "graph_edges": 0,
+        "concepts": 0,
+        "relations": 0,
+        "graph_extraction_provider": graph_extraction_provider(),
+        "graph_error": f"{type(exc).__name__}: {exc}",
+    }
+    batch.stats = {**stats, **graph_stats}
+    batch.status = "partial_failed" if batch.success_count > 0 else "failed"
+    batch.last_error = f"Graph generation failed: {exc}"
+    batch.completed_at = datetime.utcnow()
+    session.commit()
+    emit_ingestion_log(batch_id, "graph_failed", batch.last_error, **graph_stats)
+    emit_ingestion_log(
+        batch_id,
+        "batch_partial_failed" if batch.status == "partial_failed" else "batch_failed",
+        f"Batch {batch.status}: graph generation failed after {batch.success_count} file(s) succeeded",
+        state=batch.status,
+        processed_files=batch.processed_files,
+        total_files=batch.total_files,
+        success_count=batch.success_count,
+        failure_count=batch.failure_count,
+        skipped_count=batch.skipped_count,
+    )
+    return summarize_batch(batch)
+
+
+async def rebuild_course_graph_for_batch(session: Session, course_id: str, batch_id: str) -> dict:
+    try:
+        return await rebuild_course_graph(session, course_id, batch_id=batch_id)
+    except TypeError as exc:
+        if "unexpected keyword argument 'batch_id'" not in str(exc):
+            raise
+        return await rebuild_course_graph(session, course_id)
 
 
 def embedding_audit_payload(provider: str, external_called: bool, fallback_reason: str | None, vector_count: int) -> dict:
@@ -73,27 +116,6 @@ def emit_model_audit_log(batch_id: str) -> None:
         graph_extraction_provider=graph_provider,
         graph_extraction_model=settings.chat_model if graph_provider == "openai_compatible_chat" else graph_provider,
     )
-
-
-def source_type_from_path(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        return "pdf"
-    if suffix in {".ppt", ".pptx"}:
-        return suffix.lstrip(".")
-    if suffix == ".docx":
-        return "docx"
-    if suffix in {".md", ".markdown"}:
-        return "markdown"
-    if suffix == ".txt":
-        return "text"
-    if suffix == ".ipynb":
-        return "notebook"
-    if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
-        return "image"
-    if suffix in {".html", ".htm"}:
-        return "html"
-    return "unknown"
 
 
 def get_course_paths(course_name: str) -> dict[str, Path]:
@@ -229,12 +251,41 @@ def create_sync_batch(db: Session, course_id: str, root: Path, trigger_source: s
     return batch
 
 
-def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path]) -> IngestionBatch:
+def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path], force: bool = False) -> IngestionBatch:
     storage_batch_root = str(files[0].parent) if files else "storage files"
     batch = IngestionBatch(course_id=course_id, source_root=storage_batch_root, trigger_source="upload", status="queued")
     batch.total_files = len(files)
-    batch.stats = {"uploaded_files": [str(path) for path in files], "coverage_by_source_type": {}, "errors": []}
+    batch.stats = {"uploaded_files": [str(path) for path in files], "coverage_by_source_type": {}, "errors": [], "force": force}
     db.add(batch)
+    db.flush()
+    if force:
+        for path in files:
+            path_string = str(path)
+            document = db.scalar(select(Document).where(Document.course_id == course_id, Document.source_path == path_string))
+            job = db.scalar(
+                select(IngestionJob)
+                .where(IngestionJob.course_id == course_id, IngestionJob.source_path == path_string)
+                .order_by(IngestionJob.updated_at.desc())
+            )
+            if job is None:
+                job = IngestionJob(
+                    course_id=course_id,
+                    document_id=document.id if document else None,
+                    batch_id=batch.id,
+                    source_path=path_string,
+                    trigger_source="upload",
+                    status="queued",
+                    stats={"force_reparse": True},
+                )
+                db.add(job)
+            else:
+                job.document_id = document.id if document else job.document_id
+                job.batch_id = batch.id
+                job.source_path = path_string
+                job.trigger_source = "upload"
+                job.status = "queued"
+                job.error_message = None
+                job.stats = {"force_reparse": True}
     db.commit()
     db.refresh(batch)
     return batch
@@ -289,6 +340,11 @@ def register_uploaded_file(db: Session, course: Course, source_path: Path) -> tu
 
 def summarize_batch(batch: IngestionBatch) -> dict:
     stats = batch.stats or {}
+    graph_stats = {
+        key: value
+        for key, value in stats.items()
+        if key.startswith("graph_") or key in {"concepts", "relations"}
+    }
     return {
         "batch_id": batch.id,
         "state": batch.status,
@@ -301,23 +357,10 @@ def summarize_batch(batch: IngestionBatch) -> dict:
         "skipped_count": batch.skipped_count,
         "coverage_by_source_type": stats.get("coverage_by_source_type", {}),
         "errors": stats.get("errors", []),
+        "graph_stats": graph_stats,
         "started_at": batch.started_at,
         "completed_at": batch.completed_at,
     }
-
-
-def choose_llm_graph_chunks(chunks: list[Chunk], limit: int = 3) -> set[str]:
-    priority = {"markdown": 4, "pdf_page": 4, "doc_section": 4, "slide": 4, "text": 3, "html": 3, "ocr": 3, "code": 0, "output": 0}
-    ranked = sorted(
-        chunks,
-        key=lambda chunk: (
-            priority.get(chunk.metadata_json.get("content_kind", "text"), 2),
-            len(chunk.content),
-            1 if chunk.source_type == "notebook" else 2,
-        ),
-        reverse=True,
-    )
-    return {chunk.id for chunk in ranked[:limit]}
 
 
 def get_batch_status(db: Session, batch_id: str) -> dict | None:
@@ -325,6 +368,39 @@ def get_batch_status(db: Session, batch_id: str) -> dict | None:
     if batch is None:
         return None
     return summarize_batch(batch)
+
+
+def finalize_interrupted_batches() -> int:
+    from app.db import SessionLocal
+
+    finalized: list[str] = []
+    now = datetime.utcnow()
+    with SessionLocal() as session:
+        batches = session.scalars(select(IngestionBatch).where(IngestionBatch.status.notin_(TERMINAL_STATES))).all()
+        for batch in batches:
+            batch.status = "failed"
+            batch.last_error = "Interrupted because the API process restarted before this batch reached a terminal state"
+            batch.completed_at = now
+            jobs = session.scalars(
+                select(IngestionJob).where(
+                    IngestionJob.batch_id == batch.id,
+                    IngestionJob.status.notin_(TERMINAL_STATES),
+                )
+            ).all()
+            for job in jobs:
+                job.status = "failed"
+                job.error_message = batch.last_error
+            finalized.append(batch.id)
+        session.commit()
+
+    for batch_id in finalized:
+        emit_ingestion_log(
+            batch_id,
+            "batch_failed",
+            "Batch failed because the API process restarted before it reached a terminal state",
+            state="failed",
+        )
+    return len(finalized)
 
 
 def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
@@ -428,6 +504,7 @@ async def ingest_file(
     batch_id: str | None = None,
     course_id: str | None = None,
     rebuild_graph: bool = True,
+    force: bool = False,
 ) -> dict:
     job = db.get(IngestionJob, existing_job_id) if existing_job_id else None
     course = resolve_course(db, job.course_id if job is not None else course_id)
@@ -452,7 +529,7 @@ async def ingest_file(
         job.trigger_source = trigger_source
         db.commit()
 
-    if active_version and active_version.checksum == checksum:
+    if active_version and active_version.checksum == checksum and not force:
         chunk_count = db.query(Chunk).filter(Chunk.document_id == existing_document.id, Chunk.is_active.is_(True)).count() if existing_document else 0
         job.document_id = existing_document.id if existing_document else None
         job.status = "skipped"
@@ -479,7 +556,7 @@ async def ingest_file(
     if not sections:
         raise RuntimeError(f"No readable content extracted from {source_path.name}")
 
-    chapter = derive_chapter(source_path)
+    chapter = derive_chapter(source_path, course_name=course.name)
     document, version_number, stale_chunk_ids = create_or_update_document(
         db=db,
         course=course,
@@ -676,12 +753,15 @@ async def run_batch_ingestion(batch_id: str) -> dict:
                     batch.success_count += 1
                     emit_ingestion_log(batch_id, "file_completed", f"Completed {path.name}", source_path=str(path), stats=result.get("stats", {}))
             except Exception as exc:
+                session.rollback()
                 failed_job = session.get(IngestionJob, job.id)
                 if failed_job is not None:
                     failed_job.status = "failed"
                     failed_job.error_message = str(exc)
-                batch.failure_count += 1
-                batch.last_error = str(exc)
+                batch = session.get(IngestionBatch, batch_id)
+                if batch is not None:
+                    batch.failure_count += 1
+                    batch.last_error = str(exc)
                 errors.append({"source_path": str(path), "message": str(exc)})
                 emit_ingestion_log(batch_id, "file_failed", f"Failed {path.name}: {exc}", source_path=str(path), error=str(exc))
                 session.commit()
@@ -706,23 +786,61 @@ async def run_batch_ingestion(batch_id: str) -> dict:
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} disappeared")
-        graph_stats = await rebuild_course_graph(session, batch.course_id) if batch.success_count > 0 or batch.skipped_count > 0 else {
-            "graph_rebuilt": False,
-            "graph_nodes": 0,
-            "graph_edges": 0,
-            "concepts": 0,
-            "relations": 0,
-            "graph_extraction_provider": graph_extraction_provider(),
-        }
+        if batch.success_count > 0:
+            settings = get_settings()
+            batch.status = "extracting_graph"
+            session.commit()
+            emit_ingestion_log(
+                batch_id,
+                "batch_graph_started",
+                "Generating course graph",
+                processed_files=batch.processed_files,
+                total_files=batch.total_files,
+                success_count=batch.success_count,
+                failure_count=batch.failure_count,
+                skipped_count=batch.skipped_count,
+                graph_extraction_chunk_limit=settings.graph_extraction_chunk_limit,
+                graph_extraction_chunks_per_document=settings.graph_extraction_chunks_per_document,
+            )
+            try:
+                graph_stats = await rebuild_course_graph_for_batch(session, batch.course_id, batch_id)
+            except Exception as exc:
+                session.rollback()
+                return finalize_graph_generation_failure(
+                    session,
+                    batch_id,
+                    exc,
+                    {
+                        "coverage_by_source_type": dict(coverage),
+                        "errors": errors,
+                        "degraded_mode": is_degraded_mode(),
+                    },
+                )
+        else:
+            graph_stats = {
+                "graph_rebuilt": False,
+                "graph_nodes": 0,
+                "graph_edges": 0,
+                "concepts": 0,
+                "relations": 0,
+                "graph_extraction_provider": graph_extraction_provider(),
+            }
         batch.stats = {
             "coverage_by_source_type": dict(coverage),
             "errors": errors,
             "degraded_mode": is_degraded_mode(),
             **graph_stats,
         }
-        if batch.failure_count == batch.total_files and batch.total_files > 0:
+        if batch.skipped_count == batch.total_files and batch.total_files > 0:
+            batch.status = "skipped"
+            terminal_event = "batch_skipped"
+        elif batch.failure_count == batch.total_files and batch.total_files > 0:
             batch.status = "failed"
             terminal_event = "batch_failed"
+        elif graph_stats.get("graph_llm_failed_chunks", 0) > 0:
+            batch.status = "partial_failed"
+            terminal_event = "batch_partial_failed"
+            batch.last_error = f"Graph extraction failed for {graph_stats['graph_llm_failed_chunks']} chunk(s)"
         elif batch.failure_count > 0:
             batch.status = "partial_failed"
             terminal_event = "batch_partial_failed"
@@ -738,7 +856,7 @@ async def run_batch_ingestion(batch_id: str) -> dict:
         session.close()
 
 
-async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str]) -> dict:
+async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], force: bool = False) -> dict:
     from app.db import SessionLocal
 
     session = SessionLocal()
@@ -761,7 +879,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str]) -> 
 
         course = resolve_course(session, batch.course_id)
         emit_model_audit_log(batch_id)
-        emit_ingestion_log(batch_id, "batch_started", f"Parsing {len(files)} files", total_files=len(files))
+        emit_ingestion_log(batch_id, "batch_started", f"Parsing {len(files)} files" + (" with force reparse" if force else ""), total_files=len(files), force=force)
         for index, path in enumerate(files, start=1):
             emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] Parsing {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
             job = session.scalar(
@@ -796,6 +914,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str]) -> 
                     batch_id=batch.id,
                     course_id=course.id,
                     rebuild_graph=False,
+                    force=force,
                 )
                 coverage[result.get("source_type", "unknown")] += 1
                 if result["status"] == "skipped":
@@ -805,12 +924,15 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str]) -> 
                     batch.success_count += 1
                     emit_ingestion_log(batch_id, "file_completed", f"Completed {path.name}", source_path=str(path), stats=result.get("stats", {}))
             except Exception as exc:
+                session.rollback()
                 failed_job = session.get(IngestionJob, job.id)
                 if failed_job is not None:
                     failed_job.status = "failed"
                     failed_job.error_message = str(exc)
-                batch.failure_count += 1
-                batch.last_error = str(exc)
+                batch = session.get(IngestionBatch, batch_id)
+                if batch is not None:
+                    batch.failure_count += 1
+                    batch.last_error = str(exc)
                 errors.append({"source_path": str(path), "message": str(exc)})
                 emit_ingestion_log(batch_id, "file_failed", f"Failed {path.name}: {exc}", source_path=str(path), error=str(exc))
                 session.commit()
@@ -819,7 +941,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str]) -> 
                 if batch is None:
                     break
                 batch.processed_files += 1
-                batch.stats = {"uploaded_files": file_paths, "coverage_by_source_type": dict(coverage), "errors": errors}
+                batch.stats = {"uploaded_files": file_paths, "coverage_by_source_type": dict(coverage), "errors": errors, "force": force}
                 emit_ingestion_log(
                     batch_id,
                     "batch_progress",
@@ -835,24 +957,65 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str]) -> 
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} disappeared")
-        graph_stats = await rebuild_course_graph(session, batch.course_id) if batch.success_count > 0 or batch.skipped_count > 0 else {
-            "graph_rebuilt": False,
-            "graph_nodes": 0,
-            "graph_edges": 0,
-            "concepts": 0,
-            "relations": 0,
-            "graph_extraction_provider": graph_extraction_provider(),
-        }
+        if batch.success_count > 0:
+            settings = get_settings()
+            batch.status = "extracting_graph"
+            session.commit()
+            emit_ingestion_log(
+                batch_id,
+                "batch_graph_started",
+                "Generating course graph",
+                processed_files=batch.processed_files,
+                total_files=batch.total_files,
+                success_count=batch.success_count,
+                failure_count=batch.failure_count,
+                skipped_count=batch.skipped_count,
+                graph_extraction_chunk_limit=settings.graph_extraction_chunk_limit,
+                graph_extraction_chunks_per_document=settings.graph_extraction_chunks_per_document,
+            )
+            try:
+                graph_stats = await rebuild_course_graph_for_batch(session, batch.course_id, batch_id)
+            except Exception as exc:
+                session.rollback()
+                return finalize_graph_generation_failure(
+                    session,
+                    batch_id,
+                    exc,
+                    {
+                        "uploaded_files": file_paths,
+                        "coverage_by_source_type": dict(coverage),
+                        "errors": errors,
+                        "force": force,
+                        "degraded_mode": is_degraded_mode(),
+                    },
+                )
+        else:
+            graph_stats = {
+                "graph_rebuilt": False,
+                "graph_nodes": 0,
+                "graph_edges": 0,
+                "concepts": 0,
+                "relations": 0,
+                "graph_extraction_provider": graph_extraction_provider(),
+            }
         batch.stats = {
             "uploaded_files": file_paths,
             "coverage_by_source_type": dict(coverage),
             "errors": errors,
+            "force": force,
             "degraded_mode": is_degraded_mode(),
             **graph_stats,
         }
-        if batch.failure_count == batch.total_files and batch.total_files > 0:
+        if batch.skipped_count == batch.total_files and batch.total_files > 0:
+            batch.status = "skipped"
+            terminal_event = "batch_skipped"
+        elif batch.failure_count == batch.total_files and batch.total_files > 0:
             batch.status = "failed"
             terminal_event = "batch_failed"
+        elif graph_stats.get("graph_llm_failed_chunks", 0) > 0:
+            batch.status = "partial_failed"
+            terminal_event = "batch_partial_failed"
+            batch.last_error = f"Graph extraction failed for {graph_stats['graph_llm_failed_chunks']} chunk(s)"
         elif batch.failure_count > 0:
             batch.status = "partial_failed"
             terminal_event = "batch_partial_failed"
@@ -875,6 +1038,7 @@ async def run_ingestion_job(job_id: str, source_path: Path, trigger_source: str 
     try:
         return await ingest_file(session, source_path, trigger_source=trigger_source, existing_job_id=job_id)
     except Exception as exc:
+        session.rollback()
         job = session.get(IngestionJob, job_id)
         if job:
             job.status = "failed"

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import type { CourseFileStatus, CourseFileSummary } from "@course-kg/shared";
@@ -42,8 +42,15 @@ type IngestionLogEvent = {
   graph_extraction_model?: string;
 };
 
-const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed"]);
+const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_missing"]);
 const terminalBatchStates = new Set(["completed", "partial_failed", "failed", "skipped"]);
+
+function isBatchNotFoundError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return error.message.includes("Batch not found") || error.message.includes("Request failed with 404");
+}
 
 type FileBrowserItem = CourseFileSummary & {
   localOnly?: boolean;
@@ -95,25 +102,29 @@ function fileNameFromPath(path: string): string {
 function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | null }) {
   const queryClient = useQueryClient();
   const [batchId, setBatchId] = useState<string | null>(null);
+  const [dismissedBatchId, setDismissedBatchId] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [activeLogBatchId, setActiveLogBatchId] = useState<string | null>(null);
   const [logOpen, setLogOpen] = useState(false);
   const [logs, setLogs] = useState<IngestionLogEvent[]>([]);
+  const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(() => new Set());
 
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedCourseId],
     queryFn: () => fetchDashboard(selectedCourseId),
     enabled: Boolean(selectedCourseId),
   });
-  const activeBatchId = batchId ?? dashboardQuery.data?.batch_status?.batch_id ?? null;
+  const activeBatchCandidate = batchId ?? dashboardQuery.data?.batch_status?.batch_id ?? null;
+  const activeBatchId = activeBatchCandidate && activeBatchCandidate !== dismissedBatchId ? activeBatchCandidate : null;
   const batchQuery = useQuery({
     queryKey: ["batch", selectedCourseId, activeBatchId],
     queryFn: () => fetchBatchStatus(activeBatchId as string),
     enabled: Boolean(activeBatchId),
+    retry: (failureCount, error) => !isBatchNotFoundError(error) && failureCount < 2,
     refetchInterval: (query) => {
       const state = query.state.data?.state;
-      return state && ["completed", "partial_failed", "failed"].includes(state) ? false : 3000;
+      return state && terminalBatchStates.has(state) ? false : 3000;
     },
   });
   const courseFilesQuery = useQuery({
@@ -123,10 +134,19 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     refetchInterval: () => (activeBatchId && !terminalBatchStates.has(batchQuery.data?.state ?? "") ? 3000 : false),
   });
   const visibleBatch = batchQuery.data && !terminalBatchStates.has(batchQuery.data.state) ? batchQuery.data : null;
+  const isGraphBuilding = visibleBatch?.state === "extracting_graph";
+  const remoteParseablePaths = useMemo(
+    () => (courseFilesQuery.data ?? []).filter((file) => file.status !== "parsing").map((file) => file.source_path),
+    [courseFilesQuery.data],
+  );
   const parseTargetPaths = useMemo(() => {
-    const remoteParseablePaths = (courseFilesQuery.data ?? []).filter((file) => file.status !== "parsing").map((file) => file.source_path);
     return Array.from(new Set([...uploadedFiles.map((file) => file.path), ...remoteParseablePaths]));
-  }, [courseFilesQuery.data, uploadedFiles]);
+  }, [remoteParseablePaths, uploadedFiles]);
+  const selectedParseTargetPaths = useMemo(
+    () => parseTargetPaths.filter((path) => selectedFilePaths.has(path)),
+    [parseTargetPaths, selectedFilePaths],
+  );
+  const effectiveParseTargetPaths = selectedParseTargetPaths.length > 0 ? selectedParseTargetPaths : parseTargetPaths;
   const uploadMutation = useMutation({
     mutationFn: async (files: File[]) => {
       setUploadProgress({ completed: 0, total: files.length });
@@ -156,13 +176,15 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   });
 
   const parseUploadsMutation = useMutation({
-    mutationFn: () => parseUploadedFiles(parseTargetPaths, selectedCourseId),
+    mutationFn: ({ paths, force }: { paths: string[]; force: boolean }) => parseUploadedFiles(paths, selectedCourseId, force),
     onSuccess: (data) => {
       setBatchId(data.batch_id);
+      setDismissedBatchId(null);
       setActiveLogBatchId(data.batch_id);
       setLogs([]);
       setLogOpen(true);
       setUploadedFiles([]);
+      setSelectedFilePaths(new Set());
       void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
     },
@@ -233,6 +255,47 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     removeFileMutation.mutate(file.source_path);
   };
 
+  const handleFileRowClick = (event: MouseEvent<HTMLDivElement>, file: FileBrowserItem) => {
+    if (!event.shiftKey || file.status === "parsing") {
+      return;
+    }
+    event.preventDefault();
+    setSelectedFilePaths((current) => {
+      const next = new Set(current);
+      if (next.has(file.source_path)) {
+        next.delete(file.source_path);
+      } else {
+        next.add(file.source_path);
+      }
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    setSelectedFilePaths(new Set());
+  }, [selectedCourseId]);
+
+  useEffect(() => {
+    setSelectedFilePaths((current) => {
+      const validPaths = new Set(parseTargetPaths);
+      const next = new Set(Array.from(current).filter((path) => validPaths.has(path)));
+      return next.size === current.size ? current : next;
+    });
+  }, [parseTargetPaths]);
+
+  useEffect(() => {
+    if (!activeBatchId || terminalBatchStates.has(batchQuery.data?.state ?? "")) {
+      return;
+    }
+    setActiveLogBatchId((current) => {
+      if (current === activeBatchId) {
+        return current;
+      }
+      setLogs([]);
+      return activeBatchId;
+    });
+  }, [activeBatchId, batchQuery.data?.state]);
+
   useEffect(() => {
     if (!activeLogBatchId) {
       return;
@@ -243,6 +306,11 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       setLogs((current) => [...current, item].slice(-300));
       if (terminalLogEvents.has(item.event)) {
         source.close();
+        setActiveLogBatchId(null);
+        if (item.event === "batch_missing") {
+          setBatchId(null);
+          setDismissedBatchId(activeLogBatchId);
+        }
         void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
         void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
         void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, activeLogBatchId] });
@@ -250,6 +318,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     };
     source.onerror = () => {
       source.close();
+      setActiveLogBatchId(null);
+      void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, activeLogBatchId] });
     };
     return () => {
       source.close();
@@ -259,10 +329,31 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   useEffect(() => {
     if (batchQuery.data?.state && terminalBatchStates.has(batchQuery.data.state)) {
       setBatchId(null);
+      setDismissedBatchId(activeBatchId);
       void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
     }
-  }, [batchQuery.data?.state, queryClient, selectedCourseId]);
+  }, [activeBatchId, batchQuery.data?.state, queryClient, selectedCourseId]);
+
+  useEffect(() => {
+    if (!activeBatchId || !isBatchNotFoundError(batchQuery.error)) {
+      return;
+    }
+    setBatchId(null);
+    setDismissedBatchId(activeBatchId);
+    setActiveLogBatchId((current) => (current === activeBatchId ? null : current));
+    setLogs((current) => [
+      ...current,
+      {
+        timestamp: new Date().toISOString(),
+        event: "batch_missing",
+        message: "旧批次日志已清理，已停止同步该批次。",
+        state: "missing",
+      },
+    ].slice(-300));
+    void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
+    void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+  }, [activeBatchId, batchQuery.error, queryClient, selectedCourseId]);
 
   const inclusionRules = useMemo(
     () => [
@@ -296,12 +387,22 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             <div className="flex flex-wrap gap-3">
               <button
                 type="button"
-                onClick={() => parseUploadsMutation.mutate()}
-                disabled={parseUploadsMutation.isPending || parseTargetPaths.length === 0}
+                onClick={() => parseUploadsMutation.mutate({ paths: effectiveParseTargetPaths, force: false })}
+                disabled={parseUploadsMutation.isPending || effectiveParseTargetPaths.length === 0}
                 className="rounded-full border border-emerald-300/35 bg-emerald-300/10 px-5 py-3 text-sm uppercase tracking-[0.24em] text-white disabled:opacity-50"
               >
                 {parseUploadsMutation.isPending ? <LoaderCircle className="mr-2 inline size-4 animate-spin" /> : <FileCheck2 className="mr-2 inline size-4" />}
                 {parseUploadsMutation.isPending ? "解析中" : "解析文件"}
+              </button>
+              <button
+                type="button"
+                onClick={() => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true })}
+                disabled={parseUploadsMutation.isPending || parseTargetPaths.length === 0}
+                className="rounded-full border border-rose-300/30 bg-rose-300/8 px-4 py-3 text-xs uppercase tracking-[0.2em] text-rose-50/80 transition hover:text-white disabled:opacity-45"
+                title="强制重建当前课程所有文件的 chunks、embedding、Qdrant 向量和图谱"
+              >
+                {parseUploadsMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <RefreshCcw className="mr-2 inline size-3.5" />}
+                全量重新解析
               </button>
               <label
                 aria-disabled={uploadMutation.isPending}
@@ -339,6 +440,13 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 <PanelRightOpen className="size-4" />
               </button>
             </div>
+            {selectedParseTargetPaths.length > 0 ? (
+              <p className="text-xs uppercase tracking-[0.2em] text-cyan-50/58">
+                已选择 {selectedParseTargetPaths.length} 个文件；点击解析文件只处理选中文件。再次 Shift + 左键点击可取消选择。
+              </p>
+            ) : (
+              <p className="text-xs uppercase tracking-[0.2em] text-white/36">按住 Shift 并左键点击文件可多选；未选择时解析按钮按原逻辑处理待解析/变更文件。</p>
+            )}
             {uploadMutation.isPending ? (
               <div className="max-w-md">
                 <div className="flex items-center justify-between text-xs uppercase tracking-[0.22em] text-white/45">
@@ -418,8 +526,19 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
           ) : fileItems.length === 0 ? (
             <div className="px-5 py-8 text-sm text-white/50">暂无文件。上传文件后会先显示为待解析。</div>
           ) : (
-            fileItems.map((file) => (
-              <div key={`${file.id}-${file.source_path}`} className="border-b border-white/7 px-4 py-4 last:border-b-0 transition hover:bg-white/[0.035]">
+            fileItems.map((file) => {
+              const isSelected = selectedFilePaths.has(file.source_path);
+              return (
+              <div
+                key={`${file.id}-${file.source_path}`}
+                onClick={(event) => handleFileRowClick(event, file)}
+                className={cn(
+                  "border-b border-white/7 px-4 py-4 last:border-b-0 transition hover:bg-white/[0.035]",
+                  file.status !== "parsing" && "cursor-default",
+                  isSelected && "bg-cyan-300/[0.08] ring-1 ring-inset ring-cyan-200/35",
+                )}
+                title="按住 Shift 并左键点击可多选文件"
+              >
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
@@ -432,7 +551,10 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                   </div>
                   <button
                     type="button"
-                    onClick={() => handleRemoveFile(file)}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleRemoveFile(file);
+                    }}
                     disabled={file.status === "parsing" || removeFileMutation.isPending}
                     className="inline-flex shrink-0 items-center gap-2 rounded-full border border-white/10 px-3 py-2 text-xs text-white/62 transition hover:border-rose-200/35 hover:text-rose-100 disabled:pointer-events-none disabled:opacity-40"
                     title={file.status === "parsing" ? "解析中，暂不能移除" : "移除文件"}
@@ -445,9 +567,11 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                   <span className="rounded-full border border-white/8 px-2.5 py-1">{file.source_type || "unknown"}</span>
                   {file.chapter ? <span className="rounded-full border border-white/8 px-2.5 py-1">{file.chapter}</span> : null}
                   <span className="rounded-full border border-white/8 px-2.5 py-1">{file.chunk_count} chunks</span>
+                  {isSelected ? <span className="rounded-full border border-cyan-200/30 bg-cyan-300/10 px-2.5 py-1 text-cyan-50">已选择</span> : null}
                 </div>
               </div>
-            ))
+              );
+            })
           )}
         </div>
         </div>
@@ -491,6 +615,26 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
           </div>
 
           <div className="mt-6 space-y-5">
+            {isGraphBuilding ? (
+              <div className="relative overflow-hidden rounded-[22px] border border-cyan-200/22 bg-cyan-300/[0.055] p-5">
+                <div className="absolute inset-0 bg-[linear-gradient(90deg,transparent,rgba(103,232,249,0.12),transparent)] animate-pulse" />
+                <div className="relative flex items-start gap-4">
+                  <div className="grid size-12 shrink-0 place-items-center rounded-full border border-cyan-100/20 bg-cyan-200/10">
+                    <LoaderCircle className="size-6 animate-spin text-cyan-100" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-cyan-50">正在生成课程图谱</p>
+                    <p className="mt-2 text-sm leading-6 text-cyan-50/72">图谱关系抽取和绘制需要等待模型完成，请不要关闭页面、停止后端或重启服务。</p>
+                    <div className="mt-4 flex items-center gap-2">
+                      {[0, 1, 2, 3].map((item) => (
+                        <span key={item} className="size-2 animate-pulse rounded-full bg-cyan-100/80" style={{ animationDelay: `${item * 150}ms` }} />
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
             <div className="border border-white/8 bg-black/10 p-5">
               <div className="flex items-center justify-between gap-4">
                 <p className="text-lg font-medium text-white">{visibleBatch?.state ?? "未启动"}</p>
@@ -521,8 +665,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             {(visibleBatch?.errors ?? []).length > 0 ? (
               <div className="rounded-[22px] border border-rose-300/20 bg-rose-400/[0.05] p-5">
                 <p className="text-xs uppercase tracking-[0.26em] text-rose-100/70">Failures</p>
-                <div className="mt-4 space-y-3">
-                  {visibleBatch?.errors.slice(0, 6).map((error) => (
+                <div className="custom-scrollbar kg-rounded-scrollbar mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">
+                  {visibleBatch?.errors.map((error) => (
                     <div key={`${error.source_path}-${error.message}`} className="rounded-[18px] border border-white/8 px-4 py-3 text-sm text-white/72">
                       <p className="font-medium text-white">{error.source_path}</p>
                       <p className="mt-1 text-white/58">{error.message}</p>

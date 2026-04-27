@@ -7,11 +7,13 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.utils import source_type_from_path
 from app.core.config import get_settings
 from app.models import Chunk, Concept, ConceptRelation, Course, Document, DocumentVersion, IngestionBatch, IngestionJob
 from app.schemas import Citation, SearchFilters
 from app.services.concept_graph import get_graph_payload
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode
+from app.services.parsers import derive_chapter, is_invalid_chapter_label
 from app.services.vector_store import VectorStore
 
 
@@ -296,6 +298,11 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
             "skipped_count": latest_batch.skipped_count,
             "coverage_by_source_type": (latest_batch.stats or {}).get("coverage_by_source_type", {}),
             "errors": (latest_batch.stats or {}).get("errors", []),
+            "graph_stats": {
+                key: value
+                for key, value in (latest_batch.stats or {}).items()
+                if key.startswith("graph_") or key in {"concepts", "relations"}
+            },
             "started_at": latest_batch.started_at,
             "completed_at": latest_batch.completed_at,
         },
@@ -309,33 +316,14 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
 ACTIVE_FILE_STATES = {"parsing", "chunking", "embedding", "extracting_graph", "processing"}
 
 
-def source_type_from_path(path: str) -> str:
-    suffix = Path(path).suffix.lower()
-    if suffix == ".pdf":
-        return "pdf"
-    if suffix in {".ppt", ".pptx"}:
-        return suffix.lstrip(".")
-    if suffix == ".docx":
-        return "docx"
-    if suffix in {".md", ".markdown"}:
-        return "markdown"
-    if suffix == ".txt":
-        return "text"
-    if suffix == ".ipynb":
-        return "notebook"
-    if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
-        return "image"
-    if suffix in {".html", ".htm"}:
-        return "html"
-    return "unknown"
-
-
 def file_status_from_job(job: IngestionJob | None, has_parsed_chunks: bool) -> str:
     if job is None:
         return "parsed" if has_parsed_chunks else "pending"
     if job.status in ACTIVE_FILE_STATES:
         return "parsing"
     if job.status == "queued":
+        if (job.stats or {}).get("force_reparse"):
+            return "pending"
         return "parsed" if has_parsed_chunks else "pending"
     if job.status == "failed":
         return "failed"
@@ -391,7 +379,9 @@ def list_course_files(db: Session, course_id: str) -> list[dict]:
                 "title": document.title if document else path.stem or path.name,
                 "source_path": path_string,
                 "source_type": document.source_type if document else source_type_from_path(path_string),
-                "chapter": document.tags[0] if document and document.tags else path.parent.name if storage_root is not None and path.parent != storage_root else None,
+                "chapter": document.tags[0]
+                if document and document.tags and not is_invalid_chapter_label(document.tags[0], course_name=course.name if course else None)
+                else derive_chapter(path, course_name=course.name if course else None),
                 "status": file_status_from_job(job, has_parsed_chunks=chunk_count > 0),
                 "job_state": job.status if job else None,
                 "batch_id": job.batch_id if job else None,

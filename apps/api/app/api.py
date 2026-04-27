@@ -59,7 +59,7 @@ from app.services.ingestion import (
     remove_course_file,
     summarize_course,
 )
-from app.services.ingestion_logs import TERMINAL_LOG_EVENTS, subscribe_ingestion_logs, unsubscribe_ingestion_logs
+from app.services.ingestion_logs import TERMINAL_LOG_EVENTS, list_ingestion_logs, subscribe_ingestion_logs, unsubscribe_ingestion_logs
 from app.services.retrieval import get_dashboard_snapshot, get_job_status, list_course_files, search_chunks
 from app.services.runtime_settings import model_settings_payload, update_model_settings
 from app.services.storage import save_upload
@@ -176,8 +176,8 @@ def enqueue_batch(batch_id: str) -> None:
         asyncio.run(run_batch_ingestion(batch_id))
 
 
-def enqueue_uploaded_batch(batch_id: str, file_paths: list[str]) -> None:
-    asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths))
+def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False) -> None:
+    asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force))
 
 
 @router.post("/files/upload", response_model=UploadFileResponse)
@@ -216,8 +216,8 @@ async def parse_uploaded_files(
             continue
         seen_paths.add(path)
         file_paths.append(path)
-    batch = create_uploaded_files_batch(db, course.id, file_paths)
-    background_tasks.add_task(enqueue_uploaded_batch, batch.id, [str(path) for path in file_paths])
+    batch = create_uploaded_files_batch(db, course.id, file_paths, force=request.force)
+    background_tasks.add_task(enqueue_uploaded_batch, batch.id, [str(path) for path in file_paths], request.force)
     return {"batch_id": batch.id, "state": "queued"}
 
 
@@ -243,20 +243,89 @@ def batch_status(batch_id: str, db: Session = Depends(get_db)) -> dict:
 
 @router.get("/ingestion/batches/{batch_id}/logs")
 async def batch_logs(batch_id: str):
+    from app.db import SessionLocal
+
+    with SessionLocal() as session:
+        batch_exists = get_batch_status(session, batch_id) is not None
+
+    if not batch_exists:
+        async def missing_stream():
+            yield f"data: {json.dumps({'timestamp': datetime.utcnow().isoformat(), 'event': 'batch_missing', 'message': 'Batch no longer exists. The local UI state can be cleared.', 'state': 'missing'}, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(missing_stream(), media_type="text/event-stream")
+
     async def event_stream():
+        emitted: set[str] = set()
+
+        def event_key(item: dict) -> str:
+            return str(item.get("log_id") or item.get("synthetic_key") or f"{item.get('timestamp')}:{item.get('event')}:{item.get('message')}")
+
+        def format_new(item: dict) -> str | None:
+            key = event_key(item)
+            if key in emitted:
+                return None
+            emitted.add(key)
+            return f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+
+        def batch_snapshot_event() -> dict | None:
+            from app.db import SessionLocal
+
+            with SessionLocal() as session:
+                snapshot = get_batch_status(session, batch_id)
+            if snapshot is None:
+                return None
+            state = snapshot["state"]
+            terminal_events = {
+                "completed": "batch_completed",
+                "failed": "batch_failed",
+                "partial_failed": "batch_partial_failed",
+                "skipped": "batch_skipped",
+            }
+            event = terminal_events.get(state, "batch_status")
+            return {
+                "synthetic_key": f"snapshot:{state}:{snapshot['processed_files']}:{snapshot['success_count']}:{snapshot['failure_count']}:{snapshot['skipped_count']}",
+                "timestamp": datetime.utcnow().isoformat(),
+                "event": event,
+                "message": f"Batch {state}: {snapshot['processed_files']}/{snapshot['total_files']} processed",
+                "state": state,
+                "processed_files": snapshot["processed_files"],
+                "total_files": snapshot["total_files"],
+                "success_count": snapshot["success_count"],
+                "failure_count": snapshot["failure_count"],
+                "skipped_count": snapshot["skipped_count"],
+            }
+
         history, subscriber = subscribe_ingestion_logs(batch_id)
         try:
             for item in history:
-                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                chunk = format_new(item)
+                if chunk:
+                    yield chunk
                 if item.get("event") in TERMINAL_LOG_EVENTS:
                     return
             while True:
+                latest = list_ingestion_logs(batch_id)
+                for item in latest:
+                    chunk = format_new(item)
+                    if chunk:
+                        yield chunk
+                    if item.get("event") in TERMINAL_LOG_EVENTS:
+                        return
+                snapshot = batch_snapshot_event()
+                if snapshot:
+                    chunk = format_new(snapshot)
+                    if chunk:
+                        yield chunk
+                    if snapshot.get("event") in TERMINAL_LOG_EVENTS:
+                        return
                 try:
-                    item = await asyncio.to_thread(subscriber.get, True, 15)
+                    item = await asyncio.to_thread(subscriber.get, True, 2)
                 except Exception:
                     yield ": heartbeat\n\n"
                     continue
-                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                chunk = format_new(item)
+                if chunk:
+                    yield chunk
                 if item.get("event") in TERMINAL_LOG_EVENTS:
                     return
         finally:

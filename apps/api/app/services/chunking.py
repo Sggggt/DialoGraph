@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from typing import Any
 
 from app.services.parsers import ParsedSection
 
@@ -12,10 +13,21 @@ except Exception:  # pragma: no cover - optional fallback
 
 
 def normalize_text(text: str) -> str:
+    text = text.replace("\x00", "")
     text = text.replace("\r\n", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
+
+
+def sanitize_metadata(value: Any) -> Any:
+    if isinstance(value, str):
+        return normalize_text(value)
+    if isinstance(value, list):
+        return [sanitize_metadata(item) for item in value]
+    if isinstance(value, dict):
+        return {normalize_text(key) if isinstance(key, str) else key: sanitize_metadata(item) for key, item in value.items()}
+    return value
 
 
 def rough_token_count(text: str) -> int:
@@ -63,26 +75,29 @@ def infer_content_kind(content: str, fallback: str | None = None) -> str:
 def chunk_sections(sections: Iterable[ParsedSection], chapter: str, source_type: str) -> list[dict]:
     chunks: list[dict] = []
     for section_index, section in enumerate(sections, start=1):
-        content_kind = infer_content_kind(section.text, section.metadata.get("content_kind") if section.metadata else None)
+        section_text = normalize_text(section.text)
+        section_title = normalize_text(section.title)
+        section_name = normalize_text(section.section or section.title)
+        content_kind = infer_content_kind(section_text, section.metadata.get("content_kind") if section.metadata else None)
         unit_size = 900 if content_kind == "code" else 1200
         overlap = 120 if source_type == "markdown" else 150
-        for chunk_index, content in enumerate(split_text(section.text, unit_size, overlap), start=1):
+        for chunk_index, content in enumerate(split_text(section_text, unit_size, overlap), start=1):
             snippet = content[:280].strip()
             chunks.append(
                 {
                     "content": content,
                     "snippet": snippet,
                     "chapter": chapter,
-                    "section": section.section or section.title,
+                    "section": section_name,
                     "page_number": section.page_number,
                     "token_count": rough_token_count(content),
-                    "metadata": {
-                        "section_title": section.title,
+                    "metadata": sanitize_metadata({
+                        "section_title": section_title,
                         "section_index": section_index,
                         "chunk_index": chunk_index,
                         "content_kind": content_kind,
                         **section.metadata,
-                    },
+                    }),
                 }
             )
     return chunks

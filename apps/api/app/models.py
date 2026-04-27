@@ -173,6 +173,17 @@ class IngestionJob(TimestampMixin, Base):
     batch: Mapped[IngestionBatch | None] = relationship(back_populates="jobs")
 
 
+class IngestionLog(Base):
+    __tablename__ = "ingestion_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("ingestion_batches.id"), index=True)
+    event: Mapped[str] = mapped_column(String(64), index=True)
+    message: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class QASession(TimestampMixin, Base):
     __tablename__ = "qa_sessions"
 

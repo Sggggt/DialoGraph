@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import os
+import shutil
+import uuid
+from pathlib import Path
+
+import httpx
+import pytest
+
+pytestmark = pytest.mark.no_fallback_e2e
+
+if os.getenv("RUN_NO_FALLBACK_E2E") != "1":
+    pytest.skip("Set RUN_NO_FALLBACK_E2E=1 to run the real no-fallback integration smoke test", allow_module_level=True)
+
+
+@pytest.mark.asyncio
+async def test_parse_search_and_qa_without_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("ENABLE_MODEL_FALLBACK", "false")
+    monkeypatch.setenv("ENABLE_DATABASE_FALLBACK", "false")
+
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    settings = get_settings()
+    assert settings.openai_api_key, "OPENAI_API_KEY is required for no-fallback E2E"
+    assert settings.enable_model_fallback is False
+    assert settings.enable_database_fallback is False
+
+    import app.models as models
+    from app.db import Base, SessionLocal, engine, ensure_schema
+    from app.schemas import AgentRequest, SearchFilters
+    from app.services.agent_graph import run_agent
+    from app.services.ingestion import create_course_space, ingest_file
+    from app.services.retrieval import search_chunks
+    from app.services.vector_store import VectorStore
+
+    Base.metadata.create_all(bind=engine)
+    ensure_schema()
+
+    course_name = f"No Fallback E2E {uuid.uuid4()}"
+    source = tmp_path / "centrality.md"
+    source.write_text(
+        "# Centrality\n\nDegree centrality counts incident edges in a graph. "
+        "It is a local measure used in network analysis.",
+        encoding="utf-8",
+    )
+
+    db = SessionLocal()
+    course = None
+    chunk_ids: list[str] = []
+    course_root = settings.course_paths_for_name(course_name)["course_root"]
+    try:
+        try:
+            qdrant_response = httpx.get(f"{settings.qdrant_url.rstrip('/')}/collections", timeout=5.0, trust_env=False)
+            qdrant_response.raise_for_status()
+        except Exception as exc:
+            pytest.fail(f"Qdrant is unavailable at {settings.qdrant_url}; no-fallback E2E cannot run: {exc}")
+        VectorStore(course_name=course_name)
+        course = create_course_space(db, course_name, "temporary no-fallback smoke test")
+        result = await ingest_file(db, source, trigger_source="test", course_id=course.id, rebuild_graph=False)
+        assert result["status"] == "completed"
+        assert result["stats"]["embedding_provider"] == "openai_compatible"
+        assert result["stats"]["embedding_external_called"] is True
+        assert result["stats"]["embedding_fallback_reason"] is None
+
+        chunks = db.query(models.Chunk).filter(models.Chunk.course_id == course.id, models.Chunk.is_active.is_(True)).all()
+        chunk_ids = [chunk.id for chunk in chunks]
+        assert chunk_ids
+
+        search_results = await search_chunks(db, course.id, "degree centrality", SearchFilters(), 3)
+        assert search_results
+        assert search_results[0]["citations"]
+
+        response = await run_agent(
+            db,
+            AgentRequest(question="What is degree centrality?", course_id=course.id, top_k=3),
+        )
+        assert response["answer"]
+        assert response["citations"]
+        assert response["trace"]
+        answer_trace = next(item for item in response["trace"] if item["node"] == "answer_generator")
+        assert "provider=openai_compatible_chat" in (answer_trace["output_summary"] or "")
+        assert "fallback=None" in (answer_trace["output_summary"] or "")
+
+        vector_index = settings.course_paths_for_name(course.name)["ingestion_root"] / "vector_index.json"
+        assert not vector_index.exists()
+    finally:
+        if course is not None:
+            try:
+                VectorStore(course_name=course.name).delete(chunk_ids)
+            except Exception:
+                pass
+            db.query(models.AgentTraceEvent).filter(models.AgentTraceEvent.run_id.in_(
+                db.query(models.AgentRun.id).filter(models.AgentRun.course_id == course.id)
+            )).delete(synchronize_session=False)
+            db.query(models.AgentRun).filter(models.AgentRun.course_id == course.id).delete(synchronize_session=False)
+            db.query(models.QASession).filter(models.QASession.course_id == course.id).delete(synchronize_session=False)
+            db.query(models.ConceptRelation).filter(models.ConceptRelation.course_id == course.id).delete(synchronize_session=False)
+            concept_ids = [item.id for item in db.query(models.Concept).filter(models.Concept.course_id == course.id).all()]
+            if concept_ids:
+                db.query(models.ConceptAlias).filter(models.ConceptAlias.concept_id.in_(concept_ids)).delete(synchronize_session=False)
+            db.query(models.Concept).filter(models.Concept.course_id == course.id).delete(synchronize_session=False)
+            db.query(models.Chunk).filter(models.Chunk.course_id == course.id).delete(synchronize_session=False)
+            db.query(models.DocumentVersion).filter(models.DocumentVersion.document_id.in_(
+                db.query(models.Document.id).filter(models.Document.course_id == course.id)
+            )).delete(synchronize_session=False)
+            db.query(models.Document).filter(models.Document.course_id == course.id).delete(synchronize_session=False)
+            db.query(models.IngestionJob).filter(models.IngestionJob.course_id == course.id).delete(synchronize_session=False)
+            db.query(models.IngestionBatch).filter(models.IngestionBatch.course_id == course.id).delete(synchronize_session=False)
+            db.query(models.Course).filter(models.Course.id == course.id).delete(synchronize_session=False)
+            db.commit()
+        db.close()
+        shutil.rmtree(course_root, ignore_errors=True)
+        get_settings.cache_clear()

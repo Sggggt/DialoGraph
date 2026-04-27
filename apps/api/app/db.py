@@ -55,13 +55,17 @@ def build_engine():
     connect_args = {"connect_timeout": 5} if database_url.startswith("postgresql") else {}
     primary = create_engine(database_url, future=True, echo=False, connect_args=connect_args)
     if try_connect(primary):
-        for sqlite_path in candidate_sqlite_paths():
-            if not sqlite_path.exists():
-                continue
-            fallback = create_engine(f"sqlite:///{sqlite_path.as_posix()}", future=True, echo=False)
-            if try_connect(fallback) and has_materialized_course_data(fallback) and not has_materialized_course_data(primary):
-                return fallback
+        if settings.enable_database_fallback:
+            for sqlite_path in candidate_sqlite_paths():
+                if not sqlite_path.exists():
+                    continue
+                fallback = create_engine(f"sqlite:///{sqlite_path.as_posix()}", future=True, echo=False)
+                if try_connect(fallback) and has_materialized_course_data(fallback) and not has_materialized_course_data(primary):
+                    return fallback
         return primary
+
+    if not settings.enable_database_fallback:
+        raise RuntimeError("Primary database is unavailable and ENABLE_DATABASE_FALLBACK is false")
 
     for sqlite_path in candidate_sqlite_paths():
         fallback = create_engine(f"sqlite:///{sqlite_path.as_posix()}", future=True, echo=False)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import asyncio
 from collections import defaultdict
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -10,6 +12,8 @@ from app.core.config import get_settings
 from app.models import Chunk, Concept, ConceptAlias, ConceptRelation, Course, Document
 from app.schemas import Citation
 from app.services.embeddings import ChatProvider
+from app.services.ingestion_logs import emit_ingestion_log
+from app.services.parsers import canonical_chapter_label, derive_chapter, is_invalid_chapter_label
 
 
 ALLOWED_RELATIONS = {
@@ -22,6 +26,7 @@ ALLOWED_RELATIONS = {
     "extends",
     "mentions",
 }
+GRAPH_EXTRACTION_CONCURRENCY = 2
 KEYWORD_TERMS = [
     "eigenvector centrality",
     "betweenness centrality",
@@ -40,6 +45,36 @@ KEYWORD_TERMS = [
     "connected component",
     "pagerank",
     "spectral graph theory",
+]
+GRAPH_TOPIC_HINTS = [
+    "breadth-first search",
+    "depth-first search",
+    "dijkstra",
+    "bellman-ford",
+    "floyd-warshall",
+    "kruskal",
+    "prim",
+    "minimum spanning tree",
+    "spanning tree",
+    "ford-fulkerson",
+    "max-flow",
+    "maximum flow",
+    "flow network",
+    "matching",
+    "vertex cover",
+    "independent set",
+    "coloring",
+    "planar graph",
+    "eulerian",
+    "hamiltonian",
+    "np-complete",
+    "np-hard",
+    "complexity class",
+    "tree search",
+    "shortest path",
+    "cut",
+    "connectivity",
+    "matrix tree",
 ]
 STOP_CONCEPTS = {
     "the",
@@ -229,6 +264,7 @@ def get_or_create_concept(
     importance_score: float,
 ) -> tuple[Concept, bool]:
     normalized = normalize_concept_name(name)
+    chapter_ref = None if is_invalid_chapter_label(chapter) else chapter
     alias_match = db.scalar(select(ConceptAlias).where(ConceptAlias.normalized_alias == normalized))
     concept = None
     if alias_match and alias_match.concept and alias_match.concept.course_id == course_id:
@@ -245,7 +281,7 @@ def get_or_create_concept(
             summary=summary[:800],
             concept_type=concept_type or "concept",
             importance_score=importance_score,
-            chapter_refs=[chapter] if chapter else [],
+            chapter_refs=[chapter_ref] if chapter_ref else [],
         )
         db.add(concept)
         db.flush()
@@ -256,8 +292,8 @@ def get_or_create_concept(
         concept.importance_score = max(float(concept.importance_score or 0.0), float(importance_score or 0.0))
         if concept_type and concept.concept_type == "concept":
             concept.concept_type = concept_type
-        if chapter and chapter not in concept.chapter_refs:
-            concept.chapter_refs = sorted({*concept.chapter_refs, chapter})
+        if chapter_ref and chapter_ref not in concept.chapter_refs:
+            concept.chapter_refs = sorted({*concept.chapter_refs, chapter_ref})
 
     all_aliases = {clean_display_name(concept.canonical_name), *[clean_display_name(alias) for alias in aliases if is_valid_concept(alias)]}
     for alias in all_aliases:
@@ -273,10 +309,19 @@ def get_or_create_concept(
     return concept, created
 
 
-async def upsert_concepts_from_chunk(db: Session, course_id: str, chunk: Chunk, use_llm: bool = True) -> tuple[int, int]:
+async def upsert_concepts_from_chunk(
+    db: Session,
+    course_id: str,
+    chunk: Chunk,
+    use_llm: bool = True,
+    llm_payload: dict | None = None,
+) -> tuple[int, int]:
     settings = get_settings()
     fallback = heuristic_extract_graph(chunk.content) if settings.enable_model_fallback else {"concepts": [], "relations": []}
-    llm_payload = await ChatProvider().extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type) if use_llm else {"concepts": [], "relations": []}
+    if use_llm:
+        llm_payload = llm_payload if llm_payload is not None else await ChatProvider().extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type)
+    else:
+        llm_payload = {"concepts": [], "relations": []}
     extracted = merge_graph_candidates(llm_payload, fallback)
     extraction_method = "llm+rules" if settings.enable_model_fallback and llm_payload.get("concepts") else "llm" if llm_payload.get("concepts") else "heuristic"
 
@@ -298,11 +343,16 @@ async def upsert_concepts_from_chunk(db: Session, course_id: str, chunk: Chunk, 
             created_count += 1
 
     relation_count = 0
+    relation_keys: set[tuple[str, str, str]] = set()
     for relation_data in extracted["relations"]:
         source = concept_map.get(normalize_concept_name(relation_data["source"]))
         target = concept_map.get(normalize_concept_name(relation_data["target"]))
         if source is None or target is None or source.id == target.id:
             continue
+        relation_key = (source.id, target.id, relation_data["relation_type"])
+        if relation_key in relation_keys:
+            continue
+        relation_keys.add(relation_key)
         confidence = float(relation_data.get("confidence", 0.55))
         existing = db.scalar(
             select(ConceptRelation).where(
@@ -335,39 +385,153 @@ async def upsert_concepts_from_chunk(db: Session, course_id: str, chunk: Chunk, 
     return created_count, relation_count
 
 
-def choose_llm_graph_chunks(chunks: list[Chunk], limit: int = 3) -> set[str]:
+def graph_topic_score(chunk: Chunk) -> int:
+    haystack = f"{getattr(chunk, 'section', '') or ''}\n{getattr(chunk, 'snippet', '') or ''}\n{chunk.content[:1200]}".lower()
+    return sum(1 for hint in GRAPH_TOPIC_HINTS if hint in haystack)
+
+
+def graph_chunk_rank(chunk: Chunk) -> tuple[int, int, int, int]:
     priority = {"markdown": 4, "pdf_page": 4, "doc_section": 4, "slide": 4, "text": 3, "html": 3, "ocr": 3, "code": 0, "output": 0}
-    ranked = sorted(
-        chunks,
-        key=lambda chunk: (
-            priority.get((chunk.metadata_json or {}).get("content_kind", "text"), 2),
-            len(chunk.content),
-            1 if chunk.source_type == "notebook" else 2,
-        ),
+    return (
+        graph_topic_score(chunk),
+        priority.get((chunk.metadata_json or {}).get("content_kind", "text"), 2),
+        len(chunk.content),
+        1 if chunk.source_type == "notebook" else 2,
+    )
+
+
+def choose_llm_graph_chunks(
+    chunks: list[Chunk],
+    limit: int | None = None,
+    chunks_per_document: int | None = None,
+) -> set[str]:
+    settings = get_settings()
+    limit = limit or settings.graph_extraction_chunk_limit
+    chunks_per_document = chunks_per_document or settings.graph_extraction_chunks_per_document
+
+    ranked = sorted(chunks, key=graph_chunk_rank, reverse=True)
+    by_document: dict[str, list[Chunk]] = defaultdict(list)
+    for chunk in ranked:
+        by_document[chunk.document_id].append(chunk)
+
+    selected: list[Chunk] = []
+    selected_ids: set[str] = set()
+    representatives = sorted(
+        (document_chunks[:chunks_per_document] for document_chunks in by_document.values()),
+        key=lambda document_chunks: graph_chunk_rank(document_chunks[0]) if document_chunks else (0, 0, 0),
         reverse=True,
     )
-    return {chunk.id for chunk in ranked[:limit]}
+    for document_chunks in representatives:
+        for chunk in document_chunks:
+            if len(selected) >= limit:
+                break
+            selected.append(chunk)
+            selected_ids.add(chunk.id)
+        if len(selected) >= limit:
+            break
+
+    if len(selected) < limit:
+        for chunk in ranked:
+            if chunk.id in selected_ids:
+                continue
+            selected.append(chunk)
+            selected_ids.add(chunk.id)
+            if len(selected) >= limit:
+                break
+    return selected_ids
 
 
-async def rebuild_course_graph(db: Session, course_id: str) -> dict:
+async def extract_llm_graph_payloads(
+    chunks: list[Chunk],
+    concurrency: int = GRAPH_EXTRACTION_CONCURRENCY,
+    batch_id: str | None = None,
+) -> tuple[dict[str, dict], dict[str, str]]:
+    provider = ChatProvider()
+    semaphore = asyncio.Semaphore(concurrency)
+    total = len(chunks)
+    completed = 0
+    payloads: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+
+    async def extract(chunk: Chunk) -> None:
+        nonlocal completed
+        async with semaphore:
+            try:
+                payloads[chunk.id] = await provider.extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type)
+            except Exception as exc:
+                errors[chunk.id] = f"{type(exc).__name__}: {exc}"
+            finally:
+                completed += 1
+                if batch_id and (completed == total or completed % 5 == 0 or chunk.id in errors):
+                    emit_ingestion_log(
+                        batch_id,
+                        "batch_graph_progress",
+                        f"Graph extraction {completed}/{total} chunks",
+                        completed_graph_chunks=completed,
+                        total_graph_chunks=total,
+                        successful_extractions=len(payloads),
+                        failed_extractions=len(errors),
+                    )
+
+    if not chunks:
+        return {}, {}
+    await asyncio.gather(*(extract(chunk) for chunk in chunks))
+    return payloads, errors
+
+
+async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None = None) -> dict:
+    settings = get_settings()
+    course = db.get(Course, course_id)
+    sync_graph_chapter_labels(db, course_id)
+    active_documents = db.scalars(select(Document).where(Document.course_id == course_id, Document.is_active.is_(True))).all()
+    graph_documents = filter_graph_documents(course, active_documents)
+    graph_document_ids = {document.id for document in graph_documents}
+    document_chapters = {document.id: document_chapter_label(document, course.name if course else None) for document in graph_documents}
+    chunks = db.scalars(
+        select(Chunk)
+        .where(Chunk.course_id == course_id, Chunk.is_active.is_(True), Chunk.document_id.in_(graph_document_ids))
+        .order_by(Chunk.created_at.asc())
+    ).all()
+    llm_chunk_ids = choose_llm_graph_chunks(chunks)
+    selected_llm_chunks = [chunk for chunk in chunks if chunk.id in llm_chunk_ids]
+    if batch_id:
+        emit_ingestion_log(
+            batch_id,
+            "batch_graph_selected",
+            f"Selected {len(selected_llm_chunks)} chunks from {len(graph_document_ids)} documents for LLM graph extraction",
+            selected_llm_chunks=len(selected_llm_chunks),
+            graph_source_documents=len(graph_document_ids),
+            total_active_chunks=len(chunks),
+        )
+    try:
+        extraction_result = await extract_llm_graph_payloads(selected_llm_chunks, batch_id=batch_id)
+    except TypeError as exc:
+        if "unexpected keyword argument 'batch_id'" not in str(exc):
+            raise
+        extraction_result = await extract_llm_graph_payloads(selected_llm_chunks)
+    if isinstance(extraction_result, tuple):
+        llm_payloads, llm_errors = extraction_result
+    else:
+        llm_payloads, llm_errors = extraction_result, {}
+    if llm_chunk_ids and not llm_payloads:
+        sample_error = next(iter(llm_errors.values()), "no LLM graph payloads were returned")
+        raise RuntimeError(f"Graph extraction failed for all selected chunks: {sample_error}")
+    llm_document_ids = {chunk.document_id for chunk in chunks if chunk.id in llm_chunk_ids}
+
     db.query(ConceptRelation).filter(ConceptRelation.course_id == course_id).delete(synchronize_session=False)
     concept_ids = [concept.id for concept in db.scalars(select(Concept).where(Concept.course_id == course_id)).all()]
     if concept_ids:
         db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(concept_ids)).delete(synchronize_session=False)
         db.query(Concept).filter(Concept.id.in_(concept_ids)).delete(synchronize_session=False)
-    db.commit()
 
-    chunks = db.scalars(
-        select(Chunk)
-        .join(Document, Document.id == Chunk.document_id)
-        .where(Chunk.course_id == course_id, Chunk.is_active.is_(True), Document.is_active.is_(True))
-        .order_by(Chunk.created_at.asc())
-    ).all()
-    llm_chunk_ids = choose_llm_graph_chunks(chunks, limit=3)
     concept_count = 0
     relation_count = 0
+    llm_success_chunks = 0
     for chunk in chunks:
-        created, relations = await upsert_concepts_from_chunk(db, course_id, chunk, use_llm=chunk.id in llm_chunk_ids)
+        use_llm = chunk.id in llm_payloads
+        created, relations = await upsert_concepts_from_chunk(db, course_id, chunk, use_llm=use_llm, llm_payload=llm_payloads.get(chunk.id))
+        if use_llm:
+            llm_success_chunks += 1
         concept_count += created
         relation_count += relations
     db.commit()
@@ -379,6 +543,115 @@ async def rebuild_course_graph(db: Session, course_id: str) -> dict:
         "graph_nodes": len(graph.get("nodes", [])),
         "graph_edges": len(graph.get("edges", [])),
         "graph_extraction_provider": graph_extraction_provider(),
+        "graph_extraction_chunk_limit": settings.graph_extraction_chunk_limit,
+        "graph_extraction_chunks_per_document": settings.graph_extraction_chunks_per_document,
+        "graph_llm_selected_chunks": len(llm_chunk_ids),
+        "graph_llm_source_documents": len(llm_document_ids),
+        "graph_llm_success_chunks": llm_success_chunks,
+        "graph_llm_failed_chunks": len(llm_errors),
+        "graph_llm_errors": llm_errors,
+        "graph_total_active_chunks": len(chunks),
+        "graph_source_documents": len(graph_document_ids),
+    }
+
+
+def document_chapter_label(document: Document, course_name: str | None = None) -> str:
+    path_label = derive_chapter(Path(document.source_path), course_name=course_name)
+    if not is_invalid_chapter_label(path_label, course_name=course_name):
+        return path_label
+    for tag in document.tags or []:
+        if not is_invalid_chapter_label(tag, course_name=course_name):
+            return tag
+    return document.title[:80] or document.source_type
+
+
+def _is_under_path(path: Path, root: Path) -> bool:
+    try:
+        resolved_path = path.resolve()
+        resolved_root = root.resolve()
+    except OSError:
+        return False
+    return resolved_path == resolved_root or resolved_root in resolved_path.parents
+
+
+def filter_graph_documents(course: Course | None, documents: list[Document]) -> list[Document]:
+    if course is None:
+        return documents
+    storage_root = get_settings().course_paths_for_name(course.name)["storage_root"]
+    storage_documents = [document for document in documents if _is_under_path(Path(document.source_path), storage_root)]
+    return storage_documents or documents
+
+
+def normalize_chapter_ref(value: str, course_name: str | None = None) -> str | None:
+    label = canonical_chapter_label(value, course_name=course_name)
+    if label and not is_invalid_chapter_label(label, course_name=course_name):
+        return label
+    if is_invalid_chapter_label(value, course_name=course_name):
+        return None
+    return value
+
+
+def sync_graph_chapter_labels(db: Session, course_id: str) -> dict:
+    course = db.get(Course, course_id)
+    documents = db.scalars(select(Document).where(Document.course_id == course_id, Document.is_active.is_(True))).all()
+    graph_documents = filter_graph_documents(course, documents)
+    document_chapters = {document.id: document_chapter_label(document, course.name if course else None) for document in graph_documents}
+    updated_documents = 0
+    updated_chunks = 0
+    updated_concepts = 0
+    for document in graph_documents:
+        chapter = document_chapters[document.id]
+        if document.tags != [chapter]:
+            document.tags = [chapter]
+            updated_documents += 1
+    chunks = db.scalars(
+        select(Chunk).where(Chunk.course_id == course_id, Chunk.is_active.is_(True), Chunk.document_id.in_(document_chapters))
+    ).all()
+    for chunk in chunks:
+        chapter = document_chapters.get(chunk.document_id)
+        if chapter and chunk.chapter != chapter:
+            chunk.chapter = chapter
+            updated_chunks += 1
+    relation_refs: dict[str, set[str]] = defaultdict(set)
+    relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
+    evidence_chunk_ids = {relation.evidence_chunk_id for relation in relations if relation.evidence_chunk_id}
+    evidence_chunks = db.scalars(select(Chunk).where(Chunk.id.in_(evidence_chunk_ids))).all() if evidence_chunk_ids else []
+    evidence_documents = {
+        document.id: document
+        for document in db.scalars(
+            select(Document).where(Document.id.in_({chunk.document_id for chunk in evidence_chunks}))
+        ).all()
+    }
+    chunk_chapters = {
+        chunk.id: document_chapter_label(evidence_documents[chunk.document_id], course.name if course else None)
+        for chunk in evidence_chunks
+        if chunk.document_id in evidence_documents
+    }
+    for relation in relations:
+        chapter = chunk_chapters.get(relation.evidence_chunk_id or "")
+        if not chapter:
+            continue
+        relation_refs[relation.source_concept_id].add(chapter)
+        if relation.target_concept_id:
+            relation_refs[relation.target_concept_id].add(chapter)
+    concepts = db.scalars(select(Concept).where(Concept.course_id == course_id)).all()
+    for concept in concepts:
+        normalized_refs = sorted(
+            {
+                normalized
+                for ref in [*(concept.chapter_refs or []), *relation_refs.get(concept.id, set())]
+                for normalized in [normalize_chapter_ref(ref, course.name if course else None)]
+                if normalized
+            }
+        )
+        if normalized_refs != (concept.chapter_refs or []):
+            concept.chapter_refs = normalized_refs
+            updated_concepts += 1
+    db.commit()
+    return {
+        "updated_documents": updated_documents,
+        "updated_chunks": updated_chunks,
+        "updated_concepts": updated_concepts,
     }
 
 
@@ -482,12 +755,13 @@ def get_graph_payload(db: Session, course_id: str, chapter: str | None = None) -
     documents = db.scalars(
         select(Document).where(Document.course_id == course_id, Document.is_active.is_(True)).order_by(Document.title)
     ).all()
+    documents = filter_graph_documents(course, documents)
     if chapter:
-        documents = [document for document in documents if chapter in (document.tags or [])]
+        documents = [document for document in documents if chapter == document_chapter_label(document, course.name if course else None)]
     concepts = db.scalars(select(Concept).where(Concept.course_id == course_id)).all()
     relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
 
-    chapter_names = sorted({(document.tags[0] if document.tags else document.source_type) for document in documents})
+    chapter_names = sorted({document_chapter_label(document, course.name if course else None) for document in documents})
 
     course_label = course.name if course is not None else "Course Workspace"
     nodes = [{"id": f"course:{course_id}", "name": course_label, "category": "course", "value": 1}]
@@ -498,7 +772,7 @@ def get_graph_payload(db: Session, course_id: str, chapter: str | None = None) -
         edges.append({"source": f"course:{course_id}", "target": f"chapter:{chapter_name}", "label": "contains", "category": "structure"})
 
     for document in documents:
-        chapter_name = document.tags[0] if document.tags else document.source_type
+        chapter_name = document_chapter_label(document, course.name if course else None)
         nodes.append(
             {
                 "id": document.id,

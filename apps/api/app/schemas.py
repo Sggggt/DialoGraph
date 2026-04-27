@@ -38,6 +38,7 @@ class UploadFileResponse(BaseModel):
 
 class ParseUploadedFilesRequest(BaseModel):
     file_paths: list[str] = Field(default_factory=list)
+    force: bool = False
 
 
 class JobStatusResponse(BaseModel):
@@ -65,7 +66,7 @@ class SearchRequest(BaseModel):
     query: str
     course_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
-    top_k: int = 6
+    top_k: int = Field(default=6, ge=1, le=50)
 
 
 class SearchResult(BaseModel):
@@ -97,7 +98,7 @@ class QARequest(BaseModel):
     session_id: str | None = None
     course_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
-    top_k: int = 6
+    top_k: int = Field(default=6, ge=1, le=50)
     history: list[ChatMessage] = Field(default_factory=list)
 
 
@@ -117,7 +118,7 @@ class AgentRequest(BaseModel):
     session_id: str | None = None
     course_id: str | None = None
     filters: SearchFilters = Field(default_factory=SearchFilters)
-    top_k: int = 6
+    top_k: int = Field(default=6, ge=1, le=50)
     history: list[ChatMessage] = Field(default_factory=list)
     stream_trace: bool = True
 
@@ -189,6 +190,8 @@ class ModelSettingsResponse(BaseModel):
     embedding_model: str
     chat_model: str
     embedding_dimensions: int
+    graph_extraction_chunk_limit: int
+    graph_extraction_chunks_per_document: int
     has_api_key: bool
     degraded_mode: bool
 
@@ -201,6 +204,8 @@ class ModelSettingsUpdate(BaseModel):
     embedding_model: str | None = None
     chat_model: str | None = None
     embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
+    graph_extraction_chunk_limit: int | None = Field(default=None, ge=1, le=200)
+    graph_extraction_chunks_per_document: int | None = Field(default=None, ge=1, le=10)
 
 
 class RelatedConcept(BaseModel):
@@ -292,6 +297,7 @@ class IngestionBatchSummary(BaseModel):
     skipped_count: int
     coverage_by_source_type: dict[str, int] = Field(default_factory=dict)
     errors: list[BatchError] = Field(default_factory=list)
+    graph_stats: dict = Field(default_factory=dict)
     started_at: datetime | None = None
     completed_at: datetime | None = None
 

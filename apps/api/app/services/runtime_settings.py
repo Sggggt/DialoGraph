@@ -17,6 +17,8 @@ def model_settings_payload() -> dict:
         "embedding_model": settings.embedding_model,
         "chat_model": settings.chat_model,
         "embedding_dimensions": settings.embedding_dimensions,
+        "graph_extraction_chunk_limit": settings.graph_extraction_chunk_limit,
+        "graph_extraction_chunks_per_document": settings.graph_extraction_chunks_per_document,
         "has_api_key": bool(settings.openai_api_key),
         "degraded_mode": not settings.openai_api_key,
     }
@@ -68,6 +70,8 @@ def update_model_settings(payload: dict) -> dict:
         "embedding_model": "embedding_model",
         "chat_model": "chat_model",
         "embedding_dimensions": "embedding_dimensions",
+        "graph_extraction_chunk_limit": "graph_extraction_chunk_limit",
+        "graph_extraction_chunks_per_document": "graph_extraction_chunks_per_document",
     }
     for key, env_key in key_map.items():
         value = payload.get(key)

@@ -9,6 +9,120 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ApiDir = Join-Path $Root "apps\api"
 $WebDir = Join-Path $Root "apps\web"
+$EnvFile = Join-Path $Root ".env"
+$InfraComposeFile = Join-Path $Root "infra\docker-compose.yml"
+
+function Get-DotEnvValue {
+  param(
+    [string]$Key,
+    [string]$DefaultValue
+  )
+
+  if (-not (Test-Path $EnvFile)) {
+    return $DefaultValue
+  }
+
+  $prefix = "$Key="
+  foreach ($line in Get-Content -Encoding UTF8 -LiteralPath $EnvFile) {
+    $cleanLine = $line.TrimStart([char]0xFEFF).Trim()
+    if (-not $cleanLine -or $cleanLine.StartsWith("#")) {
+      continue
+    }
+    if ($cleanLine.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return $cleanLine.Substring($prefix.Length).Trim().Trim('"')
+    }
+  }
+
+  return $DefaultValue
+}
+
+function Get-PostgresEndpoint {
+  param([string]$DatabaseUrl)
+
+  if ($DatabaseUrl -match "postgresql(?:\+[^:]+)?://(?:[^:@/]+(?::[^@/]*)?@)?([^/:]+)(?::(\d+))?/") {
+    $port = if ($Matches[2]) { [int]$Matches[2] } else { 5432 }
+    return @{ Host = $Matches[1]; Port = $port }
+  }
+
+  return @{ Host = "127.0.0.1"; Port = 5432 }
+}
+
+function Get-HttpEndpoint {
+  param(
+    [string]$Url,
+    [int]$DefaultPort
+  )
+
+  try {
+    $uri = [System.Uri]$Url
+    $port = if ($uri.IsDefaultPort) { $DefaultPort } else { $uri.Port }
+    return @{ Host = $uri.Host; Port = $port; Url = $Url.TrimEnd("/") }
+  } catch {
+    return @{ Host = "127.0.0.1"; Port = $DefaultPort; Url = $Url.TrimEnd("/") }
+  }
+}
+
+function Test-TcpPort {
+  param(
+    [string]$HostName,
+    [int]$Port
+  )
+
+  try {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    $task = $client.ConnectAsync($HostName, $Port)
+    if (-not $task.Wait(2000)) {
+      $client.Dispose()
+      return $false
+    }
+    $client.Dispose()
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Start-Infrastructure {
+  $databaseUrl = Get-DotEnvValue -Key "DATABASE_URL" -DefaultValue "postgresql+psycopg://postgres:postgres@localhost:5432/course_kg"
+  $qdrantUrl = Get-DotEnvValue -Key "QDRANT_URL" -DefaultValue "http://localhost:6333"
+  $postgres = Get-PostgresEndpoint -DatabaseUrl $databaseUrl
+  $qdrant = Get-HttpEndpoint -Url $qdrantUrl -DefaultPort 6333
+
+  Write-Host "Starting infrastructure with Docker Compose:" -ForegroundColor Cyan
+  Write-Host "  PostgreSQL, Redis, and Qdrant are managed by: $InfraComposeFile"
+  Write-Host "  Expected PostgreSQL: $($postgres.Host):$($postgres.Port)"
+  Write-Host "  Expected Qdrant: $($qdrant.Url)"
+
+  if (-not (Test-Path $InfraComposeFile)) {
+    throw "Docker Compose file not found: $InfraComposeFile"
+  }
+
+  & docker compose -f $InfraComposeFile up -d
+  if ($LASTEXITCODE -ne 0) {
+    throw "Docker Compose failed to start infrastructure. Make sure Docker Desktop is running."
+  }
+
+  $deadline = (Get-Date).AddSeconds(90)
+  do {
+    $postgresOk = Test-TcpPort -HostName $postgres.Host -Port $postgres.Port
+    $qdrantOk = Test-TcpPort -HostName $qdrant.Host -Port $qdrant.Port
+    if ($postgresOk -and $qdrantOk) {
+      Write-Host "Infrastructure is reachable." -ForegroundColor Green
+      return
+    }
+    Start-Sleep -Seconds 1
+  } while ((Get-Date) -lt $deadline)
+
+  Write-Host ""
+  Write-Host "Infrastructure did not become reachable:" -ForegroundColor Red
+  if (-not $postgresOk) {
+    Write-Host "  - PostgreSQL is not reachable at $($postgres.Host):$($postgres.Port)"
+  }
+  if (-not $qdrantOk) {
+    Write-Host "  - Qdrant is not reachable at $($qdrant.Host):$($qdrant.Port)"
+  }
+  throw "Docker Compose started, but required infrastructure ports are not ready."
+}
 
 function Test-Url {
   param([string]$Url)
@@ -97,6 +211,7 @@ $FrontendUrl = "http://127.0.0.1:$FrontendPort$OpenPath"
 
 Write-Host "Course Knowledge Base launcher" -ForegroundColor Cyan
 Write-Host "Root: $Root"
+Start-Infrastructure
 
 if (-not (Test-Url $BackendUrl)) {
   $pythonExe = Join-Path $ApiDir ".venv\Scripts\python.exe"

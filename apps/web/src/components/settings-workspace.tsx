@@ -16,6 +16,8 @@ type SettingsForm = {
   embedding_model: string;
   chat_model: string;
   embedding_dimensions: string;
+  graph_extraction_chunk_limit: string;
+  graph_extraction_chunks_per_document: string;
   api_key: string;
   clear_api_key: boolean;
 };
@@ -37,6 +39,8 @@ export function SettingsWorkspace() {
       embedding_model: settingsQuery.data.embedding_model,
       chat_model: settingsQuery.data.chat_model,
       embedding_dimensions: String(settingsQuery.data.embedding_dimensions),
+      graph_extraction_chunk_limit: String(settingsQuery.data.graph_extraction_chunk_limit ?? 72),
+      graph_extraction_chunks_per_document: String(settingsQuery.data.graph_extraction_chunks_per_document ?? 2),
       api_key: "",
       clear_api_key: false,
     });
@@ -71,12 +75,16 @@ export function SettingsWorkspace() {
 
   const handleSubmit = () => {
     const dimensions = Number.parseInt(form.embedding_dimensions, 10);
+    const graphChunkLimit = Number.parseInt(form.graph_extraction_chunk_limit, 10);
+    const graphChunksPerDocument = Number.parseInt(form.graph_extraction_chunks_per_document, 10);
     saveMutation.mutate({
       base_url: form.base_url.trim(),
       resolve_ip: form.resolve_ip.trim() || null,
       embedding_model: form.embedding_model.trim(),
       chat_model: form.chat_model.trim(),
       embedding_dimensions: Number.isFinite(dimensions) ? dimensions : undefined,
+      graph_extraction_chunk_limit: Number.isFinite(graphChunkLimit) ? graphChunkLimit : undefined,
+      graph_extraction_chunks_per_document: Number.isFinite(graphChunksPerDocument) ? graphChunksPerDocument : undefined,
       api_key: form.api_key.trim() || null,
       clear_api_key: form.clear_api_key,
     });
@@ -175,6 +183,38 @@ export function SettingsWorkspace() {
               </label>
 
               <label className="flex flex-col gap-2">
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">图谱最多阅读多少个片段</span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={200}
+                  placeholder="推荐 120；默认 72；上限 200"
+                  value={form.graph_extraction_chunk_limit ?? ""}
+                  onChange={(event) => updateForm("graph_extraction_chunk_limit", event.target.value)}
+                  className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white"
+                />
+                <span className="text-xs leading-5 text-white/42">
+                  推荐 120；默认 72。想明显增加概念可用 160，接近上限 200 时会明显变慢并增加模型调用成本。
+                </span>
+              </label>
+
+              <label className="flex flex-col gap-2">
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">每个文件重点抽几个片段</span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={10}
+                  placeholder="推荐 3；默认 2；上限 10"
+                  value={form.graph_extraction_chunks_per_document ?? ""}
+                  onChange={(event) => updateForm("graph_extraction_chunks_per_document", event.target.value)}
+                  className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white"
+                />
+                <span className="text-xs leading-5 text-white/42">
+                  推荐 3；默认 2。课件很长时可用 4-5；超过 6 通常只适合少量文件精细重建。
+                </span>
+              </label>
+
+              <label className="flex flex-col gap-2">
                 <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">API Key</span>
                 <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.04] px-4">
                   <KeyRound className="size-4 text-cyan-100/58" />
@@ -226,7 +266,7 @@ export function SettingsWorkspace() {
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-5">
               <p className="text-xs leading-6 text-white/42">
-                修改向量维度后，已创建的向量库可能需要重建。已运行中的解析批次不会切换模型，新批次会使用这里的配置。
+                所有设置保存后都会热更新到后端运行时，不需要重启 API。新发起的解析、检索、问答和图谱生成会立即使用这里的配置。
               </p>
               <div className="flex items-center gap-2">
                 {saved ? <span className="text-sm text-emerald-100">已保存</span> : null}
@@ -248,7 +288,7 @@ export function SettingsWorkspace() {
         {[
           { label: "Embedding", value: settings?.embedding_model, icon: ServerCog },
           { label: "Chat / Graph", value: settings?.chat_model, icon: ServerCog },
-          { label: "Base URL", value: settings?.base_url, icon: ServerCog },
+          { label: "Graph Coverage", value: `${settings?.graph_extraction_chunk_limit ?? 72} 个片段 / 每文件 ${settings?.graph_extraction_chunks_per_document ?? 2} 个`, icon: ServerCog },
         ].map(({ label, value, icon: Icon }) => (
           <div key={label} className="glass-panel rounded-[24px] p-5">
             <div className="flex items-center gap-3">

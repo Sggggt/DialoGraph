@@ -8,6 +8,9 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from app.core.config import get_settings
+from app.core.utils import source_type_from_path
+
 
 @dataclass
 class ParsedSection:
@@ -19,24 +22,7 @@ class ParsedSection:
 
 
 def detect_source_type(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        return "pdf"
-    if suffix in {".ppt", ".pptx"}:
-        return suffix.lstrip(".")
-    if suffix == ".docx":
-        return "docx"
-    if suffix in {".md", ".markdown"}:
-        return "markdown"
-    if suffix in {".txt", ".tex"}:
-        return "text"
-    if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
-        return "image"
-    if suffix == ".ipynb":
-        return "notebook"
-    if suffix == ".html":
-        return "html"
-    return "unknown"
+    return source_type_from_path(path)
 
 
 def load_text(path: Path) -> str:
@@ -292,21 +278,99 @@ def parse_document(path: Path) -> tuple[str, list[ParsedSection]]:
     }
     parser = parsers.get(source_type)
     if parser is None:
-        return source_type, parse_with_unstructured(path)
+        if get_settings().enable_model_fallback:
+            return source_type, parse_with_unstructured(path)
+        raise RuntimeError(f"Unsupported source type for {path.name}: {source_type}")
     try:
         return source_type, parser(path)
-    except Exception:
-        return source_type, parse_with_unstructured(path)
+    except Exception as exc:
+        if get_settings().enable_model_fallback:
+            return source_type, parse_with_unstructured(path)
+        raise RuntimeError(f"Failed to parse {path.name} as {source_type}: {exc}") from exc
 
 
 def sections_to_json(sections: list[ParsedSection]) -> list[dict[str, Any]]:
     return [asdict(section) for section in sections]
 
 
-def derive_chapter(path: Path) -> str:
+INVALID_CHAPTER_LABELS = {
+    "data",
+    "storage",
+    "reviewmarkdown",
+}
+
+
+def _normalize_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def is_date_like_label(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:19|20)\d{6}", value.strip()))
+
+
+def is_invalid_chapter_label(value: str | None, course_name: str | None = None) -> bool:
+    if not value:
+        return True
+    normalized = _normalize_label(value)
+    if not normalized:
+        return True
+    if normalized.replace(" ", "") in INVALID_CHAPTER_LABELS:
+        return True
+    if is_date_like_label(normalized.replace(" ", "")):
+        return True
+    if course_name and normalized == _normalize_label(course_name):
+        return True
+    return False
+
+
+def canonical_chapter_label(value: str, course_name: str | None = None) -> str | None:
+    cleaned = re.sub(r"[_-]+", " ", value)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return None
+
+    match = re.search(r"\b(?:chapter|chap)\s*\.?\s*(\d+[A-Za-z]?)\b", cleaned, flags=re.IGNORECASE)
+    if match:
+        return f"Chapter {match.group(1)}"
+
+    match = re.search(r"\b(?:lecture|lec|l)\s*\.?\s*(\d+[A-Za-z]?)\b", cleaned, flags=re.IGNORECASE)
+    if match:
+        return f"Lecture {match.group(1)}"
+
+    match = re.search(r"\bweek\s*\.?\s*(\d+[A-Za-z]?)\b", cleaned, flags=re.IGNORECASE)
+    if match:
+        return f"Week {match.group(1)}"
+
+    match = re.search(r"\blab\s*\.?\s*(\d+[A-Za-z]?)\b", cleaned, flags=re.IGNORECASE)
+    if match:
+        return f"Lab {match.group(1)}"
+
+    if re.search(r"\blabs?\b|\blaboratory\b", cleaned, flags=re.IGNORECASE):
+        if re.search(r"\bquestions?\b", cleaned, flags=re.IGNORECASE):
+            return "Lab Questions"
+        if re.search(r"\bsolutions?\b", cleaned, flags=re.IGNORECASE):
+            return "Lab Solutions"
+        return "Lab"
+
+    if re.search(r"\bcourse\s*work\b|\bcoursework\b", cleaned, flags=re.IGNORECASE):
+        return "Coursework"
+
+    if re.search(r"\bz\s*table\b|\breference\b|\bformula\b|\bsummary\b|\bvisuali[sz]er\b", cleaned, flags=re.IGNORECASE):
+        return "Reference"
+
+    if re.search(r"\breview\b|\brevision\b|复习|总讲义", cleaned, flags=re.IGNORECASE):
+        return "Review"
+
+    cleaned = cleaned[:80].strip()
+    if cleaned and not re.search(r"[A-Za-z0-9]", cleaned):
+        return "Reference"
+    return None if is_invalid_chapter_label(cleaned, course_name=course_name) else cleaned
+
+
+def derive_chapter(path: Path, course_name: str | None = None) -> str:
     candidates = [path.stem, path.parent.name]
     for item in candidates:
-        match = re.match(r"(L\d+|Lecture\s+\d+|Lab\s+\d+)", item, flags=re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return path.parent.name if path.parent.name != path.anchor else path.stem
+        label = canonical_chapter_label(item, course_name=course_name)
+        if label and not is_invalid_chapter_label(label, course_name=course_name):
+            return label
+    return path.stem[:80]

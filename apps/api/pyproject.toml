@@ -35,5 +35,19 @@ ocr = ["paddleocr>=2.9.1"]
 fallback = ["unstructured>=0.16.8"]
 rerank = ["sentence-transformers>=3.3.1"]
 
+[dependency-groups]
+dev = [
+  "pytest>=8.3.4",
+  "pytest-asyncio>=0.24.0",
+]
+
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+markers = [
+  "no_fallback_e2e: requires PostgreSQL, Qdrant, and an OpenAI-compatible model endpoint with fallback disabled",
+]
+testpaths = ["tests"]

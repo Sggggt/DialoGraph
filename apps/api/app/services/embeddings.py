@@ -59,6 +59,13 @@ class EmbeddingProvider:
             )
 
     async def _openai_compatible_embeddings(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
+        batch_size = self.settings.embedding_batch_size
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), batch_size):
+            vectors.extend(await self._openai_compatible_embeddings_batch(texts[start : start + batch_size], text_type=text_type))
+        return vectors
+
+    async def _openai_compatible_embeddings_batch(self, texts: list[str], text_type: str = "document") -> list[list[float]]:
         payload: dict[str, Any] = {
             "model": self.settings.embedding_model,
             "input": texts,
@@ -157,12 +164,18 @@ class ChatProvider:
                 raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
             return {"concepts": [], "relations": []}
         system_prompt = (
-            "You extract a compact course knowledge graph from teaching material. "
+            "You extract a course knowledge graph from teaching material. "
             "Return JSON only with keys concepts and relations. "
             "Each concept must contain name, aliases, summary, concept_type, importance_score. "
             "Each relation must contain source, target, relation_type, confidence. "
             "Allowed relation_type values: defines, relates_to, prerequisite_of, example_of, solves, compares, extends, mentions. "
-            "Keep only course-relevant concepts. Skip generic words and formatting artifacts."
+            "Extract 6 to 12 specific course concepts when the excerpt has enough substance, including algorithms, theorems, "
+            "definitions, problem types, complexity classes, graph structures, and proof techniques. "
+            "Extract 6 to 16 useful relations between those concepts. "
+            "Every relation source and target must exactly match a concept name included in concepts. "
+            "Prefer specific names like Breadth-First Search, Dijkstra Algorithm, Spanning Tree, Flow Network, NP-Complete, "
+            "Matching, Cut, Planar Graph, Eulerian Tour, Hamiltonian Cycle, and Matrix Tree Theorem over generic words. "
+            "Skip formatting artifacts, page headers, exercise labels, and generic words."
         )
         user_prompt = (
             f"chapter={chapter or 'General'}\n"
@@ -296,12 +309,47 @@ async def post_openai_compatible_json(
     timeout: float,
     resolve_ip: str | None = None,
 ) -> dict[str, Any]:
-    if resolve_ip:
-        return await asyncio.to_thread(_post_json_with_curl_resolve, url, payload, headers, timeout, resolve_ip)
-    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-        response = await client.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        return response.json()
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            if resolve_ip:
+                return await asyncio.to_thread(_post_json_with_curl_resolve, url, payload, headers, timeout, resolve_ip)
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 3 or not _is_retryable_openai_error(exc):
+                raise
+            await asyncio.sleep(float(attempt))
+    raise RuntimeError(f"OpenAI-compatible request failed: {last_error}")
+
+
+def _is_retryable_openai_error(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return status_code == 429 or status_code >= 500
+    message = str(exc).lower()
+    non_retryable_markers = ("invalidparameter", "invalid parameter", "unauthorized", "forbidden", "401", "403")
+    if any(marker in message for marker in non_retryable_markers):
+        return False
+    retryable_markers = (
+        "timeout",
+        "timed out",
+        "operation timed out",
+        "failed to connect",
+        "could not connect",
+        "connection reset",
+        "handshake",
+        "schannel",
+        "ssl/tls",
+        "temporarily unavailable",
+        "curl: (28)",
+        "curl: (7)",
+        "curl: (35)",
+    )
+    return any(marker in message for marker in retryable_markers)
 
 
 def _post_json_with_curl_resolve(

@@ -54,6 +54,75 @@ flowchart TB
 - `packages/shared`: 前后端共享的 TypeScript 数据契约。
 - `infra`: 本地基础设施，包含 PostgreSQL、Redis、Qdrant 的 Docker Compose 配置。
 
+## Data Model
+
+系统使用 SQLAlchemy ORM 管理以下核心表：
+
+```mermaid
+erDiagram
+    Course ||--o{ Document : has
+    Course ||--o{ Concept : has
+    Course ||--o{ IngestionBatch : has
+    Document ||--o{ DocumentVersion : versions
+    Document ||--o{ Chunk : chunks
+    DocumentVersion ||--o{ Chunk : chunks
+    Concept ||--o{ ConceptAlias : aliases
+    Concept ||--o{ ConceptRelation : source_relations
+    IngestionBatch ||--o{ IngestionJob : jobs
+    IngestionBatch ||--o{ IngestionLog : logs
+    QASession ||--o{ AgentRun : runs
+    AgentRun ||--o{ AgentTraceEvent : traces
+```
+
+关键约束：
+
+- `Course.name` UNIQUE — 课程名唯一
+- `Concept(course_id, normalized_name)` UNIQUE — 同课程内概念去重
+- `DocumentVersion(document_id, version)` UNIQUE — 文档版本号唯一
+- 所有主键使用 `UUID v4`（`String(36)`），分布式友好
+- `TimestampMixin` 自动维护 `created_at` / `updated_at`
+- Schema 演进通过启动时的 `SCHEMA_PATCHES`（`ALTER TABLE ADD COLUMN`）实现
+
+## Storage Coordination
+
+系统涉及三类存储，各有不同的事务保障：
+
+| 存储 | 技术 | 事务保障 |
+|------|------|----------|
+| 关系数据库 | SQLAlchemy (PG/SQLite) | `autocommit=False`，完整 ACID |
+| 向量索引 | Qdrant / FallbackJSON | 无分布式事务 |
+| 文件系统 | 本地磁盘 | 无事务 |
+
+**跨存储一致性策略**：
+
+- **图谱构建**采用单事务模式（DELETE→INSERT→单次 COMMIT），ACID 合规。
+- **文档解析**因需要实时进度反馈，使用多次 commit，通过应用层补偿保证最终一致性。
+- **检索层**对向量存储返回的结果用 DB 做二次验证（过滤已删除或不活跃的 chunk），防御跨存储不一致。
+- **批量操作**的异常处理采用 `rollback()→get()→标记 failed→commit()` 模式，单文件失败不污染批次。
+- **进程重启恢复**：`finalize_interrupted_batches()` 在 FastAPI lifespan 启动时将未完成的批次标记为 failed。
+
+## Concurrency & Async Model
+
+```
+FastAPI (uvicorn) ─── async API routes
+  ├── BackgroundTasks ─── asyncio.run() in thread pool
+  │     └── run_uploaded_files_ingestion (async)
+  ├── LLM calls ─── httpx.AsyncClient / asyncio.to_thread(curl)
+  └── Graph extraction ─── asyncio.gather() + Semaphore(2)
+```
+
+**并发控制机制**：
+
+| 机制 | 位置 | 保护范围 |
+|------|------|----------|
+| SQLAlchemy Session | `autocommit=False` | DB 事务隔离 |
+| `asyncio.Semaphore(2)` | `extract_llm_graph_payloads` | LLM API 并发限流 |
+| `threading.Lock` | `FallbackVectorStore` | JSON 向量文件读写互斥 |
+| `_VECTOR_FILE_LOCKS_GUARD` | 锁注册表守卫 | 锁创建的线程安全 |
+| 原子文件写入 | `_write` (temp+replace) | 向量文件写入完整性 |
+
+**设计决策**：Agent 流程中每个 LangGraph 节点执行时都会 `db.commit()` 更新 `current_node` 和 trace 事件。这是有意的可观测性设计，使前端能通过 `/tasks/{run_id}` 实时追踪 Agent 执行进度。
+
 ## Fallback Policy
 
 默认 fallback 是上锁的：
@@ -277,17 +346,36 @@ sequenceDiagram
     participant Qdrant
 
     User->>Web: Upload or sync course files
-    Web->>API: POST /api/files/upload or /api/ingestion/sync-source
+    Web->>API: POST /api/files/upload or /api/ingestion/parse-uploaded-files
     API->>FS: Save archived copy
-    API->>API: Parse document
-    API->>API: Chunk sections
-    API->>Model: Create embeddings
+    API->>API: Parse document (PDF/PPTX/DOCX/MD/Notebook/OCR)
+    API->>API: Chunk sections (RecursiveCharacterTextSplitter)
+    API->>Model: Create embeddings (batch, async)
     API->>Qdrant: Upsert vectors
-    API->>DB: Store documents, versions, chunks
-    API->>Model: Extract concept graph payload
-    API->>DB: Store concepts and relations
-    API-->>Web: Batch status and graph/search readiness
+    API->>DB: Store documents, versions, chunks (commit)
+    API->>Model: Extract concept graph payload (Semaphore-throttled)
+    API->>DB: Rebuild graph (single-transaction DELETE→INSERT→COMMIT)
+    API-->>Web: Batch status via SSE stream
 ```
+
+## Agent QA Flow
+
+```mermaid
+graph LR
+    A[query_analyzer] --> B[router]
+    B -->|retrieve| C[query_rewriter]
+    B -->|direct/clarify| G[answer_generator]
+    C --> D[retrievers]
+    D --> E[document_grader]
+    E -->|has docs| F[context_synthesizer]
+    E -->|retry < 2| R[retry_planner]
+    R --> D
+    F --> G
+    G --> H[citation_checker]
+    H --> I[self_check]
+```
+
+每个节点执行时实时更新 `AgentRun.current_node` 和 `AgentTraceEvent`（commit per node），支持前端进度追踪。
 
 ## Main API Endpoints
 
@@ -299,16 +387,27 @@ sequenceDiagram
 - `GET /api/graph/nodes/{concept_id}?course_id=...`
 - `GET /api/concepts?course_id=...`
 - `POST /api/files/upload?course_id=...`
-- `POST /api/ingestion/sync-source?course_id=...`
+- `POST /api/ingestion/parse-uploaded-files`
+- `POST /api/ingestion/parse-storage?course_id=...`
+- `GET /api/ingestion/batches/{batch_id}`
+- `GET /api/ingestion/batches/{batch_id}/logs` (SSE)
 - `POST /api/search`
 - `POST /api/qa`
-- `POST /api/qa/stream`
+- `POST /api/qa/stream` (SSE)
+- `POST /api/agent`
+- `GET /api/tasks/{run_id}`
 - `GET /api/sessions?course_id=...`
+- `GET /api/sessions/{session_id}/messages`
+- `DELETE /api/sessions/{session_id}`
+- `GET /api/settings/model`
+- `PUT /api/settings/model`
 
 ## Development Notes
 
 - Keep `.env`, `data/`, local databases and generated logs out of Git.
 - `ingestion/` contains derived extraction artifacts; it can be regenerated from stored source documents.
 - `storage/` contains uploaded or copied source files; deleting it removes the material needed for re-ingestion.
-- The API uses lightweight schema patching at startup instead of Alembic migrations.
+- The API uses lightweight schema patching at startup (`SCHEMA_PATCHES` + `ALTER TABLE ADD COLUMN`) instead of Alembic migrations.
 - Authentication and production-grade authorization are not implemented yet.
+- The `FallbackVectorStore` uses thread-level locks with atomic temp-file writes; it is safe for single-process deployments but not for multi-worker configurations.
+- `finalize_interrupted_batches()` runs at startup to mark incomplete batches as failed, providing crash recovery for the ingestion pipeline.

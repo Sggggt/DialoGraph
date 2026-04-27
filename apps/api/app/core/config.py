@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "knowledge_chunks"
     redis_url: str = "redis://localhost:6379/0"
+    enable_database_fallback: bool = False
 
     course_name: str = "Sample Course"
     data_root: Path = Field(default=WORKSPACE_ROOT / "data")
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-v4"
     chat_model: str = "qwen-plus"
     embedding_dimensions: int = 1024
+    embedding_batch_size: int = Field(default=10, ge=1, le=10)
+    graph_extraction_chunk_limit: int = Field(default=72, ge=1, le=200)
+    graph_extraction_chunks_per_document: int = Field(default=2, ge=1, le=10)
     enable_model_fallback: bool = False
 
     def sanitize_course_dir_name(self, course_name: str) -> str:

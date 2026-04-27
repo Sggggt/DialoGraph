@@ -199,6 +199,8 @@ export interface ModelSettingsResponse {
   embedding_model: string;
   chat_model: string;
   embedding_dimensions: number;
+  graph_extraction_chunk_limit: number;
+  graph_extraction_chunks_per_document: number;
   has_api_key: boolean;
   degraded_mode: boolean;
 }
@@ -211,6 +213,8 @@ export interface ModelSettingsUpdate {
   embedding_model?: string | null;
   chat_model?: string | null;
   embedding_dimensions?: number | null;
+  graph_extraction_chunk_limit?: number | null;
+  graph_extraction_chunks_per_document?: number | null;
 }
 
 export interface RelatedConcept {
@@ -284,21 +288,22 @@ export interface BatchError {
   message: string;
 }
 
-export interface IngestionBatchSummary {
-  batch_id: string;
-  state: JobState;
-  trigger_source: string;
-  source_root: string;
+  export interface IngestionBatchSummary {
+    batch_id: string;
+    state: JobState;
+    trigger_source: string;
+    source_root: string;
   total_files: number;
   processed_files: number;
   success_count: number;
   failure_count: number;
-  skipped_count: number;
-  coverage_by_source_type: Record<string, number>;
-  errors: BatchError[];
-  started_at?: string | null;
-  completed_at?: string | null;
-}
+    skipped_count: number;
+    coverage_by_source_type: Record<string, number>;
+    errors: BatchError[];
+    graph_stats: Record<string, unknown>;
+    started_at?: string | null;
+    completed_at?: string | null;
+  }
 
 export interface BatchStartResponse {
   batch_id: string;
@@ -307,6 +312,7 @@ export interface BatchStartResponse {
 
 export interface ParseUploadedFilesRequest {
   file_paths: string[];
+  force?: boolean;
 }
 
 export interface DashboardSnapshot {
