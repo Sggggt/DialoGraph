@@ -1,60 +1,62 @@
+[English](./README.en.md) | **中文**
+
 # DialoGraph
 
 DialoGraph 是一个本地课程知识库系统。它把 PDF、PPT/PPTX、DOCX、Markdown、TXT、Notebook、HTML 和图片资料解析成可检索的文本块、向量索引、概念卡片、知识图谱关系和带引用的问答会话。
 
 系统已经支持多课程隔离：每门课程有独立的文件目录、导入批次、图谱、检索结果和问答历史。
 
-## Architecture
+## 系统架构
 
 ```mermaid
 flowchart TB
-    U["User Browser"] --> W["Next.js Web<br/>apps/web"]
-    W -->|HTTP / SSE| API["FastAPI API<br/>apps/api"]
+    U["用户浏览器"] --> W["Next.js 前端<br/>apps/web"]
+    W -->|HTTP / SSE| API["FastAPI 后端<br/>apps/api"]
 
-    subgraph API_RUNTIME["API Runtime"]
-        API --> ROUTES["API Routes<br/>courses / files / search / qa / graph"]
-        ROUTES --> INGEST["Ingestion Service<br/>parse -> chunk -> embed -> graph"]
-        ROUTES --> RETRIEVAL["Retrieval Service<br/>dense + lexical + RRF"]
-        ROUTES --> AGENT["LangGraph Agent<br/>rewrite / route / grade / answer / self-check"]
-        INGEST --> PARSERS["Document Parsers<br/>PDF / PPTX / DOCX / Markdown / Notebook / OCR"]
-        INGEST --> GRAPH["Concept Graph Builder<br/>concepts + relations"]
+    subgraph API_RUNTIME["后端运行时"]
+        API --> ROUTES["API 路由<br/>课程 / 文件 / 搜索 / 问答 / 图谱"]
+        ROUTES --> INGEST["导入服务<br/>解析 → 切块 → 向量化 → 图谱"]
+        ROUTES --> RETRIEVAL["检索服务<br/>稠密检索 + 词法检索 + RRF 融合"]
+        ROUTES --> AGENT["LangGraph 智能体<br/>改写 / 路由 / 评分 / 回答 / 自检"]
+        INGEST --> PARSERS["文档解析器<br/>PDF / PPTX / DOCX / Markdown / Notebook / OCR"]
+        INGEST --> GRAPH["概念图谱构建器<br/>概念 + 关系"]
     end
 
-    subgraph WORKERS["Optional Background Components"]
+    subgraph WORKERS["可选后台组件"]
         CELERY["Celery Worker<br/>apps/worker"] --> INGEST
-        WATCHER["Watchdog File Watcher"] --> CELERY
+        WATCHER["目录监听器"] --> CELERY
     end
 
-    subgraph STORES["Storage Layer"]
-        DB[("PostgreSQL<br/>primary metadata store")]
-        SQLITE[("SQLite fallback<br/>development / local recovery")]
-        QDRANT[("Qdrant<br/>vector collection: knowledge_chunks")]
-        FS["Local data root<br/>data/<Course Name>/"]
-        REDIS[("Redis<br/>Celery broker")]
+    subgraph STORES["存储层"]
+        DB[("PostgreSQL<br/>主元数据存储")]
+        SQLITE[("SQLite 降级<br/>开发 / 本地恢复")]
+        QDRANT[("Qdrant<br/>向量集合: knowledge_chunks")]
+        FS["本地数据目录<br/>data/<课程名>/"]
+        REDIS[("Redis<br/>Celery 消息代理")]
     end
 
     API --> DB
-    API -. "database fallback" .-> SQLITE
+    API -. "数据库降级" .-> SQLITE
     API --> QDRANT
     API --> FS
     CELERY --> REDIS
 
-    subgraph MODEL["Model Provider"]
-        LLM["OpenAI-compatible endpoint<br/>DashScope / OpenAI / compatible APIs"]
+    subgraph MODEL["模型提供方"]
+        LLM["OpenAI 兼容端点<br/>DashScope / OpenAI / 兼容 API"]
     end
 
-    API -->|embeddings / chat / graph extraction| LLM
+    API -->|向量化 / 对话 / 图谱抽取| LLM
 ```
 
-## Components
+## 项目组成
 
-- `apps/web`: Next.js 前端工作台，包含上传、搜索、问答、图谱、概念卡片和设置页面。
-- `apps/api`: FastAPI 后端，负责课程管理、文件导入、解析、切块、embedding、检索、知识图谱构建和 Agent 问答。
-- `apps/worker`: 可选后台组件，包含 Celery ingestion worker 和目录监听器。
-- `packages/shared`: 前后端共享的 TypeScript 数据契约。
-- `infra`: 本地基础设施，包含 PostgreSQL、Redis、Qdrant 的 Docker Compose 配置。
+- `apps/web`：Next.js 前端工作台，包含上传、搜索、问答、图谱、概念卡片和设置页面。
+- `apps/api`：FastAPI 后端，负责课程管理、文件导入、解析、切块、向量化、检索、知识图谱构建和智能体问答。
+- `apps/worker`：可选后台组件，包含 Celery 导入 Worker 和目录监听器。
+- `packages/shared`：前后端共享的 TypeScript 数据契约。
+- `infra`：本地基础设施，包含 PostgreSQL、Redis、Qdrant 的 Docker Compose 配置。
 
-## Data Model
+## 数据模型
 
 系统使用 SQLAlchemy ORM 管理以下核心表：
 
@@ -81,9 +83,9 @@ erDiagram
 - `DocumentVersion(document_id, version)` UNIQUE — 文档版本号唯一
 - 所有主键使用 `UUID v4`（`String(36)`），分布式友好
 - `TimestampMixin` 自动维护 `created_at` / `updated_at`
-- Schema 演进通过启动时的 `SCHEMA_PATCHES`（`ALTER TABLE ADD COLUMN`）实现
+- 模式演进通过启动时的 `SCHEMA_PATCHES`（`ALTER TABLE ADD COLUMN`）实现
 
-## Storage Coordination
+## 跨存储协调
 
 系统涉及三类存储，各有不同的事务保障：
 
@@ -97,45 +99,45 @@ erDiagram
 
 - **图谱构建**采用单事务模式（DELETE→INSERT→单次 COMMIT），ACID 合规。
 - **文档解析**因需要实时进度反馈，使用多次 commit，通过应用层补偿保证最终一致性。
-- **检索层**对向量存储返回的结果用 DB 做二次验证（过滤已删除或不活跃的 chunk），防御跨存储不一致。
+- **检索层**对向量存储返回的结果用数据库做二次验证（过滤已删除或不活跃的 chunk），防御跨存储不一致。
 - **批量操作**的异常处理采用 `rollback()→get()→标记 failed→commit()` 模式，单文件失败不污染批次。
-- **进程重启恢复**：`finalize_interrupted_batches()` 在 FastAPI lifespan 启动时将未完成的批次标记为 failed。
+- **进程重启恢复**：`finalize_interrupted_batches()` 在 FastAPI 生命周期启动时将未完成的批次标记为失败。
 
-## Concurrency & Async Model
+## 并发与异步模型
 
 ```
-FastAPI (uvicorn) ─── async API routes
-  ├── BackgroundTasks ─── asyncio.run() in thread pool
-  │     └── run_uploaded_files_ingestion (async)
-  ├── LLM calls ─── httpx.AsyncClient / asyncio.to_thread(curl)
-  └── Graph extraction ─── asyncio.gather() + Semaphore(2)
+FastAPI (uvicorn) ─── 异步 API 路由
+  ├── BackgroundTasks ─── asyncio.run()（线程池中执行）
+  │     └── run_uploaded_files_ingestion（异步）
+  ├── LLM 调用 ─── httpx.AsyncClient / asyncio.to_thread(curl)
+  └── 图谱抽取 ─── asyncio.gather() + Semaphore(2)
 ```
 
 **并发控制机制**：
 
 | 机制 | 位置 | 保护范围 |
 |------|------|----------|
-| SQLAlchemy Session | `autocommit=False` | DB 事务隔离 |
+| SQLAlchemy 会话 | `autocommit=False` | 数据库事务隔离 |
 | `asyncio.Semaphore(2)` | `extract_llm_graph_payloads` | LLM API 并发限流 |
 | `threading.Lock` | `FallbackVectorStore` | JSON 向量文件读写互斥 |
 | `_VECTOR_FILE_LOCKS_GUARD` | 锁注册表守卫 | 锁创建的线程安全 |
-| 原子文件写入 | `_write` (temp+replace) | 向量文件写入完整性 |
+| 原子文件写入 | `_write`（临时文件+原子替换） | 向量文件写入完整性 |
 
-**设计决策**：Agent 流程中每个 LangGraph 节点执行时都会 `db.commit()` 更新 `current_node` 和 trace 事件。这是有意的可观测性设计，使前端能通过 `/tasks/{run_id}` 实时追踪 Agent 执行进度。
+**设计决策**：智能体流程中每个 LangGraph 节点执行时都会 `db.commit()` 更新 `current_node` 和追踪事件。这是有意的可观测性设计，使前端能通过 `/tasks/{run_id}` 实时追踪智能体执行进度。
 
-## Fallback Policy
+## 降级策略
 
-默认 fallback 是上锁的：
+默认降级功能是上锁的：
 
 ```env
 ENABLE_MODEL_FALLBACK=false
 ```
 
-这意味着系统不会静默降级到假 embedding、抽取式答案或本地 JSON 向量索引。默认要求：
+这意味着系统不会静默降级到假向量化、抽取式答案或本地 JSON 向量索引。默认要求：
 
-- `OPENAI_API_KEY` 可用，用于 embedding、chat 和图谱抽取。
-- `QDRANT_URL` 指向可访问的 Qdrant。
-- `DATABASE_URL` 指向可访问的 PostgreSQL。
+- `OPENAI_API_KEY` 可用，用于向量化、对话和图谱抽取。
+- `QDRANT_URL` 指向可访问的 Qdrant 实例。
+- `DATABASE_URL` 指向可访问的 PostgreSQL 实例。
 
 只有在本地离线调试时才建议显式解锁：
 
@@ -143,55 +145,55 @@ ENABLE_MODEL_FALLBACK=false
 ENABLE_MODEL_FALLBACK=true
 ```
 
-解锁后，系统可能使用 deterministic local hash embedding、extractive fallback answer，或 `data/<Course Name>/ingestion/vector_index.json` 作为向量索引兜底。这些结果只适合开发验证，不适合作为正式知识库质量判断。
+解锁后，系统可能使用确定性本地哈希向量、抽取式回退答案，或 `data/<课程名>/ingestion/vector_index.json` 作为向量索引兜底。这些结果只适合开发验证，不适合作为正式知识库质量判断。
 
-数据库层还有一个开发用 SQLite fallback：如果 PostgreSQL 不可用，或者 PostgreSQL 是空库而本地 SQLite 已有数据，API 会尝试使用 `apps/course_kg.db` 或 `apps/knowledge_base.db`。生产环境不要依赖这个行为。
+数据库层还有一个开发用 SQLite 降级：如果 PostgreSQL 不可用，或者 PostgreSQL 是空库而本地 SQLite 已有数据，API 会尝试使用 `apps/course_kg.db` 或 `apps/knowledge_base.db`。生产环境不要依赖这个行为。
 
-## Data Layout
+## 数据目录结构
 
 默认数据根目录是 `data/`。每门课程会创建独立目录：
 
 ```text
 data/
-  <Course Name>/
-    storage/       uploaded files and archived copies
-    ingestion/     extracted JSON and optional fallback vector_index.json
-    source/        optional watched source files
-  qdrant/          Qdrant persistent storage
-  postgres/        PostgreSQL persistent storage
-  redis/           Redis persistent storage
+  <课程名>/
+    storage/       上传文件和归档副本
+    ingestion/     解析 JSON 和可选的降级向量索引 vector_index.json
+    source/        可选的监听源文件目录
+  qdrant/          Qdrant 持久化存储
+  postgres/        PostgreSQL 持久化存储
+  redis/           Redis 持久化存储
 ```
 
 主要持久化位置：
 
 - 图谱节点和关系：PostgreSQL 表 `concepts`、`concept_relations`。
 - 问答历史：PostgreSQL 表 `qa_sessions`，消息在 `transcript` 字段。
-- Agent 运行轨迹：`agent_runs`、`agent_trace_events`。
+- 智能体运行轨迹：`agent_runs`、`agent_trace_events`。
 - 文档、版本、切块和导入批次：`documents`、`document_versions`、`chunks`、`ingestion_batches`、`ingestion_jobs`。
-- 向量索引：Qdrant collection `knowledge_chunks`。
+- 向量索引：Qdrant 集合 `knowledge_chunks`。
 
-## Prerequisites
+## 环境要求
 
 - Node.js `>= 20.9.0`
 - Python `>= 3.11`
-- `uv` for Python dependency management
-- Docker Desktop or Docker Engine with Compose v2
+- `uv` Python 依赖管理工具
+- Docker Desktop 或支持 Compose v2 的 Docker Engine
 
-Install `uv` if needed:
+如需安装 `uv`：
 
 ```powershell
 python -m pip install uv
 ```
 
-## Configuration
+## 配置
 
-Create the root environment file:
+创建根目录环境变量文件：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Minimum local development configuration:
+最小本地开发配置：
 
 ```env
 DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/knowledge_base
@@ -208,206 +210,268 @@ EMBEDDING_DIMENSIONS=1024
 ENABLE_MODEL_FALLBACK=false
 ```
 
-If you use DashScope or another OpenAI-compatible endpoint, set `OPENAI_BASE_URL` and `OPENAI_API_KEY` accordingly.
+如果使用 DashScope 或其他 OpenAI 兼容端点，请相应设置 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`。
 
-## Install Dependencies
+## 安装依赖
 
-Install frontend workspace dependencies from the repo root:
+在仓库根目录安装前端工作区依赖：
 
 ```powershell
 npm install
 ```
 
-Install API dependencies:
+安装后端 API 依赖：
 
 ```powershell
 cd apps/api
 uv sync
 ```
 
-Install worker dependencies if you need background ingestion:
+如需后台导入功能，安装 Worker 依赖：
 
 ```powershell
 cd apps/worker
 uv sync
 ```
 
-## Build and Start Backend Infrastructure
+## 构建并启动后端基础设施
 
-The current repository has Docker Compose for backend infrastructure only: PostgreSQL, Redis and Qdrant. It does not currently include Dockerfiles for API/Web/Worker application images.
+当前仓库的 Docker Compose 仅包含后端基础设施：PostgreSQL、Redis 和 Qdrant。暂不包含 API/Web/Worker 应用的 Dockerfile。
 
-Pull the infrastructure images:
+拉取基础设施镜像：
 
 ```powershell
 docker compose -f infra/docker-compose.yml pull
 ```
 
-Start the backend infrastructure:
+启动后端基础设施：
 
 ```powershell
 docker compose -f infra/docker-compose.yml up -d
 ```
 
-Check status:
+检查状态：
 
 ```powershell
 docker compose -f infra/docker-compose.yml ps
 ```
 
-Recreate containers after image updates:
+镜像更新后重建容器：
 
 ```powershell
 docker compose -f infra/docker-compose.yml pull
 docker compose -f infra/docker-compose.yml up -d --force-recreate
 ```
 
-`docker compose build` is not useful for the current infra file because all three services use public images directly (`postgres:16`, `redis:7`, `qdrant/qdrant:v1.13.2`) and no local `build:` context is defined.
+`docker compose build` 对当前基础设施配置无效，因为三个服务均直接使用公共镜像（`postgres:16`、`redis:7`、`qdrant/qdrant:v1.13.2`），未定义本地构建上下文。
 
-## Start Application Services
+## 启动应用服务
 
-Recommended Windows launcher from the repo root:
+推荐使用仓库根目录的 Windows 启动器：
 
 ```powershell
 .\start-app.ps1
 ```
 
-The launcher starts:
+启动器会运行：
 
-- API on `http://127.0.0.1:8000`
-- Web on `http://127.0.0.1:3000`
-- Browser path defaults to `/graph`
+- API 服务：`http://127.0.0.1:8000`
+- Web 前端：`http://127.0.0.1:3000`
+- 浏览器默认打开 `/graph` 页面
 
-Run without opening a browser:
+不打开浏览器启动：
 
 ```powershell
 .\start-app.ps1 -NoBrowser
 ```
 
-Use custom ports:
+使用自定义端口：
 
 ```powershell
 .\start-app.ps1 -BackendPort 8001 -FrontendPort 3001 -OpenPath "/search"
 ```
 
-Manual API start:
+手动启动 API：
 
 ```powershell
 cd apps/api
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Manual Web start:
+手动启动前端：
 
 ```powershell
 $env:NEXT_PUBLIC_API_BASE_URL = "http://127.0.0.1:8000/api"
 npm run dev --workspace web -- --hostname 127.0.0.1 --port 3000
 ```
 
-Optional worker:
+可选 Worker：
 
 ```powershell
 cd apps/worker
 uv run celery -A worker_app.celery_app worker --loglevel=info
 ```
 
-Optional watched-folder ingestion:
+可选目录监听导入：
 
 ```powershell
 cd apps/worker
 uv run python -m worker_app.watcher
 ```
 
-## Build Frontend
+## 构建前端
 
-Type-check and build the web app:
+类型检查并构建 Web 应用：
 
 ```powershell
 npm run typecheck:web
 npm run build:web
 ```
 
-Start the production Next.js server after build:
+构建后启动生产模式 Next.js 服务：
 
 ```powershell
 $env:NEXT_PUBLIC_API_BASE_URL = "http://127.0.0.1:8000/api"
 npm run start --workspace web
 ```
 
-## Ingestion Flow
+## 导入流程
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant Web
+    participant 用户
+    participant 前端
     participant API
-    participant FS as Course Storage
-    participant DB as PostgreSQL
-    participant Model as Model API
+    participant 文件存储 as 课程存储
+    participant 数据库 as PostgreSQL
+    participant 模型 as 模型 API
     participant Qdrant
 
-    User->>Web: Upload or sync course files
-    Web->>API: POST /api/files/upload or /api/ingestion/parse-uploaded-files
-    API->>FS: Save archived copy
-    API->>API: Parse document (PDF/PPTX/DOCX/MD/Notebook/OCR)
-    API->>API: Chunk sections (RecursiveCharacterTextSplitter)
-    API->>Model: Create embeddings (batch, async)
-    API->>Qdrant: Upsert vectors
-    API->>DB: Store documents, versions, chunks (commit)
-    API->>Model: Extract concept graph payload (Semaphore-throttled)
-    API->>DB: Rebuild graph (single-transaction DELETE→INSERT→COMMIT)
-    API-->>Web: Batch status via SSE stream
+    用户->>前端: 上传或同步课程文件
+    前端->>API: POST /api/files/upload 或 /api/ingestion/parse-uploaded-files
+    API->>文件存储: 保存归档副本
+    API->>API: 解析文档（PDF/PPTX/DOCX/MD/Notebook/OCR）
+    API->>API: 切块（RecursiveCharacterTextSplitter）
+    API->>模型: 批量异步生成向量
+    API->>Qdrant: 写入向量
+    API->>数据库: 存储文档、版本、切块（commit）
+    API->>模型: 抽取概念图谱（Semaphore 限流）
+    API->>数据库: 重建图谱（单事务 DELETE→INSERT→COMMIT）
+    API-->>前端: 通过 SSE 流推送批次状态
+```
+## RAG 检索增强生成架构
+
+下图展示了系统完整的 RAG（检索增强生成）管线，包含离线索引阶段和在线查询阶段：
+
+```mermaid
+flowchart TB
+    subgraph IDX["离线索引阶段 - 导入时执行"]
+        direction TB
+        SRC["源文件<br/>PDF / PPTX / DOCX / MD / Notebook / HTML / 图片"]
+        SRC --> PARSE["文档解析器<br/>结构化提取 + OCR"]
+        PARSE --> CHUNK["语义切块<br/>RecursiveCharacterTextSplitter<br/>chunk_size=1200, overlap=150"]
+        CHUNK --> EMB["向量化<br/>OpenAI 兼容 API<br/>批量异步 + 降级哈希"]
+        CHUNK --> META["元数据提取<br/>章节 / 类型 / 页码 / 标题"]
+        EMB --> VEC_W[("向量存储写入<br/>Qdrant / FallbackJSON")]
+        META --> DB_W[("关系数据库写入<br/>Document, Chunk")]
+        CHUNK --> LLM_G["LLM 图谱抽取<br/>Semaphore 限流"]
+        LLM_G --> GRAPH_W[("知识图谱写入<br/>Concept, Relation<br/>单事务 ACID")]
+    end
+
+    subgraph QRY["在线查询阶段 - 用户提问时执行"]
+        direction TB
+        Q["用户问题"] --> QA["查询分析<br/>分词 / 意图识别"]
+        QA --> ROUTE{"路由决策"}
+        ROUTE -->|直答 / 澄清| DIRECT["直接回答<br/>无需检索"]
+        ROUTE -->|笔记 / 习题 / 比较 / 通用| REWRITE["查询改写<br/>LLM 上下文消歧"]
+        REWRITE --> DENSE["稠密检索<br/>向量相似度"]
+        REWRITE --> LEX["词法检索<br/>BM25 式全文匹配"]
+        DENSE --> RRF["RRF 融合排序<br/>k=60"]
+        LEX --> RRF
+        RRF --> GRADE["文档评分<br/>词项重叠 + 分数阈值"]
+        GRADE -->|文档不足, 重试次数不足| RETRY["重试规划<br/>扩展查询词"]
+        RETRY --> DENSE
+        GRADE -->|有相关文档| CTX["上下文合成<br/>top-K 摘录拼接"]
+        CTX --> GEN["答案生成<br/>LLM + 课程上下文约束"]
+        GEN --> CITE["引用检查<br/>过滤无关引用"]
+        CITE --> SELF["自检<br/>状态闭合"]
+    end
+
+    subgraph STR["存储层"]
+        VEC[("Qdrant<br/>向量索引")]
+        DB[("PostgreSQL<br/>元数据 + 切块")]
+        KG[("知识图谱<br/>概念 + 关系")]
+    end
+
+    VEC_W -.-> VEC
+    DB_W -.-> DB
+    GRAPH_W -.-> KG
+    DENSE --> VEC
+    LEX --> DB
+    GRADE -->|二次验证| DB
 ```
 
-## Agent QA Flow
+**核心设计要点**：
+
+| 阶段 | 关键机制 | 说明 |
+|------|----------|------|
+| 切块 | 按内容类型自适应 | 代码块 900 字符、文本 1200 字符，Markdown 使用标题层级分隔 |
+| 向量化 | 批量异步 + 三级降级 | OpenAI 兼容 API → 重试（429/5xx）→ 确定性哈希降级 |
+| 检索 | 稠密 + 词法 + RRF 融合 | 两路独立召回，RRF（k=60）融合排序，避免单路漏召 |
+| 评分 | 词项重叠 + 内容类型加权 | 文本 +1.1 / 代码 -1.8 / 标题命中 +1.4 |
+| 一致性 | 检索二次验证 | 向量结果与数据库交叉验证，过滤已删除和不活跃切块 |
+| 图谱 | 单事务全量重建 | DELETE→INSERT→COMMIT，ACID 合规 |
+
+## 智能体问答流程
 
 ```mermaid
 graph LR
-    A[query_analyzer] --> B[router]
-    B -->|retrieve| C[query_rewriter]
-    B -->|direct/clarify| G[answer_generator]
-    C --> D[retrievers]
-    D --> E[document_grader]
-    E -->|has docs| F[context_synthesizer]
-    E -->|retry < 2| R[retry_planner]
+    A[查询分析器] --> B[路由器]
+    B -->|检索| C[查询改写器]
+    B -->|直答/澄清| G[答案生成器]
+    C --> D[检索器]
+    D --> E[文档评分器]
+    E -->|有文档| F[上下文合成器]
+    E -->|重试 < 2| R[重试规划器]
     R --> D
     F --> G
-    G --> H[citation_checker]
-    H --> I[self_check]
+    G --> H[引用检查器]
+    H --> I[自检器]
 ```
 
-每个节点执行时实时更新 `AgentRun.current_node` 和 `AgentTraceEvent`（commit per node），支持前端进度追踪。
+每个节点执行时实时更新 `AgentRun.current_node` 和 `AgentTraceEvent`（每节点一次 commit），支持前端进度追踪。
 
-## Main API Endpoints
+## 主要 API 端点
 
-- `GET /api/courses`
-- `POST /api/courses`
-- `GET /api/courses/current/dashboard?course_id=...`
-- `GET /api/courses/current/graph?course_id=...`
-- `GET /api/graph/chapters/{chapter}?course_id=...`
-- `GET /api/graph/nodes/{concept_id}?course_id=...`
-- `GET /api/concepts?course_id=...`
-- `POST /api/files/upload?course_id=...`
-- `POST /api/ingestion/parse-uploaded-files`
-- `POST /api/ingestion/parse-storage?course_id=...`
-- `GET /api/ingestion/batches/{batch_id}`
-- `GET /api/ingestion/batches/{batch_id}/logs` (SSE)
-- `POST /api/search`
-- `POST /api/qa`
-- `POST /api/qa/stream` (SSE)
-- `POST /api/agent`
-- `GET /api/tasks/{run_id}`
-- `GET /api/sessions?course_id=...`
-- `GET /api/sessions/{session_id}/messages`
-- `DELETE /api/sessions/{session_id}`
-- `GET /api/settings/model`
-- `PUT /api/settings/model`
+- `GET /api/courses` — 课程列表
+- `POST /api/courses` — 创建课程
+- `GET /api/courses/current/dashboard?course_id=...` — 课程仪表盘
+- `GET /api/courses/current/graph?course_id=...` — 课程图谱
+- `GET /api/graph/chapters/{chapter}?course_id=...` — 章节图谱
+- `GET /api/graph/nodes/{concept_id}?course_id=...` — 概念节点详情
+- `GET /api/concepts?course_id=...` — 概念卡片列表
+- `POST /api/files/upload?course_id=...` — 上传文件
+- `POST /api/ingestion/parse-uploaded-files` — 解析已上传文件
+- `POST /api/ingestion/parse-storage?course_id=...` — 解析存储目录
+- `GET /api/ingestion/batches/{batch_id}` — 批次状态
+- `GET /api/ingestion/batches/{batch_id}/logs` — 批次日志（SSE 流）
+- `POST /api/search` — 混合检索
+- `POST /api/qa` — 智能体问答
+- `POST /api/qa/stream` — 流式智能体问答（SSE 流）
+- `POST /api/agent` — 智能体调用
+- `GET /api/tasks/{run_id}` — 智能体运行状态
+- `GET /api/sessions?course_id=...` — 会话列表
+- `GET /api/sessions/{session_id}/messages` — 会话消息
+- `DELETE /api/sessions/{session_id}` — 删除会话
+- `GET /api/settings/model` — 模型设置
+- `PUT /api/settings/model` — 更新模型设置
 
-## Development Notes
+## 开发说明
 
-- Keep `.env`, `data/`, local databases and generated logs out of Git.
-- `ingestion/` contains derived extraction artifacts; it can be regenerated from stored source documents.
-- `storage/` contains uploaded or copied source files; deleting it removes the material needed for re-ingestion.
-- The API uses lightweight schema patching at startup (`SCHEMA_PATCHES` + `ALTER TABLE ADD COLUMN`) instead of Alembic migrations.
-- Authentication and production-grade authorization are not implemented yet.
-- The `FallbackVectorStore` uses thread-level locks with atomic temp-file writes; it is safe for single-process deployments but not for multi-worker configurations.
-- `finalize_interrupted_batches()` runs at startup to mark incomplete batches as failed, providing crash recovery for the ingestion pipeline.
+- `.env`、`data/`、本地数据库和生成的日志文件不要提交到 Git。
+- `ingestion/` 目录包含派生的解析产物，可从存储的源文件重新生成。
+- `storage/` 目录包含上传或复制的源文件，删除后将无法重新导入。
+- API 在启动时使用轻量级模式补丁（`SCHEMA_PATCHES` + `ALTER TABLE ADD COLUMN`）而非 Alembic 迁移。
+- 认证和生产级授权尚未实现。
+- `FallbackVectorStore` 使用线程级锁和原子临时文件写入；适用于单进程部署，不适用于多 Worker 配置。
+- `finalize_interrupted_batches()` 在启动时运行，将未完成的批次标记为失败，提供导入管线的崩溃恢复。
