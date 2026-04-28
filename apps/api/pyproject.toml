@@ -27,7 +27,8 @@ dependencies = [
   "pillow>=11.0.0",
   "markdown>=3.7",
   "beautifulsoup4>=4.12.3",
-  "networkx>=3.4.2"
+  "networkx>=3.4.2",
+  "portalocker>=3.0.0"
 ]
 
 [project.optional-dependencies]
@@ -49,5 +50,6 @@ asyncio_mode = "auto"
 pythonpath = ["."]
 markers = [
   "no_fallback_e2e: requires PostgreSQL, Qdrant, and an OpenAI-compatible model endpoint with fallback disabled",
+  "fallback_compat: explicitly enables local fallback paths for compatibility coverage",
 ]
 testpaths = ["tests"]

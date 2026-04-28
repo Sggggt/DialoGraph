@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -11,9 +14,15 @@ from qdrant_client.http import models as rest
 
 from app.core.config import get_settings
 
+try:
+    import portalocker
+except ImportError:  # pragma: no cover - optional dependency in fallback-only paths
+    portalocker = None
 
-_VECTOR_FILE_LOCKS: dict[Path, Lock] = {}
+
+_VECTOR_FILE_LOCKS: OrderedDict[Path, Lock] = OrderedDict()
 _VECTOR_FILE_LOCKS_GUARD = Lock()
+_MAX_VECTOR_FILE_LOCKS = 128
 
 
 def vector_file_lock(path: Path) -> Lock:
@@ -21,7 +30,37 @@ def vector_file_lock(path: Path) -> Lock:
     with _VECTOR_FILE_LOCKS_GUARD:
         if resolved not in _VECTOR_FILE_LOCKS:
             _VECTOR_FILE_LOCKS[resolved] = Lock()
+        else:
+            _VECTOR_FILE_LOCKS.move_to_end(resolved)
+        while len(_VECTOR_FILE_LOCKS) > _MAX_VECTOR_FILE_LOCKS:
+            _VECTOR_FILE_LOCKS.popitem(last=False)
         return _VECTOR_FILE_LOCKS[resolved]
+
+
+@contextmanager
+def vector_process_lock(path: Path):
+    lock_path = path.with_suffix(f"{path.suffix}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if portalocker is not None:
+        with lock_path.open("a+b") as handle:
+            portalocker.lock(handle, portalocker.LOCK_EX)
+            try:
+                yield
+            finally:
+                portalocker.unlock(handle)
+        return
+    with vector_file_lock(path):
+        yield
+
+
+def fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -51,11 +90,18 @@ class FallbackVectorStore:
 
     def _write(self, data: list[dict]) -> None:
         temporary_file = self.backing_file.with_suffix(f"{self.backing_file.suffix}.tmp")
-        temporary_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary_file.replace(self.backing_file)
+        with temporary_file.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_file, self.backing_file)
+        try:
+            fsync_directory(self.backing_file.parent)
+        except OSError:
+            pass
 
     def upsert(self, points: list[dict]) -> None:
-        with vector_file_lock(self.backing_file):
+        with vector_process_lock(self.backing_file):
             current = self._read()
             indexed = {item["id"]: item for item in current}
             for point in points:
@@ -66,12 +112,31 @@ class FallbackVectorStore:
         if not ids:
             return
         id_set = set(ids)
-        with vector_file_lock(self.backing_file):
+        with vector_process_lock(self.backing_file):
             current = self._read()
             self._write([item for item in current if item.get("id") not in id_set])
 
+    def get_points(self, ids: list[str]) -> list[dict]:
+        if not ids:
+            return []
+        id_set = set(ids)
+        with vector_process_lock(self.backing_file):
+            current = self._read()
+        return [item for item in current if item.get("id") in id_set]
+
+    def list_ids(self, course_id: str | None = None) -> list[str]:
+        with vector_process_lock(self.backing_file):
+            current = self._read()
+        ids = []
+        for item in current:
+            payload = item.get("payload", {})
+            if course_id and payload.get("course_id") != course_id:
+                continue
+            ids.append(item["id"])
+        return ids
+
     def search(self, vector: list[float], limit: int, filters: dict[str, Any]) -> list[dict]:
-        with vector_file_lock(self.backing_file):
+        with vector_process_lock(self.backing_file):
             points = self._read()
         results = []
         for point in points:
@@ -138,6 +203,57 @@ class VectorStore:
             )
         if self.settings.enable_model_fallback:
             self.fallback.delete(ids)
+
+    def get_points(self, ids: list[str]) -> list[dict]:
+        if not ids:
+            return []
+        if self.client:
+            points = self.client.retrieve(
+                collection_name=self.collection,
+                ids=ids,
+                with_payload=True,
+                with_vectors=True,
+            )
+            return [
+                {"id": str(point.id), "vector": point.vector, "payload": point.payload or {}}
+                for point in points
+            ]
+        if not self.settings.enable_model_fallback:
+            raise RuntimeError("Qdrant is unavailable and ENABLE_MODEL_FALLBACK is false")
+        return self.fallback.get_points(ids)
+
+    def list_ids(self, course_id: str | None = None) -> list[str]:
+        if self.client:
+            qdrant_filter = None
+            if course_id:
+                qdrant_filter = rest.Filter(
+                    must=[rest.FieldCondition(key="course_id", match=rest.MatchValue(value=course_id))]
+                )
+            ids: list[str] = []
+            offset = None
+            while True:
+                points, offset = self.client.scroll(
+                    collection_name=self.collection,
+                    scroll_filter=qdrant_filter,
+                    limit=256,
+                    offset=offset,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                ids.extend(str(point.id) for point in points)
+                if offset is None:
+                    break
+            return ids
+        if not self.settings.enable_model_fallback:
+            raise RuntimeError("Qdrant is unavailable and ENABLE_MODEL_FALLBACK is false")
+        return self.fallback.list_ids(course_id)
+
+    def health_check(self, course_id: str, active_chunk_ids: list[str]) -> dict:
+        vector_ids = set(self.list_ids(course_id))
+        active_ids = set(active_chunk_ids)
+        missing = sorted(active_ids - vector_ids)
+        stale = sorted(vector_ids - active_ids)
+        return {"ok": not missing, "missing": missing, "stale": stale}
 
     def search(self, vector: list[float], limit: int, filters: dict[str, Any] | None = None) -> list[dict]:
         filters = {key: value for key, value in (filters or {}).items() if value not in (None, "", [], {})}

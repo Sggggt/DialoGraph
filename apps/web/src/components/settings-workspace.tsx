@@ -33,7 +33,7 @@ export function SettingsWorkspace() {
     if (!settingsQuery.data) {
       return;
     }
-    setForm({
+    const nextForm = {
       base_url: settingsQuery.data.base_url,
       resolve_ip: settingsQuery.data.resolve_ip ?? "",
       embedding_model: settingsQuery.data.embedding_model,
@@ -43,8 +43,11 @@ export function SettingsWorkspace() {
       graph_extraction_chunks_per_document: String(settingsQuery.data.graph_extraction_chunks_per_document ?? 2),
       api_key: "",
       clear_api_key: false,
+    };
+    queueMicrotask(() => {
+      setForm(nextForm);
+      setApiKeyEditing(false);
     });
-    setApiKeyEditing(false);
   }, [settingsQuery.data]);
 
   const saveMutation = useMutation({

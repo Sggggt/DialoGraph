@@ -1,7 +1,9 @@
 "use client";
 
 import ReactMarkdown, { type Components } from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 
 import { cn } from "@/lib/utils";
 
@@ -69,8 +71,8 @@ const compactComponents: Components = {
 
 export function MarkdownRenderer({ content, className, compact = false }: MarkdownRendererProps) {
   return (
-    <div className={cn("markdown-output text-sm text-white/72", compact && "leading-7", className)}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={compact ? compactComponents : components}>
+    <div className={cn("markdown-output text-sm text-white/72", compact && "compact-markdown leading-7", className)}>
+      <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={compact ? compactComponents : components}>
         {content}
       </ReactMarkdown>
     </div>

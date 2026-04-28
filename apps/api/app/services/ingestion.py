@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
+import asyncio
+from collections import Counter, OrderedDict
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.utils import source_type_from_path
-from app.models import Chunk, Concept, Course, Document, DocumentVersion, IngestionBatch, IngestionJob
+from app.models import Chunk, Concept, Course, Document, DocumentVersion, IngestionBatch, IngestionCompensationLog, IngestionJob
 from app.services.chunking import chunk_sections
 from app.services.concept_graph import get_concept_cards, get_graph_payload, graph_extraction_provider, rebuild_course_graph
 from app.services.embeddings import EmbeddingProvider, is_degraded_mode
@@ -24,6 +26,108 @@ ALLOWED_SUFFIXES = {".pdf", ".ipynb", ".md", ".markdown", ".txt", ".docx", ".ppt
 EXCLUDED_PARTS = {"output", "tmp", "scripts", ".ipynb_checkpoints", "__pycache__"}
 IGNORED_NAMES = {".ds_store"}
 TERMINAL_STATES = {"completed", "failed", "partial_failed", "skipped"}
+_SOURCE_PATH_LOCKS: OrderedDict[str, asyncio.Lock] = OrderedDict()
+_SOURCE_PATH_LOCKS_GUARD = Lock()
+_MAX_SOURCE_PATH_LOCKS = 256
+
+
+def normalized_source_path(path: Path) -> str:
+    return str(path.resolve()).lower()
+
+
+def source_path_lock(path: Path) -> asyncio.Lock:
+    key = normalized_source_path(path)
+    with _SOURCE_PATH_LOCKS_GUARD:
+        if key not in _SOURCE_PATH_LOCKS:
+            _SOURCE_PATH_LOCKS[key] = asyncio.Lock()
+        else:
+            _SOURCE_PATH_LOCKS.move_to_end(key)
+        while len(_SOURCE_PATH_LOCKS) > _MAX_SOURCE_PATH_LOCKS:
+            _SOURCE_PATH_LOCKS.popitem(last=False)
+        return _SOURCE_PATH_LOCKS[key]
+
+
+def active_batch_for_course(db: Session, course_id: str) -> IngestionBatch | None:
+    return db.scalar(
+        select(IngestionBatch)
+        .where(IngestionBatch.course_id == course_id, IngestionBatch.status.notin_(TERMINAL_STATES))
+        .order_by(IngestionBatch.created_at.desc())
+    )
+
+
+def create_vector_compensation_log(
+    db: Session,
+    *,
+    course_id: str,
+    job_id: str | None,
+    operation: str,
+    vector_ids: list[str],
+    payload_json: dict | None = None,
+) -> IngestionCompensationLog:
+    log = IngestionCompensationLog(
+        course_id=course_id,
+        job_id=job_id,
+        operation=operation,
+        vector_ids=vector_ids,
+        payload_json=payload_json or {},
+        status="pending",
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log
+
+
+def mark_vector_compensation_log(db: Session, log_id: str, status: str, error: str | None = None) -> None:
+    log = db.get(IngestionCompensationLog, log_id)
+    if log is None:
+        return
+    log.status = status
+    log.error_message = error
+    db.commit()
+
+
+def process_pending_vector_compensations(db: Session) -> int:
+    pending = db.scalars(
+        select(IngestionCompensationLog).where(IngestionCompensationLog.status == "pending").order_by(IngestionCompensationLog.created_at.asc())
+    ).all()
+    processed = 0
+    for log in pending:
+        course = db.get(Course, log.course_id)
+        if course is None:
+            log.status = "failed"
+            log.error_message = "Course no longer exists"
+            continue
+        try:
+            vector_store = VectorStore(course_name=course.name)
+            if log.operation == "upsert":
+                active_ids = set(
+                    db.scalars(
+                        select(Chunk.id).where(
+                            Chunk.course_id == log.course_id,
+                            Chunk.id.in_(log.vector_ids),
+                            Chunk.is_active.is_(True),
+                        )
+                    ).all()
+                )
+                inactive_ids = [vector_id for vector_id in log.vector_ids if vector_id not in active_ids]
+                if inactive_ids:
+                    vector_store.delete(inactive_ids)
+            elif log.operation == "delete":
+                vector_store.delete(log.vector_ids)
+            elif log.operation == "restore":
+                points = log.payload_json.get("points", [])
+                if points:
+                    vector_store.upsert(points)
+            log.status = "completed"
+            log.error_message = None
+            processed += 1
+        except Exception as exc:
+            log.status = "failed"
+            log.error_message = str(exc)
+    if pending:
+        db.commit()
+    return processed
 
 
 def finalize_graph_generation_failure(session: Session, batch_id: str, exc: Exception, stats: dict) -> dict:
@@ -244,6 +348,9 @@ def set_job_state(db: Session, job: IngestionJob, state: str, *, error: str | No
 
 
 def create_sync_batch(db: Session, course_id: str, root: Path, trigger_source: str = "sync") -> IngestionBatch:
+    active = active_batch_for_course(db, course_id)
+    if active is not None:
+        return active
     batch = IngestionBatch(course_id=course_id, source_root=str(root), trigger_source=trigger_source, status="queued")
     db.add(batch)
     db.commit()
@@ -252,6 +359,9 @@ def create_sync_batch(db: Session, course_id: str, root: Path, trigger_source: s
 
 
 def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path], force: bool = False) -> IngestionBatch:
+    active = active_batch_for_course(db, course_id)
+    if active is not None:
+        return active
     storage_batch_root = str(files[0].parent) if files else "storage files"
     batch = IngestionBatch(course_id=course_id, source_root=storage_batch_root, trigger_source="upload", status="queued")
     batch.total_files = len(files)
@@ -293,7 +403,11 @@ def create_uploaded_files_batch(db: Session, course_id: str, files: list[Path], 
 
 def register_uploaded_file(db: Session, course: Course, source_path: Path) -> tuple[Document, IngestionJob]:
     checksum = compute_checksum(source_path)
-    document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(source_path)))
+    document = db.scalar(
+        select(Document)
+        .where(Document.course_id == course.id, Document.source_path == str(source_path))
+        .with_for_update()
+    )
     if document is None:
         document = Document(
             course_id=course.id,
@@ -317,6 +431,7 @@ def register_uploaded_file(db: Session, course: Course, source_path: Path) -> tu
         select(IngestionJob)
         .where(IngestionJob.course_id == course.id, IngestionJob.source_path == str(source_path))
         .order_by(IngestionJob.updated_at.desc())
+        .with_for_update()
     )
     if job is None or job.status not in {"queued", "failed", "skipped"}:
         job = IngestionJob(
@@ -376,6 +491,7 @@ def finalize_interrupted_batches() -> int:
     finalized: list[str] = []
     now = datetime.utcnow()
     with SessionLocal() as session:
+        process_pending_vector_compensations(session)
         batches = session.scalars(select(IngestionBatch).where(IngestionBatch.status.notin_(TERMINAL_STATES))).all()
         for batch in batches:
             batch.status = "failed"
@@ -407,6 +523,7 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
     document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == source_path))
     jobs = db.scalars(select(IngestionJob).where(IngestionJob.course_id == course.id, IngestionJob.source_path == source_path)).all()
     removed = False
+    file_to_delete: Path | None = None
 
     if document is not None:
         document.is_active = False
@@ -436,16 +553,18 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
 
     course_paths = get_course_paths(course.name)
     storage_root = course_paths["storage_root"].resolve()
-    try:
-        resolved_path = Path(source_path).resolve()
-        if resolved_path.exists() and resolved_path.is_file() and (resolved_path == storage_root or storage_root in resolved_path.parents):
-            resolved_path.unlink()
-            removed = True
-    except OSError:
-        pass
+    resolved_path = Path(source_path).resolve()
+    if resolved_path.exists() and resolved_path.is_file() and (resolved_path == storage_root or storage_root in resolved_path.parents):
+        file_to_delete = resolved_path
+        removed = True
 
     if removed:
         db.commit()
+        if file_to_delete is not None:
+            try:
+                file_to_delete.unlink()
+            except OSError:
+                pass
     return removed
 
 
@@ -483,20 +602,39 @@ def create_or_update_document(
             .all()
         ]
         document.is_active = True
-        document.checksum = checksum
         document.title = title
         document.source_type = source_type
         document.tags = tags or document.tags
         document.difficulty = difficulty or document.difficulty
         version_number = (db.scalar(select(func.max(DocumentVersion.version)).where(DocumentVersion.document_id == document.id)) or 0) + 1
-        db.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).update({"is_active": False})
-        db.query(Chunk).filter(Chunk.document_id == document.id).update({"is_active": False})
-    db.commit()
-    db.refresh(document)
+    db.flush()
     return document, version_number, stale_chunk_ids
 
 
 async def ingest_file(
+    db: Session,
+    source_path: Path,
+    trigger_source: str = "upload",
+    existing_job_id: str | None = None,
+    batch_id: str | None = None,
+    course_id: str | None = None,
+    rebuild_graph: bool = True,
+    force: bool = False,
+) -> dict:
+    async with source_path_lock(source_path):
+        return await _ingest_file_locked(
+            db=db,
+            source_path=source_path,
+            trigger_source=trigger_source,
+            existing_job_id=existing_job_id,
+            batch_id=batch_id,
+            course_id=course_id,
+            rebuild_graph=rebuild_graph,
+            force=force,
+        )
+
+
+async def _ingest_file_locked(
     db: Session,
     source_path: Path,
     trigger_source: str = "upload",
@@ -567,9 +705,7 @@ async def ingest_file(
         tags=[chapter],
     )
     job.document_id = document.id
-    db.commit()
     vector_store = VectorStore(course_name=course.name)
-    vector_store.delete(stale_chunk_ids)
 
     version = DocumentVersion(
         document_id=document.id,
@@ -577,7 +713,7 @@ async def ingest_file(
         checksum=checksum,
         storage_path=str(storage_path),
         extracted_path=str(course_paths["ingestion_root"] / f"{document.id}-{version_number}.json"),
-        is_active=True,
+        is_active=False,
     )
     db.add(version)
     db.flush()
@@ -602,6 +738,7 @@ async def ingest_file(
             source_type=source_type,
             metadata_json=payload["metadata"],
             embedding_status="pending",
+            is_active=False,
         )
         db.add(chunk)
         created_chunks.append(chunk)
@@ -646,7 +783,65 @@ async def ingest_file(
                 },
             }
         )
-    vector_store.upsert(vector_points)
+    db.commit()
+
+    new_chunk_ids = [chunk.id for chunk in created_chunks]
+    upsert_log = create_vector_compensation_log(
+        db,
+        course_id=course.id,
+        job_id=job.id,
+        operation="upsert",
+        vector_ids=new_chunk_ids,
+    )
+    try:
+        vector_store.upsert(vector_points)
+    except Exception as exc:
+        mark_vector_compensation_log(db, upsert_log.id, "failed", str(exc))
+        raise
+
+    try:
+        db.query(DocumentVersion).filter(
+            DocumentVersion.document_id == document.id,
+            DocumentVersion.id != version.id,
+        ).update({"is_active": False}, synchronize_session=False)
+        db.query(Chunk).filter(
+            Chunk.document_id == document.id,
+            Chunk.id.notin_(new_chunk_ids),
+        ).update({"is_active": False}, synchronize_session=False)
+        version.is_active = True
+        for chunk in created_chunks:
+            chunk.is_active = True
+        document.checksum = checksum
+        document.is_active = True
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        try:
+            vector_store.delete(new_chunk_ids)
+        finally:
+            mark_vector_compensation_log(db, upsert_log.id, "failed", f"DB activation failed after upsert; compensated new vectors: {exc}")
+        raise
+    mark_vector_compensation_log(db, upsert_log.id, "completed")
+
+    if stale_chunk_ids:
+        stale_points = []
+        try:
+            stale_points = vector_store.get_points(stale_chunk_ids)
+        except Exception:
+            stale_points = []
+        delete_log = create_vector_compensation_log(
+            db,
+            course_id=course.id,
+            job_id=job.id,
+            operation="delete",
+            vector_ids=stale_chunk_ids,
+            payload_json={"points": stale_points},
+        )
+        try:
+            vector_store.delete(stale_chunk_ids)
+            mark_vector_compensation_log(db, delete_log.id, "completed")
+        except Exception as exc:
+            mark_vector_compensation_log(db, delete_log.id, "failed", str(exc))
 
     set_job_state(db, job, "extracting_graph", batch_id=batch_id)
     graph_stats = (

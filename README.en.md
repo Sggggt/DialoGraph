@@ -11,15 +11,18 @@ The system supports multi-course isolation: each course has its own file directo
 ```mermaid
 flowchart TB
     U["User Browser"] --> W["Next.js Web<br/>apps/web"]
-    W -->|HTTP / SSE| API["FastAPI API<br/>apps/api"]
+    W -->|HTTP / SSE + API Key| SECURITY["Auth & CORS Middleware<br/>API Key / origin allowlist"]
+    SECURITY --> API["FastAPI API<br/>apps/api"]
 
     subgraph API_RUNTIME["API Runtime"]
         API --> ROUTES["API Routes<br/>courses / files / search / qa / graph"]
-        ROUTES --> INGEST["Ingestion Service<br/>parse -> chunk -> embed -> graph"]
-        ROUTES --> RETRIEVAL["Retrieval Service<br/>dense + lexical + RRF"]
-        ROUTES --> AGENT["LangGraph Agent<br/>rewrite / route / grade / answer / self-check"]
+        ROUTES --> INGEST["Ingestion Service<br/>parse -> inactive DB version -> vector upsert -> activate"]
+        ROUTES --> RETRIEVAL["Retrieval Service<br/>dense + lexical + RRF + 1-hop GraphRAG"]
+        ROUTES --> AGENT["LangGraph Agent<br/>rewrite / route / grade / answer / live trace"]
         INGEST --> PARSERS["Document Parsers<br/>PDF / PPTX / DOCX / Markdown / Notebook / OCR"]
         INGEST --> GRAPH["Concept Graph Builder<br/>concepts + relations"]
+        INGEST --> COMP["Compensation Recovery<br/>IngestionCompensationLog"]
+        AGENT --> TRACE["SSE trace publisher<br/>agent_trace_events"]
     end
 
     subgraph WORKERS["Optional Background Components"]
@@ -29,15 +32,18 @@ flowchart TB
 
     subgraph STORES["Storage Layer"]
         DB[("PostgreSQL<br/>primary metadata store")]
-        SQLITE[("SQLite fallback<br/>development / local recovery")]
-        QDRANT[("Qdrant<br/>vector collection: knowledge_chunks")]
+        SQLITE[("SQLite fallback<br/>explicit compatibility path only")]
+        QDRANT[("Qdrant<br/>default vector store: knowledge_chunks")]
+        FALLBACK[("Fallback JSON vector index<br/>fallback_compat tests only")]
         FS["Local data root<br/>data/<Course Name>/"]
         REDIS[("Redis<br/>Celery broker")]
     end
 
     API --> DB
-    API -. "database fallback" .-> SQLITE
+    API -. "ENABLE_DATABASE_FALLBACK=true" .-> SQLITE
     API --> QDRANT
+    COMP --> QDRANT
+    API -. "ENABLE_MODEL_FALLBACK=true" .-> FALLBACK
     API --> FS
     CELERY --> REDIS
 
@@ -72,6 +78,8 @@ erDiagram
     Concept ||--o{ ConceptRelation : source_relations
     IngestionBatch ||--o{ IngestionJob : jobs
     IngestionBatch ||--o{ IngestionLog : logs
+    IngestionJob ||--o{ IngestionCompensationLog : compensations
+    Course ||--o{ IngestionCompensationLog : vector_compensations
     QASession ||--o{ AgentRun : runs
     AgentRun ||--o{ AgentTraceEvent : traces
 ```
@@ -98,19 +106,20 @@ The system involves three storage backends with different transactional guarante
 **Cross-storage consistency strategies**:
 
 - **Graph building** uses a single-transaction pattern (DELETE → INSERT → single COMMIT), fully ACID-compliant.
-- **Document ingestion** uses multiple commits for real-time progress feedback, relying on application-level compensation for eventual consistency.
+- **Document ingestion** uses two-phase activation: commit inactive new versions and chunks first, upsert vectors, then activate the new version and deactivate the old one.
 - **Retrieval layer** performs secondary validation against the DB for results returned by the vector store (filtering deleted or inactive chunks) to defend against cross-storage inconsistency.
 - **Batch operations** use a `rollback() → get() → mark failed → commit()` exception-handling pattern so that a single file failure does not pollute the entire batch.
-- **Process restart recovery**: `finalize_interrupted_batches()` runs during FastAPI lifespan startup to mark incomplete batches as failed.
+- **Process restart recovery**: `finalize_interrupted_batches()` runs during FastAPI lifespan startup to process pending vector compensation logs and mark incomplete batches as failed.
 
 ## Concurrency & Async Model
 
 ```
 FastAPI (uvicorn) ─── async API routes
-  ├── BackgroundTasks ─── asyncio.run() in thread pool
-  │     └── run_uploaded_files_ingestion (async)
+  ├── BackgroundTasks ─── async callable / Celery entrypoint
+  │     └── run_uploaded_files_ingestion (event-loop reuse)
   ├── LLM calls ─── httpx.AsyncClient / asyncio.to_thread(curl)
-  └── Graph extraction ─── asyncio.gather() + Semaphore(2)
+  ├── Graph extraction ─── asyncio.gather() + Semaphore(2)
+  └── QA streaming ─── SSE token + trace events
 ```
 
 **Concurrency control mechanisms**:
@@ -118,10 +127,12 @@ FastAPI (uvicorn) ─── async API routes
 | Mechanism | Location | Scope |
 |-----------|----------|-------|
 | SQLAlchemy Session | `autocommit=False` | DB transaction isolation |
+| `source_path` application lock | `ingest_file` | Serializes ingestion of the same file |
+| Non-terminal batch mutex | `create_sync_batch` / `create_uploaded_files_batch` | Allows one active ingestion batch per course |
 | `asyncio.Semaphore(2)` | `extract_llm_graph_payloads` | LLM API concurrency throttling |
-| `threading.Lock` | `FallbackVectorStore` | JSON vector file read/write mutual exclusion |
-| `_VECTOR_FILE_LOCKS_GUARD` | Lock registry guard | Thread-safe lock creation |
-| Atomic file write | `_write` (temp+replace) | Vector file write integrity |
+| `portalocker` / process lock | `FallbackVectorStore` | Multi-process fallback JSON vector file locking |
+| LRU lock registry | `_VECTOR_FILE_LOCKS` / `_SOURCE_PATH_LOCKS` | Bounds lock-table growth during long-running processes |
+| fsync file write | `_write` (temp+replace+fsync) | Fallback vector file write integrity |
 
 **Design decision**: Each LangGraph node in the Agent flow calls `db.commit()` to update `current_node` and trace events. This is an intentional observability design allowing the frontend to track Agent execution progress in real time via `/tasks/{run_id}`.
 
@@ -131,9 +142,10 @@ Fallback is locked by default:
 
 ```env
 ENABLE_MODEL_FALLBACK=false
+ENABLE_DATABASE_FALLBACK=false
 ```
 
-This means the system will not silently degrade to fake embeddings, extractive answers or local JSON vector indexes. The default requires:
+This means the system will not silently degrade to fake embeddings, extractive answers, local JSON vector indexes or SQLite. The default requires:
 
 - `OPENAI_API_KEY` available for embedding, chat and graph extraction.
 - `QDRANT_URL` pointing to an accessible Qdrant instance.
@@ -143,11 +155,12 @@ Only explicitly unlock for local offline debugging:
 
 ```env
 ENABLE_MODEL_FALLBACK=true
+ENABLE_DATABASE_FALLBACK=true
 ```
 
 When unlocked, the system may use deterministic local hash embeddings, extractive fallback answers, or `data/<Course Name>/ingestion/vector_index.json` as a vector index fallback. These results are suitable for development verification only, not for production knowledge-base quality assessment.
 
-The database layer also has a development SQLite fallback: if PostgreSQL is unavailable, or PostgreSQL is empty while a local SQLite has data, the API will try `apps/course_kg.db` or `apps/knowledge_base.db`. Do not rely on this behavior in production.
+The database-layer SQLite fallback must also be explicitly enabled. Do not rely on SQLite fallback in production, and do not use fallback compatibility tests as the default release gate.
 
 ## Data Layout
 
@@ -208,6 +221,9 @@ EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
 EMBEDDING_DIMENSIONS=1024
 ENABLE_MODEL_FALLBACK=false
+ENABLE_DATABASE_FALLBACK=false
+CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+API_KEYS=
 ```
 
 If you use DashScope or another OpenAI-compatible endpoint, set `OPENAI_BASE_URL` and `OPENAI_API_KEY` accordingly.
@@ -384,12 +400,16 @@ flowchart TB
         Q["User Question"] --> QA["Query Analysis<br/>tokenization / intent detection"]
         QA --> ROUTE{"Route Decision"}
         ROUTE -->|direct / clarify| DIRECT["Direct Answer<br/>no retrieval needed"]
-        ROUTE -->|notes / exercises / compare / general| REWRITE["Query Rewrite<br/>LLM context disambiguation"]
+        ROUTE -->|notes / exercises / general| REWRITE["Query Rewrite<br/>LLM context disambiguation"]
+        ROUTE -->|multi-hop / compare / relations| MULTI_HOP["Multi-hop Rewrite<br/>LLM sub-query generation"]
         REWRITE --> DENSE["Dense Retrieval<br/>vector similarity"]
         REWRITE --> LEX["Lexical Retrieval<br/>BM25-style full-text match"]
+        MULTI_HOP --> DENSE
+        MULTI_HOP --> LEX
         DENSE --> RRF["RRF Fusion Ranking<br/>k=60"]
         LEX --> RRF
-        RRF --> GRADE["Document Grading<br/>term overlap + score threshold"]
+        RRF --> GRAPH_EXT["GraphRAG Extension<br/>(multi-hop only) 1-hop neighbor boost"]
+        GRAPH_EXT --> GRADE["Document Grading<br/>term overlap + score threshold"]
         GRADE -->|insufficient docs, retries remaining| RETRY["Retry Planner<br/>expand query terms"]
         RETRY --> DENSE
         GRADE -->|relevant docs found| CTX["Context Synthesis<br/>top-K excerpt assembly"]
@@ -409,6 +429,7 @@ flowchart TB
     GRAPH_W -.-> KG
     DENSE --> VEC
     LEX --> DB
+    GRAPH_EXT --> KG
     GRADE -->|secondary validation| DB
 ```
 
@@ -423,15 +444,31 @@ flowchart TB
 | Consistency | Retrieval secondary validation | Vector results cross-validated against DB, filtering deleted and inactive chunks |
 | Graph | Single-transaction full rebuild | DELETE → INSERT → COMMIT, fully ACID-compliant |
 
+### GraphRAG Mechanism
+
+When a query is routed to the "multi-hop / relations" branch, the system activates Graph-Enhanced Retrieval (GraphRAG). The following diagram illustrates its 1-hop expansion workflow:
+
+```mermaid
+graph LR
+    BASE[Hybrid Search Base Chunks] --> REL[Extract 1-Hop Neighbor Relations]
+    REL --> NEW[Discover New Evidence Chunks]
+    NEW --> BOOST[Calculate Graph Boost Score]
+    BOOST --> MERGE[Merge & Re-rank with Base]
+    BASE --> MERGE
+```
+
 ## Agent QA Flow
 
 ```mermaid
 graph LR
     A[query_analyzer] --> B[router]
     B -->|retrieve| C[query_rewriter]
+    B -->|multi-hop| C2[multi_hop_rewriter]
     B -->|direct/clarify| G[answer_generator]
-    C --> D[retrievers]
+    C --> D[hybrid_retriever<br/>Dense+Lexical+RRF]
+    C2 --> D2[graph_enhanced_retriever<br/>+ GraphRAG]
     D --> E[document_grader]
+    D2 --> E
     E -->|has docs| F[context_synthesizer]
     E -->|retry < 2| R[retry_planner]
     R --> D

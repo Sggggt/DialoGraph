@@ -158,26 +158,26 @@ def concept_cards(course_id: str | None = None, db: Session = Depends(get_db)) -
     return get_concept_cards(db, course.id)
 
 
-def enqueue_ingestion(job_id: str, source_path: str, trigger_source: str) -> None:
+async def enqueue_ingestion(job_id: str, source_path: str, trigger_source: str) -> None:
     try:
         from worker_app.tasks import ingest_path
 
         ingest_path.delay(source_path, trigger_source=trigger_source, job_id=job_id)
     except Exception:
-        asyncio.run(run_ingestion_job(job_id, Path(source_path), trigger_source=trigger_source))
+        await run_ingestion_job(job_id, Path(source_path), trigger_source=trigger_source)
 
 
-def enqueue_batch(batch_id: str) -> None:
+async def enqueue_batch(batch_id: str) -> None:
     try:
         from worker_app.tasks import ingest_batch
 
         ingest_batch.delay(batch_id)
     except Exception:
-        asyncio.run(run_batch_ingestion(batch_id))
+        await run_batch_ingestion(batch_id)
 
 
-def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False) -> None:
-    asyncio.run(run_uploaded_files_ingestion(batch_id, file_paths, force=force))
+async def enqueue_uploaded_batch(batch_id: str, file_paths: list[str], force: bool = False) -> None:
+    await run_uploaded_files_ingestion(batch_id, file_paths, force=force)
 
 
 @router.post("/files/upload", response_model=UploadFileResponse)
@@ -188,7 +188,11 @@ async def upload_file(
 ) -> dict:
     course = get_requested_course(db, course_id)
     stored_path = await save_upload(upload, course.name)
-    document, job = register_uploaded_file(db, course, stored_path)
+    try:
+        document, job = register_uploaded_file(db, course, stored_path)
+    except Exception:
+        stored_path.unlink(missing_ok=True)
+        raise
     return {"document_id": document.id, "job_id": job.id, "status": "queued", "source_path": str(stored_path)}
 
 

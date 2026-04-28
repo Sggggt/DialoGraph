@@ -84,3 +84,42 @@ async def test_openai_compatible_request_does_not_retry_invalid_parameters(no_fa
         )
 
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_answer_prompt_enforces_latex_markdown_format(no_fallback_env, monkeypatch):
+    from app.services import embeddings
+    from app.services.embeddings import ChatProvider
+
+    captured_payload: dict = {}
+
+    async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
+        captured_payload.update(payload)
+        return {"choices": [{"message": {"content": "Use $$C_D(i) = \\frac{k_i}{n - 1}$$."}}]}
+
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
+
+    result = await ChatProvider().answer_question_with_meta(
+        "How is degree centrality defined?",
+        [
+            {
+                "document_title": "Centrality Notes",
+                "chapter": "L3",
+                "content": "Degree centrality is ki over n minus 1.",
+                "snippet": "Degree centrality is ki over n minus 1.",
+                "citations": [],
+                "metadata": {},
+            }
+        ],
+        [],
+    )
+
+    system_prompt = captured_payload["messages"][0]["content"]
+    user_prompt = captured_payload["messages"][-1]["content"]
+    assert "valid LaTeX" in system_prompt
+    assert "single dollar delimiters" in system_prompt
+    assert "double dollar delimiters" in system_prompt
+    assert "Never write formulas as glued plain text" in system_prompt
+    assert "\\frac{k_i}{n - 1}" in system_prompt
+    assert "variables are not attached to neighboring words" in user_prompt
+    assert result.answer.startswith("Use $$")

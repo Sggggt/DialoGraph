@@ -13,29 +13,29 @@
 
 #### 原子性修复
 
-- [ ] `ingest_file`: 将 `create_or_update_document` 内部的 `db.commit()`（L494）改为 `db.flush()`，推迟到函数末尾统一 commit
-- [ ] `ingest_file`: 在 `vector_store.delete(stale_chunk_ids)` 前记录旧向量 ID 到补偿日志，失败时可恢复
-- [ ] `ingest_file`: 将向量 `upsert` 移到 DB commit **之后**执行，失败时仅需重试向量写入而非回滚整个事务
-- [ ] `upload_file` 路由: DB 写入失败时清理已落盘的孤儿文件（`stored_path.unlink(missing_ok=True)`）
-- [ ] `remove_course_file`: 将文件删除（`unlink`）移到 `db.commit()` 之后，避免 DB 回滚但文件已删
+- [x] `ingest_file`: 将 `create_or_update_document` 内部的 `db.commit()`（L494）改为 `db.flush()`，推迟到函数末尾统一 commit
+- [x] `ingest_file`: 在 `vector_store.delete(stale_chunk_ids)` 前记录旧向量 ID 到补偿日志，失败时可恢复
+- [x] `ingest_file`: 将向量 `upsert` 移到 DB commit **之后**执行，失败时仅需重试向量写入而非回滚整个事务
+- [x] `upload_file` 路由: DB 写入失败时清理已落盘的孤儿文件（`stored_path.unlink(missing_ok=True)`）
+- [x] `remove_course_file`: 将文件删除（`unlink`）移到 `db.commit()` 之后，避免 DB 回滚但文件已删
 
 #### 并发控制
 
-- [ ] 为 `ingest_file` 添加基于 `source_path` 的应用级锁（`asyncio.Lock` 字典），防止同一文件并发解析
-- [ ] 为 `register_uploaded_file` 添加 `SELECT ... FOR UPDATE`（PG）或等效排他查询，防止并发上传同名文件竞态
-- [ ] `run_batch_ingestion` / `run_uploaded_files_ingestion`: 添加批次级互斥，防止同课程并发触发多个批次
-- [ ] 评估 `asyncio.run()` 在 `BackgroundTasks` 中的使用，考虑改为 `asyncio.create_task()` 以复用事件循环
+- [x] 为 `ingest_file` 添加基于 `source_path` 的应用级锁（`asyncio.Lock` 字典），防止同一文件并发解析
+- [x] 为 `register_uploaded_file` 添加 `SELECT ... FOR UPDATE`（PG）或等效排他查询，防止并发上传同名文件竞态
+- [x] `run_batch_ingestion` / `run_uploaded_files_ingestion`: 添加批次级互斥，防止同课程并发触发多个批次
+- [x] 评估 `asyncio.run()` 在 `BackgroundTasks` 中的使用，考虑改为 `asyncio.create_task()` 以复用事件循环
 
 #### 锁机制增强
 
-- [ ] `FallbackVectorStore`: 在 Windows 上用 `msvcrt.locking` 或 `portalocker` 替代纯线程锁，支持多进程安全
-- [ ] `FallbackVectorStore._write`: Windows 上 `Path.replace()` 非原子，添加 `os.fsync()` 确保数据落盘
-- [ ] 添加锁清理机制：为 `_VECTOR_FILE_LOCKS` 添加 LRU 淘汰或 WeakValueDictionary，避免长期运行泄漏
+- [x] `FallbackVectorStore`: 在 Windows 上用 `msvcrt.locking` 或 `portalocker` 替代纯线程锁，支持多进程安全
+- [x] `FallbackVectorStore._write`: Windows 上 `Path.replace()` 非原子，添加 `os.fsync()` 确保数据落盘
+- [x] 添加锁清理机制：为 `_VECTOR_FILE_LOCKS` 添加 LRU 淘汰或 WeakValueDictionary，避免长期运行泄漏
 
 #### 跨存储一致性
 
-- [ ] 设计并实现 `IngestionCompensationLog` 表，记录向量操作（delete/upsert），崩溃恢复时重放或回滚
-- [ ] `ingest_file` 失败路径: 添加向量存储补偿清理（删除已写入的新向量、恢复已删除的旧向量）
+- [x] 设计并实现 `IngestionCompensationLog` 表，记录向量操作（delete/upsert），崩溃恢复时重放或回滚
+- [x] `ingest_file` 失败路径: 添加向量存储补偿清理（删除已写入的新向量、恢复已删除的旧向量）
 - [ ] 在 `finalize_interrupted_batches()` 中增加向量存储一致性检查：对比 DB 中活跃 chunk ID 与向量存储中的 ID
 - [ ] `rebuild_course_graph` 前添加向量存储健康检查，确认向量数据可用后再删除旧图
 
@@ -44,26 +44,53 @@
 - [ ] `run_agent`: 在 `append_session_turn` 前用 `try/finally` 确保 transcript 一定被写入，即使后续操作失败
 - [ ] 文档化 Agent 多次 commit 是有意的可观测性设计决策（在代码注释和 README 中说明）
 
+### GraphRAG：图谱增强检索
+
+> 当前向量检索和知识图谱完全独立，图谱关系未被用于增强检索。
+> 以下任务实现「向量召回 → 图谱扩展 → 重排序」管线。
+
+#### 核心管线
+
+- [x] 在 `retrieval.py` 中新增 `graph_enhanced_search()` 函数，实现以下流程：
+  - [x] **Step 1**：调用现有 `hybrid_search_chunks()` 得到 top-K chunks
+  - [x] **Step 2**：从 top-K chunks 提取关联的 concept_ids（通过 `ConceptRelation.evidence_chunk_id` 反查）
+  - [x] **Step 3**：沿 `concept_relations` 扩展 1 跳相邻概念（`source_concept_id` ↔ `target_concept_id`）
+  - [x] **Step 4**：通过相邻概念的 `evidence_chunk_id` 找到关联 chunks
+  - [x] **Step 5**：将图谱扩展的 chunks 合并到原始结果中，用 `confidence * importance_score` 加权后重新排序
+- [x] 在 `agent_graph.py` 的 `HybridRetriever` 中，当 `route == "multi_hop_research"` 时调用 `graph_enhanced_search()`
+
+#### 概念向量去重
+
+- [ ] 为已抽取的概念生成 embedding（概念名 + summary），存入独立向量集合
+- [ ] 在 `upsert_concepts_from_chunk()` 中，对新概念做 embedding 相似度匹配（cosine > 0.92 自动合并）
+- [ ] 处理缩写与全称的消歧（如 "BFS" ↔ "Breadth-First Search"）
+
+#### 图谱质量增强
+
+- [ ] 用 chunk embedding 共现频率推断隐式 `co_occurs_with` 关系
+- [ ] 用概念关联 chunks 的被检索频次校准 `importance_score`
+- [ ] Router 升级为 LLM 分类器，替代关键词匹配路由
+
 ### 测试基础设施
 
-- [ ] 搭建 Python 测试框架（pytest + pytest-asyncio + httpx TestClient）
-- [ ] 为 `parsers.py` 编写单元测试（覆盖 PDF / Markdown / Notebook / PPTX / DOCX / HTML 解析）
-- [ ] 为 `chunking.py` 编写单元测试（切块大小、重叠、content_kind 推断）
-- [ ] 为 `retrieval.py` 编写单元测试（lexical_search、hybrid_search、RRF 融合逻辑）
-- [ ] 为 `ingestion.py` 核心流程编写集成测试（ingest_file 端到端）
-- [ ] 为 `agent_graph.py` 编写测试（路由判断、查询重写、文档评分逻辑）
-- [ ] 为 `concept_graph.py` 编写测试（概念提取、名称规范化、图谱合并）
+- [x] 搭建 Python 测试框架（pytest + pytest-asyncio + httpx TestClient）
+- [x] 为 `parsers.py` 编写单元测试（覆盖 PDF / Markdown / Notebook / PPTX / DOCX / HTML 解析）
+- [x] 为 `chunking.py` 编写单元测试（切块大小、重叠、content_kind 推断）
+- [x] 为 `retrieval.py` 编写单元测试（lexical_search、hybrid_search、RRF 融合逻辑）
+- [x] 为 `ingestion.py` 核心流程编写集成测试（ingest_file 端到端）
+- [x] 为 `agent_graph.py` 编写测试（路由判断、查询重写、文档评分逻辑）
+- [x] 为 `concept_graph.py` 编写测试（概念提取、名称规范化、图谱合并）
 - [ ] 为 `embeddings.py` 编写测试（fallback 逻辑、fake embedding 生成）
-- [ ] 搭建前端测试框架（Vitest + Testing Library）
-- [ ] 为 `lib/api.ts` 编写测试（API 客户端、SSE 流解析）
-- [ ] 添加 `conftest.py`，提供测试用的 SQLite 内存数据库 fixture
+- [x] 搭建前端测试框架（Vitest + Testing Library）
+- [x] 为 `lib/api.ts` 编写测试（API 客户端、SSE 流解析）
+- [x] 添加 `conftest.py`，提供测试用的 SQLite 内存数据库 fixture
 
 ### 安全加固
 
-- [ ] 添加 API 认证中间件（API Key 或 JWT Bearer Token）
-- [ ] 收紧 CORS 配置（替换 `allow_origins=["*"]` 为白名单）
-- [ ] 为 `ensure_schema()` 中的 DDL 操作消除字符串拼接，改用参数化或 SQLAlchemy DDL API
-- [ ] 对 `top_k` 等用户输入参数添加上限约束（如 `Field(le=50)`）
+- [x] 添加 API 认证中间件（API Key 或 JWT Bearer Token）
+- [x] 收紧 CORS 配置（替换 `allow_origins=["*"]` 为白名单）
+- [x] 为 `ensure_schema()` 中的 DDL 操作消除字符串拼接，改用参数化或 SQLAlchemy DDL API
+- [x] 对 `top_k` 等用户输入参数添加上限约束（如 `Field(le=50)`）
 
 ---
 
@@ -213,10 +240,11 @@
 
 | 阶段 | 总任务数 | 已完成 | 进度 |
 |------|---------|--------|------|
-| P0 紧急（事务/并发/锁/跨存储） | 19 | 0 | 0% |
-| P0 紧急（测试 + 安全） | 15 | 0 | 0% |
+| P0 紧急（事务/并发/锁/跨存储） | 18 | 14 | 78% |
+| P0 紧急（GraphRAG） | 13 | 7 | 54% |
+| P0 紧急（测试 + 安全） | 15 | 14 | 93% |
 | P1 重要（代码重构 + DevOps） | 20 | 0 | 0% |
 | P1 重要（效果评估） | 24 | 0 | 0% |
 | P2 改善 | 12 | 0 | 0% |
 | P3 锦上添花 | 14 | 0 | 0% |
-| **总计** | **104** | **0** | **0%** |
+| **总计** | **116** | **35** | **30%** |

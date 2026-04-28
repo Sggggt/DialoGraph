@@ -272,14 +272,16 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   };
 
   useEffect(() => {
-    setSelectedFilePaths(new Set());
+    queueMicrotask(() => setSelectedFilePaths(new Set()));
   }, [selectedCourseId]);
 
   useEffect(() => {
-    setSelectedFilePaths((current) => {
-      const validPaths = new Set(parseTargetPaths);
-      const next = new Set(Array.from(current).filter((path) => validPaths.has(path)));
-      return next.size === current.size ? current : next;
+    queueMicrotask(() => {
+      setSelectedFilePaths((current) => {
+        const validPaths = new Set(parseTargetPaths);
+        const next = new Set(Array.from(current).filter((path) => validPaths.has(path)));
+        return next.size === current.size ? current : next;
+      });
     });
   }, [parseTargetPaths]);
 
@@ -287,12 +289,14 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     if (!activeBatchId || terminalBatchStates.has(batchQuery.data?.state ?? "")) {
       return;
     }
-    setActiveLogBatchId((current) => {
-      if (current === activeBatchId) {
-        return current;
-      }
-      setLogs([]);
-      return activeBatchId;
+    queueMicrotask(() => {
+      setActiveLogBatchId((current) => {
+        if (current === activeBatchId) {
+          return current;
+        }
+        setLogs([]);
+        return activeBatchId;
+      });
     });
   }, [activeBatchId, batchQuery.data?.state]);
 
@@ -328,8 +332,10 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
 
   useEffect(() => {
     if (batchQuery.data?.state && terminalBatchStates.has(batchQuery.data.state)) {
-      setBatchId(null);
-      setDismissedBatchId(activeBatchId);
+      queueMicrotask(() => {
+        setBatchId(null);
+        setDismissedBatchId(activeBatchId);
+      });
       void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
     }
@@ -339,18 +345,20 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     if (!activeBatchId || !isBatchNotFoundError(batchQuery.error)) {
       return;
     }
-    setBatchId(null);
-    setDismissedBatchId(activeBatchId);
-    setActiveLogBatchId((current) => (current === activeBatchId ? null : current));
-    setLogs((current) => [
-      ...current,
-      {
-        timestamp: new Date().toISOString(),
-        event: "batch_missing",
-        message: "旧批次日志已清理，已停止同步该批次。",
-        state: "missing",
-      },
-    ].slice(-300));
+    queueMicrotask(() => {
+      setBatchId(null);
+      setDismissedBatchId(activeBatchId);
+      setActiveLogBatchId((current) => (current === activeBatchId ? null : current));
+      setLogs((current) => [
+        ...current,
+        {
+          timestamp: new Date().toISOString(),
+          event: "batch_missing",
+          message: "旧批次日志已清理，已停止同步该批次。",
+          state: "missing",
+        },
+      ].slice(-300));
+    });
     void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
     void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
   }, [activeBatchId, batchQuery.error, queryClient, selectedCourseId]);

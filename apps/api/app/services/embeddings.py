@@ -250,11 +250,29 @@ class ChatProvider:
                 "content": (
                     "You are a course knowledge-base assistant. "
                     "Answer only from the supplied course excerpts and do not invent unsupported facts. "
-                    "Keep the answer direct, concise, and say when the evidence is insufficient."
+                    "Keep the answer direct, concise, and say when the evidence is insufficient. "
+                    "Format the answer as clean GitHub-flavored Markdown. "
+                    "When writing mathematical notation, use valid LaTeX only: inline variables and short expressions "
+                    "must be wrapped in single dollar delimiters like $k_i$ and $n - 1$; important equations must be "
+                    "placed in display math blocks using double dollar delimiters on their own lines. "
+                    "Never write formulas as glued plain text such as n-1ki, k_iin, or C(i)=n-1ki. "
+                    "Use LaTeX commands and braces for fractions, superscripts, subscripts, and named variants, for example "
+                    "$$C_D(i) = \\frac{k_i}{n - 1}$$, $k_i^{\\text{in}}$, and $k_i^{\\text{out}}$. "
+                    "Do not repeat the same formula in both prose and math form; write the equation once, then explain "
+                    "each symbol in separate bullets or sentences."
                 ),
             },
             *history,
-            {"role": "user", "content": f"Question: {question}\n\nCourse excerpts:\n{citations}"},
+            {
+                "role": "user",
+                "content": (
+                    f"Question: {question}\n\n"
+                    "Course excerpts:\n"
+                    f"{citations}\n\n"
+                    "Before finalizing, check that every formula is either inline LaTeX or display LaTeX, "
+                    "and that variables are not attached to neighboring words."
+                ),
+            },
         ]
         payload = {"model": self.settings.chat_model, "messages": messages, "temperature": 0.2}
         return await self._post_chat_text(payload)

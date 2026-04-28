@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     qdrant_collection: str = "knowledge_chunks"
     redis_url: str = "redis://localhost:6379/0"
     enable_database_fallback: bool = False
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    api_keys: str = ""
 
     course_name: str = "Sample Course"
     data_root: Path = Field(default=WORKSPACE_ROOT / "data")
@@ -42,6 +44,14 @@ class Settings(BaseSettings):
     graph_extraction_chunk_limit: int = Field(default=72, ge=1, le=200)
     graph_extraction_chunks_per_document: int = Field(default=2, ge=1, le=10)
     enable_model_fallback: bool = False
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def api_key_list(self) -> list[str]:
+        return [key.strip() for key in self.api_keys.split(",") if key.strip()]
 
     def sanitize_course_dir_name(self, course_name: str) -> str:
         value = INVALID_COURSE_DIR_CHARS.sub("-", course_name).strip()

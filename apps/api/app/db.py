@@ -3,6 +3,7 @@ from collections.abc import Generator
 from pathlib import Path
 
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.sql.compiler import IdentifierPreparer
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import get_settings
@@ -123,6 +124,7 @@ SCHEMA_PATCHES: dict[str, dict[str, str]] = {
 def ensure_schema() -> None:
     Base.metadata.create_all(bind=engine)
     inspector = inspect(engine)
+    preparer = IdentifierPreparer(engine.dialect)
     with engine.begin() as connection:
         for table_name, patch_columns in SCHEMA_PATCHES.items():
             if table_name not in inspector.get_table_names():
@@ -131,7 +133,9 @@ def ensure_schema() -> None:
             for column_name, column_sql in patch_columns.items():
                 if column_name in existing:
                     continue
-                connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"))
+                table_sql = preparer.quote(table_name)
+                column_name_sql = preparer.quote(column_name)
+                connection.execute(text(" ".join(["ALTER TABLE", table_sql, "ADD COLUMN", column_name_sql, column_sql])))
 
 
 def get_db() -> Generator[Session, None, None]:

@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+@import "katex/dist/katex.min.css";
 
 :root {
   --background: #040816;
@@ -594,6 +595,49 @@ select {
   background: rgba(255, 255, 255, 0.035);
   color: rgba(228, 246, 255, 0.72);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.markdown-output .katex {
+  color: rgba(237, 246, 255, 0.92);
+  font-size: 1.02em;
+}
+
+.markdown-output .katex .katex-mathml {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(1px, 1px, 1px, 1px);
+  border: 0;
+  padding: 0;
+}
+
+.markdown-output .katex .katex-html {
+  display: inline-block;
+}
+
+.markdown-output .katex-display {
+  margin: 1rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.035);
+  padding: 0.85rem 1rem;
+  scrollbar-width: thin;
+}
+
+.markdown-output .katex-display > .katex {
+  display: inline-block;
+  min-width: max-content;
+}
+
+.markdown-output.compact-markdown .katex-display {
+  display: inline-block;
+  max-width: 100%;
+  margin: 0.25rem 0;
+  padding: 0.35rem 0.5rem;
+  vertical-align: middle;
 }
 
 .kg-flow-line {

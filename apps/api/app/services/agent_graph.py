@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from collections.abc import AsyncGenerator
@@ -15,12 +16,13 @@ from app.models import AgentRun, AgentTraceEvent, QASession
 from app.schemas import AgentRequest, SearchFilters
 from app.services.embeddings import ChatProvider, is_degraded_mode
 from app.services.ingestion import resolve_course
-from app.services.retrieval import hybrid_search_chunks
+from app.services.retrieval import graph_enhanced_search, hybrid_search_chunks
 
 
 AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
 NOTE_SOURCE_TYPES = {"pdf", "ppt", "pptx", "docx", "markdown", "text", "html", "image"}
 EXERCISE_MARKERS = ("exercise", "homework", "problem", "assignment", "quiz", "exam")
+_TRACE_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict]]] = {}
 
 
 class AgentState(TypedDict, total=False):
@@ -119,7 +121,29 @@ def _trace(
     db.add(event)
     db.commit()
     db.refresh(event)
-    return trace_event_to_payload(event)
+    payload = trace_event_to_payload(event)
+    _publish_trace_event(run_id, payload)
+    return payload
+
+
+def _subscribe_trace(run_id: str) -> asyncio.Queue[dict]:
+    queue: asyncio.Queue[dict] = asyncio.Queue()
+    _TRACE_SUBSCRIBERS.setdefault(run_id, set()).add(queue)
+    return queue
+
+
+def _unsubscribe_trace(run_id: str, queue: asyncio.Queue[dict]) -> None:
+    subscribers = _TRACE_SUBSCRIBERS.get(run_id)
+    if not subscribers:
+        return
+    subscribers.discard(queue)
+    if not subscribers:
+        _TRACE_SUBSCRIBERS.pop(run_id, None)
+
+
+def _publish_trace_event(run_id: str, payload: dict) -> None:
+    for queue in list(_TRACE_SUBSCRIBERS.get(run_id, ())):
+        queue.put_nowait(payload)
 
 
 def trace_event_to_payload(event: AgentTraceEvent) -> dict:
@@ -225,7 +249,8 @@ class HybridRetriever:
         all_results: dict[str, dict] = {}
         for query in queries:
             for filters in expand_route_filters(state["route"], state["filters"]):
-                results = await hybrid_search_chunks(db, state["course_id"], query, filters, max(state["top_k"] * 2, state["top_k"]))
+                search_fn = graph_enhanced_search if state["route"] == "multi_hop_research" else hybrid_search_chunks
+                results = await search_fn(db, state["course_id"], query, filters, max(state["top_k"] * 2, state["top_k"]))
                 for result in results:
                     current = all_results.get(result["chunk_id"])
                     if current is None or result["score"] > current["score"]:
@@ -506,7 +531,7 @@ def run_to_task_status(run: AgentRun) -> dict:
     }
 
 
-async def run_agent(db: Session, request: AgentRequest) -> dict:
+def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASession, AgentRun, AgentState]:
     course = resolve_course(db, request.course_id)
     session = create_or_get_session(db, course.id, request.session_id, request.question)
     run = AgentRun(
@@ -531,6 +556,10 @@ async def run_agent(db: Session, request: AgentRequest) -> dict:
         "top_k": request.top_k,
         "retry_count": 0,
     }
+    return session, run, initial
+
+
+async def execute_agent_run(db: Session, request: AgentRequest, session: QASession, run: AgentRun, initial: AgentState) -> dict:
     try:
         final_state = await AGENT_GRAPH.ainvoke(initial)
         trace_events = db.scalars(select(AgentTraceEvent).where(AgentTraceEvent.run_id == run.id).order_by(AgentTraceEvent.created_at.asc())).all()
@@ -554,10 +583,44 @@ async def run_agent(db: Session, request: AgentRequest) -> dict:
         raise
 
 
+async def run_agent(db: Session, request: AgentRequest) -> dict:
+    session, run, initial = create_agent_run_context(db, request)
+    return await execute_agent_run(db, request, session, run, initial)
+
+
 async def stream_agent_events(db: Session, request: AgentRequest) -> AsyncGenerator[dict, None]:
-    response = await run_agent(db, request)
+    session, run, initial = create_agent_run_context(db, request)
+    trace_queue = _subscribe_trace(run.id)
+    task = asyncio.create_task(execute_agent_run(db, request, session, run, initial))
+    response: dict | None = None
+    yielded_trace_ids: set[str] = set()
+    try:
+        yield {"type": "meta", "run_id": run.id, "session_id": session.id}
+        while not task.done():
+            try:
+                event = await asyncio.wait_for(trace_queue.get(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
+            if request.stream_trace:
+                yielded_trace_ids.add(event["id"])
+                yield {"type": "trace", "trace": event}
+        while not trace_queue.empty():
+            event = trace_queue.get_nowait()
+            if request.stream_trace:
+                yielded_trace_ids.add(event["id"])
+                yield {"type": "trace", "trace": event}
+        response = await task
+    except Exception as exc:
+        yield {"type": "error", "error": str(exc)}
+        return
+    finally:
+        _unsubscribe_trace(run.id, trace_queue)
+
     if request.stream_trace:
+        # Defensive replay for any trace rows missed by the in-memory queue.
         for event in response["trace"]:
+            if event["id"] in yielded_trace_ids:
+                continue
             yield {"type": "trace", "trace": event}
     for line in response["answer"].splitlines() or [response["answer"]]:
         yield {"type": "token", "token": line}

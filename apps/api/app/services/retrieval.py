@@ -4,7 +4,7 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.utils import source_type_from_path
@@ -178,6 +178,90 @@ async def hybrid_search_chunks(db: Session, course_id: str, query: str, filters:
         item["score"] = fused_score + (0.001 * item.get("score", 0.0))
     ranked = sorted(fused.values(), key=lambda item: item["score"], reverse=True)
     return ranked[:top_k]
+
+
+async def graph_enhanced_search(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
+    base_results = await hybrid_search_chunks(db, course_id, query, filters, top_k)
+    if not base_results:
+        return []
+    merged = {item["chunk_id"]: item for item in base_results}
+    base_chunk_ids = list(merged)
+    seed_relations = db.scalars(
+        select(ConceptRelation).where(
+            ConceptRelation.course_id == course_id,
+            ConceptRelation.evidence_chunk_id.in_(base_chunk_ids),
+        )
+    ).all()
+    concept_ids = {
+        concept_id
+        for relation in seed_relations
+        for concept_id in (relation.source_concept_id, relation.target_concept_id)
+        if concept_id
+    }
+    if not concept_ids:
+        return base_results
+
+    neighbor_relations = db.scalars(
+        select(ConceptRelation).where(
+            ConceptRelation.course_id == course_id,
+            or_(
+                ConceptRelation.source_concept_id.in_(concept_ids),
+                ConceptRelation.target_concept_id.in_(concept_ids),
+            ),
+        )
+    ).all()
+    evidence_ids = {relation.evidence_chunk_id for relation in neighbor_relations if relation.evidence_chunk_id}
+    evidence_ids.difference_update(base_chunk_ids)
+    if not evidence_ids:
+        return base_results
+
+    related_concept_ids = {
+        concept_id
+        for relation in neighbor_relations
+        for concept_id in (relation.source_concept_id, relation.target_concept_id)
+        if concept_id
+    }
+    concepts = {
+        concept.id: concept
+        for concept in db.scalars(select(Concept).where(Concept.id.in_(related_concept_ids))).all()
+    }
+    boost_by_chunk: dict[str, float] = {}
+    for relation in neighbor_relations:
+        if not relation.evidence_chunk_id:
+            continue
+        source = concepts.get(relation.source_concept_id)
+        target = concepts.get(relation.target_concept_id or "")
+        importance = max(float(getattr(source, "importance_score", 0.0) or 0.0), float(getattr(target, "importance_score", 0.0) or 0.0))
+        boost = float(relation.confidence or 0.0) * importance
+        boost_by_chunk[relation.evidence_chunk_id] = max(boost_by_chunk.get(relation.evidence_chunk_id, 0.0), boost)
+
+    chunks = db.scalars(
+        select(Chunk).where(
+            Chunk.id.in_(evidence_ids),
+            Chunk.course_id == course_id,
+            Chunk.is_active.is_(True),
+        )
+    ).all()
+    for chunk in chunks:
+        document = db.get(Document, chunk.document_id)
+        if document is None or document.course_id != course_id or not document.is_active:
+            continue
+        if filters.chapter and chunk.chapter != filters.chapter:
+            continue
+        if filters.source_type and chunk.source_type != filters.source_type:
+            continue
+        if filters.tags and not set(filters.tags).intersection(set(document.tags or [])):
+            continue
+        graph_boost = boost_by_chunk.get(chunk.id, 0.0)
+        item = build_search_payload(chunk, document, query, graph_boost, {"graph_boost": graph_boost})
+        item["metadata"]["graph_expanded"] = True
+        merged[chunk.id] = item
+
+    for item in merged.values():
+        scores = item.setdefault("metadata", {}).setdefault("scores", {})
+        if "graph_boost" in scores:
+            item["score"] = float(item["score"]) + float(scores["graph_boost"])
+    return sorted(merged.values(), key=lambda item: item["score"], reverse=True)[:top_k]
 
 
 def lexical_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:

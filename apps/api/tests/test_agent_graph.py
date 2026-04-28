@@ -79,3 +79,44 @@ async def test_agent_retrieval_qa_path_uses_real_provider_metadata(db_session, s
     answer_trace = next(item for item in response["trace"] if item["node"] == "answer_generator")
     assert "provider=openai_compatible_chat" in answer_trace["output_summary"]
     assert "fallback=None" in answer_trace["output_summary"]
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_events_emits_trace_before_answer_tokens(db_session, sample_course, monkeypatch):
+    import asyncio
+    import app.services.agent_graph as agent_graph
+
+    class FakeGraph:
+        async def ainvoke(self, initial):
+            agent_graph._trace(
+                initial["db"],
+                initial["run_id"],
+                "router",
+                output_summary="route=retrieve_notes",
+            )
+            await asyncio.sleep(0)
+            agent_graph._trace(
+                initial["db"],
+                initial["run_id"],
+                "retrievers",
+                output_summary="1 candidate chunks",
+            )
+            return {
+                "answer": "streamed answer",
+                "citations": [],
+                "graded_documents": [],
+                "route": "retrieve_notes",
+            }
+
+    monkeypatch.setattr(agent_graph, "AGENT_GRAPH", FakeGraph())
+
+    events = []
+    async for event in agent_graph.stream_agent_events(
+        db_session,
+        AgentRequest(question="define centrality", course_id=sample_course.id, top_k=3, stream_trace=True),
+    ):
+        events.append(event)
+
+    event_types = [event["type"] for event in events]
+    assert event_types.index("trace") < event_types.index("token")
+    assert [event["trace"]["node"] for event in events if event["type"] == "trace"][:2] == ["router", "retrievers"]
