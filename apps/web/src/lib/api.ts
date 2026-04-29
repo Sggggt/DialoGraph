@@ -2,11 +2,14 @@ import type {
   AgentResponse,
   AgentTraceEventPayload,
   BatchStartResponse,
+  CleanupStaleDataResponse,
+  CleanupStaleGraphResponse,
   ConceptCard,
   CourseFileSummary,
   CourseCreateRequest,
   CourseSummary,
   DashboardSnapshot,
+  DeleteCourseResponse,
   DeleteResponse,
   GraphNodeDetail,
   GraphResponse,
@@ -71,6 +74,14 @@ export async function createCourse(payload: CourseCreateRequest): Promise<Course
   return parseResponse<CourseSummary>(response);
 }
 
+export async function deleteCourse(courseId: string): Promise<DeleteCourseResponse> {
+  const response = await fetch(buildApiUrl(`/courses/${encodeURIComponent(courseId)}`), {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  return parseResponse<DeleteCourseResponse>(response);
+}
+
 export async function fetchDashboard(courseId?: string | null): Promise<DashboardSnapshot> {
   const response = await fetch(buildApiUrl("/courses/current/dashboard", { course_id: courseId }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<DashboardSnapshot>(response);
@@ -109,6 +120,22 @@ export async function removeCourseFile(sourcePath: string, courseId?: string | n
     headers: authHeaders(),
   });
   return parseResponse<{ removed: boolean }>(response);
+}
+
+export async function cleanupStaleData(courseId?: string | null): Promise<CleanupStaleDataResponse> {
+  const response = await fetch(buildApiUrl("/maintenance/cleanup-stale-data", { course_id: courseId }), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return parseResponse<CleanupStaleDataResponse>(response);
+}
+
+export async function cleanupStaleGraph(courseId?: string | null): Promise<CleanupStaleGraphResponse> {
+  const response = await fetch(buildApiUrl("/maintenance/cleanup-stale-graph", { course_id: courseId }), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return parseResponse<CleanupStaleGraphResponse>(response);
 }
 
 export async function fetchGraph(courseId?: string | null): Promise<GraphResponse> {

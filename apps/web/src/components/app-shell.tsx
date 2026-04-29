@@ -5,14 +5,14 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { motion } from "framer-motion";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { BookOpenText, BrainCircuit, FolderPlus, Home, RefreshCw, Search, Settings, Share2, Sparkles, TerminalSquare, Upload } from "lucide-react";
+import { BookOpenText, BrainCircuit, FolderPlus, Home, RefreshCw, Search, Settings, Share2, Sparkles, TerminalSquare, Trash2, Upload } from "lucide-react";
 
 import { AmbientCanvas } from "@/components/ambient-canvas";
 import { useCourseContext } from "@/components/course-context";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { refreshCourse } from "@/lib/api";
+import { deleteCourse, refreshCourse } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const navigation = [
@@ -30,6 +30,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const queryClient = useQueryClient();
   const { courses, selectedCourse, selectedCourseId, setSelectedCourseId, createCourseSpace, isCreating } = useCourseContext();
   const [createOpen, setCreateOpen] = useState(false);
+  const [courseToDelete, setCourseToDelete] = useState<{ id: string; name: string } | null>(null);
+  const [deleteCourseResult, setDeleteCourseResult] = useState<string | null>(null);
   const [nextCourseName, setNextCourseName] = useState("");
   const [refreshDone, setRefreshDone] = useState(false);
   const refreshMutation = useMutation({
@@ -47,6 +49,26 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       ]);
       setRefreshDone(true);
       window.setTimeout(() => setRefreshDone(false), 1600);
+    },
+  });
+  const deleteCourseMutation = useMutation({
+    mutationFn: (courseId: string) => deleteCourse(courseId),
+    onSuccess: async (data, deletedCourseId) => {
+      setDeleteCourseResult(
+        `Deleted course data: vectors ${data.deleted_vectors}, documents ${data.deleted_documents}, chunks ${data.deleted_chunks}, graph relations ${data.deleted_relations}.`,
+      );
+      const nextCourse = courses.find((course) => course.id !== deletedCourseId) ?? null;
+      setSelectedCourseId(nextCourse?.id ?? null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["courses"] }),
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+        queryClient.invalidateQueries({ queryKey: ["course-files"] }),
+        queryClient.invalidateQueries({ queryKey: ["graph"] }),
+        queryClient.invalidateQueries({ queryKey: ["chapter-graph"] }),
+        queryClient.invalidateQueries({ queryKey: ["graph-node"] }),
+        queryClient.invalidateQueries({ queryKey: ["concepts"] }),
+        queryClient.invalidateQueries({ queryKey: ["sessions"] }),
+      ]);
     },
   });
 
@@ -135,6 +157,23 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                     </option>
                   ))}
                 </select>
+                <button
+                  type="button"
+                  aria-label="删除当前课程"
+                  title="删除当前课程"
+                  onClick={() => {
+                    if (!selectedCourseId || !selectedCourse) {
+                      return;
+                    }
+                    setDeleteCourseResult(null);
+                    deleteCourseMutation.reset();
+                    setCourseToDelete({ id: selectedCourseId, name: selectedCourse.name });
+                  }}
+                  disabled={!selectedCourseId || deleteCourseMutation.isPending}
+                  className="grid size-8 place-items-center rounded-full border border-rose-200/20 text-rose-100/70 transition hover:border-rose-200/45 hover:bg-rose-300/10 hover:text-rose-50 disabled:pointer-events-none disabled:opacity-40"
+                >
+                  <Trash2 className="size-4" />
+                </button>
               </div>
               <Button type="button" variant="outline" className="rounded-full" onClick={() => setCreateOpen(true)}>
                 <FolderPlus data-icon="inline-start" />
@@ -195,6 +234,70 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </Button>
             </div>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(courseToDelete)}
+        onOpenChange={(open) => {
+          if (!open && !deleteCourseMutation.isPending) {
+            setCourseToDelete(null);
+            setDeleteCourseResult(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl" showCloseButton={!deleteCourseMutation.isPending}>
+          <DialogHeader className="border-b border-white/8 px-6 py-5">
+            <DialogTitle>Delete Course</DialogTitle>
+            <DialogDescription>
+              {courseToDelete ? `This will delete "${courseToDelete.name}" from data storage, PostgreSQL, Qdrant, and graph tables.` : ""}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 px-6 py-5">
+            {deleteCourseMutation.isPending ? (
+              <div>
+                <p className="text-sm text-white/72">Deleting course data...</p>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8">
+                  <div className="h-full w-2/3 animate-pulse rounded-full bg-[linear-gradient(90deg,#fb7185,#fbbf24,#fb7185)]" />
+                </div>
+              </div>
+            ) : deleteCourseResult ? (
+              <p className="rounded-2xl border border-emerald-200/16 bg-emerald-300/[0.055] px-4 py-3 text-sm leading-6 text-emerald-50/78">{deleteCourseResult}</p>
+            ) : (
+              <p className="rounded-2xl border border-rose-200/16 bg-rose-300/[0.055] px-4 py-3 text-sm leading-6 text-rose-50/78">
+                This is a destructive operation and cannot be undone from the UI.
+              </p>
+            )}
+            {deleteCourseMutation.error ? <p className="text-sm text-rose-100/78">{(deleteCourseMutation.error as Error).message}</p> : null}
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                className="rounded-full"
+                disabled={deleteCourseMutation.isPending}
+                onClick={() => {
+                  setCourseToDelete(null);
+                  setDeleteCourseResult(null);
+                }}
+              >
+                {deleteCourseResult ? "Close" : "Cancel"}
+              </Button>
+              {!deleteCourseResult ? (
+                <Button
+                  type="button"
+                  className="rounded-full"
+                  disabled={!courseToDelete || deleteCourseMutation.isPending}
+                  onClick={() => {
+                    if (courseToDelete) {
+                      deleteCourseMutation.mutate(courseToDelete.id);
+                    }
+                  }}
+                >
+                  {deleteCourseMutation.isPending ? "Deleting..." : "Delete"}
+                </Button>
+              ) : null}
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
     </div>

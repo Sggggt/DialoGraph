@@ -187,6 +187,41 @@ export interface DeleteResponse {
   deleted: boolean;
 }
 
+export interface CleanupStaleDataResponse {
+  deleted_vectors: number;
+  deleted_chunks: number;
+  deleted_document_versions: number;
+  deleted_documents: number;
+  removed_graph_relations: number;
+  removed_graph_concepts: number;
+}
+
+export interface CleanupStaleGraphResponse {
+  removed_relations: number;
+  removed_aliases: number;
+  removed_concepts: number;
+}
+
+export interface DeleteCourseResponse {
+  deleted: boolean;
+  deleted_vectors: number;
+  deleted_trace_events: number;
+  deleted_agent_runs: number;
+  deleted_sessions: number;
+  deleted_ingestion_logs: number;
+  deleted_compensations: number;
+  deleted_jobs: number;
+  deleted_batches: number;
+  deleted_relations: number;
+  deleted_aliases: number;
+  deleted_concepts: number;
+  deleted_chunks: number;
+  deleted_document_versions: number;
+  deleted_documents: number;
+  deleted_courses: number;
+  deleted_directory: number;
+}
+
 export interface RefreshResponse {
   course_id: string;
   refreshed_at: string;

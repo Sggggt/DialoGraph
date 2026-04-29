@@ -178,6 +178,41 @@ class DeleteResponse(BaseModel):
     deleted: bool
 
 
+class CleanupStaleDataResponse(BaseModel):
+    deleted_vectors: int = 0
+    deleted_chunks: int = 0
+    deleted_document_versions: int = 0
+    deleted_documents: int = 0
+    removed_graph_relations: int = 0
+    removed_graph_concepts: int = 0
+
+
+class CleanupStaleGraphResponse(BaseModel):
+    removed_relations: int = 0
+    removed_aliases: int = 0
+    removed_concepts: int = 0
+
+
+class DeleteCourseResponse(BaseModel):
+    deleted: bool
+    deleted_vectors: int = 0
+    deleted_trace_events: int = 0
+    deleted_agent_runs: int = 0
+    deleted_sessions: int = 0
+    deleted_ingestion_logs: int = 0
+    deleted_compensations: int = 0
+    deleted_jobs: int = 0
+    deleted_batches: int = 0
+    deleted_relations: int = 0
+    deleted_aliases: int = 0
+    deleted_concepts: int = 0
+    deleted_chunks: int = 0
+    deleted_document_versions: int = 0
+    deleted_documents: int = 0
+    deleted_courses: int = 0
+    deleted_directory: int = 0
+
+
 class RefreshResponse(BaseModel):
     course_id: str
     refreshed_at: datetime

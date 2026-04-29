@@ -4,11 +4,12 @@ import { useEffect, useMemo, useState, type MouseEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import type { CourseFileStatus, CourseFileSummary } from "@course-kg/shared";
-import { AlertCircle, CheckCircle2, Clock3, FileCheck2, Files, LoaderCircle, PanelRightOpen, RefreshCcw, Trash2, UploadCloud, X } from "lucide-react";
+import { AlertCircle, CheckCircle2, Clock3, Database, FileCheck2, Files, LoaderCircle, Network, PanelRightOpen, RefreshCcw, Trash2, UploadCloud, X } from "lucide-react";
 
-import { fetchBatchStatus, fetchCourseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, removeCourseFile, uploadFile } from "@/lib/api";
+import { cleanupStaleData, cleanupStaleGraph, fetchBatchStatus, fetchCourseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, removeCourseFile, uploadFile } from "@/lib/api";
 import { useCourseContext } from "@/components/course-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 
 type UploadedFile = {
@@ -109,6 +110,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const [logOpen, setLogOpen] = useState(false);
   const [logs, setLogs] = useState<IngestionLogEvent[]>([]);
   const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(() => new Set());
+  const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
+  const [cleanupDialog, setCleanupDialog] = useState<"data" | "graph" | null>(null);
 
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedCourseId],
@@ -199,6 +202,27 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       if (activeBatchId) {
         void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, activeBatchId] });
       }
+    },
+  });
+  const cleanupStaleDataMutation = useMutation({
+    mutationFn: () => cleanupStaleData(selectedCourseId),
+    onSuccess: (stats) => {
+      setCleanupMessage(
+        `旧数据清理完成：向量 ${stats.deleted_vectors}，chunks ${stats.deleted_chunks}，版本 ${stats.deleted_document_versions}，文档 ${stats.deleted_documents}，图谱关系 ${stats.removed_graph_relations}，图谱概念 ${stats.removed_graph_concepts}`,
+      );
+      void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["concepts", selectedCourseId] });
+    },
+  });
+  const cleanupStaleGraphMutation = useMutation({
+    mutationFn: () => cleanupStaleGraph(selectedCourseId),
+    onSuccess: (stats) => {
+      setCleanupMessage(`旧图谱清理完成：关系 ${stats.removed_relations}，别名 ${stats.removed_aliases}，概念 ${stats.removed_concepts}`);
+      void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["graph", selectedCourseId] });
+      void queryClient.invalidateQueries({ queryKey: ["concepts", selectedCourseId] });
     },
   });
 
@@ -371,6 +395,13 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     ],
     [],
   );
+  const cleanupPending = cleanupStaleDataMutation.isPending || cleanupStaleGraphMutation.isPending;
+  const cleanupError = (cleanupStaleDataMutation.error ?? cleanupStaleGraphMutation.error) as Error | null;
+  const cleanupTitle = cleanupDialog === "data" ? "清理数据库" : "清理图谱";
+  const cleanupDescription =
+    cleanupDialog === "data"
+      ? "清理当前课程的 inactive 数据库记录和 Qdrant stale 向量，当前有效数据会保留。"
+      : "清理当前课程的陈旧图谱关系和孤立概念，不会重建图谱。";
 
   if (dashboardQuery.isLoading) {
     return <LoadingBlock rows={4} />;
@@ -455,6 +486,10 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             ) : (
               <p className="text-xs uppercase tracking-[0.2em] text-white/36">按住 Shift 并左键点击文件可多选；未选择时解析按钮按原逻辑处理待解析/变更文件。</p>
             )}
+            {cleanupMessage ? <p className="text-xs leading-5 text-emerald-100/72">{cleanupMessage}</p> : null}
+            {cleanupStaleDataMutation.error || cleanupStaleGraphMutation.error ? (
+              <p className="text-xs leading-5 text-rose-100/72">{((cleanupStaleDataMutation.error ?? cleanupStaleGraphMutation.error) as Error).message}</p>
+            ) : null}
             {uploadMutation.isPending ? (
               <div className="max-w-md">
                 <div className="flex items-center justify-between text-xs uppercase tracking-[0.22em] text-white/45">
@@ -525,7 +560,39 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             <h3 className="mt-2 text-2xl font-semibold text-white">已入库文件导览</h3>
             <p className="mt-2 text-sm text-white/50">本课程 storage 文件夹中的文件会统一显示在这里。</p>
           </div>
-          <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">{fileItems.length} 个文件</span>
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setCleanupMessage(null);
+                cleanupStaleDataMutation.reset();
+                cleanupStaleGraphMutation.reset();
+                setCleanupDialog("data");
+              }}
+              disabled={!selectedCourseId || Boolean(activeBatchId) || cleanupStaleDataMutation.isPending || cleanupStaleGraphMutation.isPending}
+              className="inline-flex items-center gap-1.5 rounded-full border border-amber-200/18 bg-amber-300/[0.055] px-3 py-1.5 text-[11px] text-amber-50/72 transition hover:border-amber-200/36 hover:text-white disabled:pointer-events-none disabled:opacity-40"
+              title={activeBatchId ? "当前有导入批次运行，暂不能清理" : "清理 inactive 数据和 stale vectors"}
+            >
+              {cleanupStaleDataMutation.isPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Database className="size-3.5" />}
+              清理数据库
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setCleanupMessage(null);
+                cleanupStaleDataMutation.reset();
+                cleanupStaleGraphMutation.reset();
+                setCleanupDialog("graph");
+              }}
+              disabled={!selectedCourseId || Boolean(activeBatchId) || cleanupStaleDataMutation.isPending || cleanupStaleGraphMutation.isPending}
+              className="inline-flex items-center gap-1.5 rounded-full border border-cyan-200/18 bg-cyan-300/[0.055] px-3 py-1.5 text-[11px] text-cyan-50/72 transition hover:border-cyan-200/36 hover:text-white disabled:pointer-events-none disabled:opacity-40"
+              title={activeBatchId ? "当前有导入批次运行，暂不能清理" : "清理 stale graph relations"}
+            >
+              {cleanupStaleGraphMutation.isPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Network className="size-3.5" />}
+              清理图谱
+            </button>
+            <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">{fileItems.length} 个文件</span>
+          </div>
         </div>
 
         <div className="custom-scrollbar kg-rounded-scrollbar mt-5 min-h-[18rem] flex-1 overflow-y-auto overscroll-contain rounded-[24px] border border-white/8 bg-black/10 pr-1">
@@ -687,6 +754,64 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         </motion.div>
         </div>
       </section>
+
+      <Dialog
+        open={cleanupDialog !== null}
+        onOpenChange={(open) => {
+          if (!open && !cleanupPending) {
+            setCleanupDialog(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl" showCloseButton={!cleanupPending}>
+          <DialogHeader className="border-b border-white/8 px-6 py-5">
+            <DialogTitle>{cleanupTitle}</DialogTitle>
+            <DialogDescription>{cleanupDescription}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 px-6 py-5">
+            {cleanupPending ? (
+              <div>
+                <p className="text-sm text-white/72">{cleanupTitle}执行中...</p>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8">
+                  <div className="h-full w-2/3 animate-pulse rounded-full bg-[linear-gradient(90deg,#64dfff,#7b7cff,#64dfff)]" />
+                </div>
+              </div>
+            ) : cleanupMessage ? (
+              <p className="rounded-2xl border border-emerald-200/16 bg-emerald-300/[0.055] px-4 py-3 text-sm leading-6 text-emerald-50/78">{cleanupMessage}</p>
+            ) : (
+              <p className="rounded-2xl border border-white/10 bg-white/[0.035] px-4 py-3 text-sm leading-6 text-white/68">确认后会立即执行维护操作。</p>
+            )}
+            {cleanupError ? <p className="text-sm text-rose-100/78">{cleanupError.message}</p> : null}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={cleanupPending}
+                onClick={() => setCleanupDialog(null)}
+                className="rounded-full border border-white/12 px-4 py-2 text-sm text-white/70 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
+              >
+                {cleanupMessage ? "关闭" : "取消"}
+              </button>
+              {!cleanupMessage ? (
+                <button
+                  type="button"
+                  disabled={!selectedCourseId || cleanupPending}
+                  onClick={() => {
+                    setCleanupMessage(null);
+                    if (cleanupDialog === "data") {
+                      cleanupStaleDataMutation.mutate();
+                    } else if (cleanupDialog === "graph") {
+                      cleanupStaleGraphMutation.mutate();
+                    }
+                  }}
+                  className="rounded-full border border-cyan-200/24 bg-cyan-300/[0.08] px-4 py-2 text-sm text-cyan-50/82 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
+                >
+                  {cleanupPending ? "执行中..." : "确认执行"}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {logOpen ? (
         <div className="fixed inset-y-0 right-0 z-50 flex w-full justify-end bg-black/24 backdrop-blur-[2px] sm:w-auto sm:bg-transparent">

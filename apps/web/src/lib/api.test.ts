@@ -41,6 +41,42 @@ describe("api client", () => {
     expect(getBatchLogUrl("batch-1")).toBe("http://api.test/api/ingestion/batches/batch-1/logs?api_key=test-key");
   });
 
+  it("calls stale cleanup endpoints with API key headers", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ deleted_vectors: 1, deleted_chunks: 2, deleted_document_versions: 3, deleted_documents: 4, removed_graph_relations: 5, removed_graph_concepts: 6 }))
+      .mockResolvedValueOnce(jsonResponse({ removed_relations: 1, removed_aliases: 2, removed_concepts: 3 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { cleanupStaleData, cleanupStaleGraph } = await import("./api");
+
+    await cleanupStaleData("course-1");
+    await cleanupStaleGraph("course-1");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://api.test/api/maintenance/cleanup-stale-data?course_id=course-1",
+      expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://api.test/api/maintenance/cleanup-stale-graph?course_id=course-1",
+      expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),
+    );
+  });
+
+  it("deletes courses with API key headers", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ deleted: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { deleteCourse } = await import("./api");
+
+    await deleteCourse("course-1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/courses/course-1",
+      expect.objectContaining({ method: "DELETE", headers: { "X-API-Key": "test-key" } }),
+    );
+  });
+
   it("parses SSE stream chunks", async () => {
     const body = new ReadableStream({
       start(controller) {

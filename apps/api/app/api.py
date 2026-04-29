@@ -17,11 +17,14 @@ from app.schemas import (
     AgentRequest,
     AgentResponse,
     BatchStartResponse,
+    CleanupStaleDataResponse,
+    CleanupStaleGraphResponse,
     ConceptCard,
     CourseFileSummary,
     CourseCreateRequest,
     CourseSummary,
     DashboardSnapshot,
+    DeleteCourseResponse,
     DeleteResponse,
     GraphNodeDetail,
     GraphResponse,
@@ -60,6 +63,7 @@ from app.services.ingestion import (
     summarize_course,
 )
 from app.services.ingestion_logs import TERMINAL_LOG_EVENTS, list_ingestion_logs, subscribe_ingestion_logs, unsubscribe_ingestion_logs
+from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, cleanup_stale_graph, delete_course_data
 from app.services.retrieval import get_dashboard_snapshot, get_job_status, list_course_files, search_chunks
 from app.services.runtime_settings import model_settings_payload, update_model_settings
 from app.services.storage import save_upload
@@ -103,6 +107,16 @@ def create_course(request: CourseCreateRequest, db: Session = Depends(get_db)) -
     return summarize_course(db, course)
 
 
+@router.delete("/courses/{course_id}", response_model=DeleteCourseResponse)
+def delete_course(course_id: str, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, course_id)
+    try:
+        stats = delete_course_data(db, course)
+    except MaintenanceConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"deleted": True, **stats}
+
+
 @router.get("/courses/current/dashboard", response_model=DashboardSnapshot)
 @router.get("/courses/default/dashboard", response_model=DashboardSnapshot, include_in_schema=False)
 def course_dashboard(course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
@@ -128,6 +142,24 @@ def delete_course_file(source_path: str, course_id: str | None = None, db: Sessi
     if not remove_course_file(db, course, source_path):
         raise HTTPException(status_code=404, detail="File not found")
     return {"removed": True}
+
+
+@router.post("/maintenance/cleanup-stale-data", response_model=CleanupStaleDataResponse)
+def cleanup_course_stale_data(course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, course_id)
+    try:
+        return cleanup_stale_data(db, course.id, course.name)
+    except MaintenanceConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/maintenance/cleanup-stale-graph", response_model=CleanupStaleGraphResponse)
+def cleanup_course_stale_graph(course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, course_id)
+    try:
+        return cleanup_stale_graph(db, course.id)
+    except MaintenanceConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/courses/current/graph", response_model=GraphResponse)

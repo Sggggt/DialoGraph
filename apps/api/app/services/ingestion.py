@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
 from collections import Counter, OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.utils import source_type_from_path
 from app.models import Chunk, Concept, Course, Document, DocumentVersion, IngestionBatch, IngestionCompensationLog, IngestionJob
-from app.services.chunking import chunk_sections
+from app.services.chunking import EMBEDDING_TEXT_VERSION, chunk_sections_with_stats, embedding_text, normalize_for_dedup
 from app.services.concept_graph import get_concept_cards, get_graph_payload, graph_extraction_provider, rebuild_course_graph
 from app.services.embeddings import EmbeddingProvider, is_degraded_mode
 from app.services.ingestion_logs import emit_ingestion_log
@@ -611,6 +612,39 @@ def create_or_update_document(
     return document, version_number, stale_chunk_ids
 
 
+def document_dedup_key(title: str, checksum: str) -> tuple[str, str]:
+    return normalize_for_dedup(title), checksum
+
+
+def find_duplicate_document(db: Session, course_id: str, title: str, checksum: str, source_path: Path) -> Document | None:
+    normalized_title, checksum_value = document_dedup_key(title, checksum)
+    candidates = db.scalars(
+        select(Document).where(
+            Document.course_id == course_id,
+            Document.checksum == checksum_value,
+            Document.is_active.is_(True),
+        )
+    ).all()
+    source_path_string = str(source_path)
+    matches = [
+        document
+        for document in candidates
+        if document.source_path != source_path_string and normalize_for_dedup(document.title) == normalized_title
+    ]
+    return sorted(matches, key=lambda document: (len(document.source_path), document.source_path))[0] if matches else None
+
+
+def chunk_content_hash(content: str) -> str:
+    return hashlib.sha256(normalize_for_dedup(content).encode("utf-8", errors="ignore")).hexdigest()
+
+
+def active_chunk_hashes_for_course(db: Session, course_id: str, excluded_document_id: str | None = None) -> set[str]:
+    query = select(Chunk.content).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))
+    if excluded_document_id:
+        query = query.where(Chunk.document_id != excluded_document_id)
+    return {chunk_content_hash(content) for content in db.scalars(query).all()}
+
+
 async def ingest_file(
     db: Session,
     source_path: Path,
@@ -648,6 +682,8 @@ async def _ingest_file_locked(
     course = resolve_course(db, job.course_id if job is not None else course_id)
     course_paths = get_course_paths(course.name)
     checksum = compute_checksum(source_path)
+    source_title = source_path.stem
+    duplicate_document = find_duplicate_document(db, course.id, source_title, checksum, source_path)
 
     existing_document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(source_path)))
     active_version = None
@@ -666,6 +702,30 @@ async def _ingest_file_locked(
         job.source_path = str(source_path)
         job.trigger_source = trigger_source
         db.commit()
+
+    if duplicate_document is not None:
+        job.document_id = duplicate_document.id
+        job.status = "skipped"
+        job.error_message = None
+        job.stats = {
+            "chunks": 0,
+            "concepts": 0,
+            "relations": 0,
+            "source_type": duplicate_document.source_type,
+            "graph_rebuilt": False,
+            "deduplicated_document": True,
+            "duplicate_of_document_id": duplicate_document.id,
+            "duplicate_key": {"title": normalize_for_dedup(source_title), "checksum": checksum},
+            **embedding_audit_payload(configured_embedding_provider(), False, "duplicate_document", 0),
+        }
+        db.commit()
+        return {
+            "job_id": job.id,
+            "document_id": duplicate_document.id,
+            "status": "skipped",
+            "stats": job.stats,
+            "source_type": duplicate_document.source_type,
+        }
 
     if active_version and active_version.checksum == checksum and not force:
         chunk_count = db.query(Chunk).filter(Chunk.document_id == existing_document.id, Chunk.is_active.is_(True)).count() if existing_document else 0
@@ -722,9 +782,18 @@ async def _ingest_file_locked(
     extracted_json.write_text(json.dumps(sections_to_json(sections), ensure_ascii=False, indent=2), encoding="utf-8")
 
     set_job_state(db, job, "chunking", batch_id=batch_id)
-    chunk_payloads = chunk_sections(sections, chapter=chapter, source_type=source_type)
+    chunk_payloads, chunking_stats = chunk_sections_with_stats(sections, chapter=chapter, source_type=source_type)
+    existing_hashes = active_chunk_hashes_for_course(db, course.id, excluded_document_id=document.id)
+    seen_hashes = set(existing_hashes)
+    deduplicated_chunks = 0
     created_chunks: list[Chunk] = []
     for payload in chunk_payloads:
+        content_hash = chunk_content_hash(payload["content"])
+        if content_hash in seen_hashes:
+            deduplicated_chunks += 1
+            continue
+        seen_hashes.add(content_hash)
+        payload["metadata"]["content_hash"] = content_hash
         chunk = Chunk(
             course_id=course.id,
             document_id=document.id,
@@ -744,9 +813,47 @@ async def _ingest_file_locked(
         created_chunks.append(chunk)
     db.flush()
 
+    if not created_chunks:
+        job.document_id = document.id
+        job.status = "skipped"
+        job.error_message = None
+        job.stats = {
+            "chunks": 0,
+            "concepts": 0,
+            "relations": 0,
+            "source_type": source_type,
+            "chapter": chapter,
+            "version": version.version,
+            "graph_rebuilt": False,
+            "chunks_before_filter": chunking_stats["chunks_before_filter"],
+            "chunks_filtered": chunking_stats["chunks_filtered"],
+            "chunks_deduplicated": deduplicated_chunks,
+            "embedding_text_version": EMBEDDING_TEXT_VERSION,
+            **embedding_audit_payload(configured_embedding_provider(), False, "no_effective_chunks", 0),
+        }
+        db.commit()
+        return {
+            "job_id": job.id,
+            "document_id": document.id,
+            "status": "skipped",
+            "stats": job.stats,
+            "source_type": source_type,
+        }
+
     set_job_state(db, job, "embedding", batch_id=batch_id)
     embedder = EmbeddingProvider()
-    embedding_result = await embedder.embed_texts_with_meta([chunk.content for chunk in created_chunks], text_type="document")
+    embedding_inputs = [
+        embedding_text(
+            document_title=document.title,
+            chapter=chunk.chapter,
+            section=chunk.section,
+            source_type=source_type,
+            content_kind=chunk.metadata_json.get("content_kind"),
+            content=chunk.content,
+        )
+        for chunk in created_chunks
+    ]
+    embedding_result = await embedder.embed_texts_with_meta(embedding_inputs, text_type="document")
     embeddings = embedding_result.vectors
     emit_ingestion_log(
         batch_id or job.id,
@@ -780,6 +887,7 @@ async def _ingest_file_locked(
                     "difficulty": document.difficulty,
                     "content": chunk.content,
                     "content_kind": chunk.metadata_json.get("content_kind"),
+                    "embedding_text_version": EMBEDDING_TEXT_VERSION,
                 },
             }
         )
@@ -866,6 +974,10 @@ async def _ingest_file_locked(
         "source_type": source_type,
         "chapter": chapter,
         "version": version.version,
+        "chunks_before_filter": chunking_stats["chunks_before_filter"],
+        "chunks_filtered": chunking_stats["chunks_filtered"],
+        "chunks_deduplicated": deduplicated_chunks,
+        "embedding_text_version": EMBEDDING_TEXT_VERSION,
         **graph_stats,
         **embedding_audit_payload(
             embedding_result.provider,

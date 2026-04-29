@@ -1,6 +1,18 @@
 from __future__ import annotations
 
-from app.services.chunking import chunk_sections, infer_content_kind, normalize_text, split_text
+from app.services.chunking import (
+    CODE_CHUNK_OVERLAP,
+    CODE_CHUNK_SIZE,
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    EMBEDDING_TEXT_VERSION,
+    chunk_sections,
+    chunk_sections_with_stats,
+    embedding_text,
+    infer_content_kind,
+    normalize_text,
+    split_text,
+)
 from app.services.parsers import ParsedSection
 
 
@@ -19,8 +31,17 @@ def test_normalize_and_split_text_overlap():
 
 def test_content_kind_and_chunk_metadata():
     sections = [
-        ParsedSection(title="Code", text="[Code Cell]\nprint('x')", metadata={}),
-        ParsedSection(title="Text\x00", text="Course\x00 note text", metadata={"content_kind": "markdown", "raw": "a\x00b"}),
+        ParsedSection(
+            title="Centrality Code",
+            section="Degree centrality example",
+            text="[Code Cell]\n# centrality example\nprint('degree centrality for network nodes')",
+            metadata={},
+        ),
+        ParsedSection(
+            title="Text\x00",
+            text="Course\x00 note text about degree centrality and network representation.",
+            metadata={"content_kind": "markdown", "raw": "a\x00b"},
+        ),
     ]
     chunks = chunk_sections(sections, chapter="L1", source_type="notebook")
 
@@ -30,3 +51,46 @@ def test_content_kind_and_chunk_metadata():
     assert "\x00" not in chunks[1]["content"]
     assert chunks[1]["metadata"]["raw"] == "ab"
     assert all(chunk["chapter"] == "L1" for chunk in chunks)
+    assert all(chunk["metadata"]["chunking_strategy"] == "chunk_800_metadata_enriched_v1" for chunk in chunks)
+
+
+def test_default_chunk_sizes_are_best_eval_strategy():
+    assert DEFAULT_CHUNK_SIZE == 800
+    assert DEFAULT_CHUNK_OVERLAP == 120
+    assert CODE_CHUNK_SIZE == 700
+    assert CODE_CHUNK_OVERLAP == 100
+
+
+def test_chunk_sections_filters_noise_and_keeps_relevant_code():
+    sections = [
+        ParsedSection(title="Output", text="[Output]\n1\n2\n3", metadata={"content_kind": "output"}),
+        ParsedSection(title="Short", text="too short", metadata={"content_kind": "markdown"}),
+        ParsedSection(title="TOC", text="\n".join(["1", "2", "3", "4", "5", "6", "7", "8"]), metadata={"content_kind": "pdf_page"}),
+        ParsedSection(title="Bad", text="鐩" * 20 + " readable network material", metadata={"content_kind": "pdf_page"}),
+        ParsedSection(title="Generic Code", text="[Code Cell]\nprint('hello world from a utility cell')", metadata={}),
+        ParsedSection(title="Community Code", section="community detection", text="[Code Cell]\nprint('community detection centrality network')", metadata={}),
+        ParsedSection(title="Good", text="This paragraph explains degree centrality in complex networks with enough detail.", metadata={"content_kind": "markdown"}),
+    ]
+
+    chunks, stats = chunk_sections_with_stats(sections, chapter="L1", source_type="notebook")
+
+    assert stats["chunks_before_filter"] == 7
+    assert stats["chunks_filtered"] == 5
+    assert [chunk["section"] for chunk in chunks] == ["community detection", "Good"]
+
+
+def test_embedding_text_adds_metadata_without_changing_content():
+    text = embedding_text(
+        document_title="Centralities",
+        chapter="Lecture 3",
+        section="Degree",
+        source_type="notebook",
+        content_kind="markdown",
+        content="Degree centrality counts incident edges.",
+    )
+
+    assert "Document: Centralities" in text
+    assert "Chapter: Lecture 3" in text
+    assert "Content Kind: markdown" in text
+    assert text.endswith("Degree centrality counts incident edges.")
+    assert EMBEDDING_TEXT_VERSION == "metadata_enriched_v1"

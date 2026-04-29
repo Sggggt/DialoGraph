@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import shutil
+from dataclasses import dataclass
+
+from sqlalchemy import or_, select
+from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
+from app.models import (
+    AgentRun,
+    AgentTraceEvent,
+    Chunk,
+    Concept,
+    ConceptAlias,
+    ConceptRelation,
+    Course,
+    Document,
+    DocumentVersion,
+    IngestionBatch,
+    IngestionCompensationLog,
+    IngestionJob,
+    IngestionLog,
+    QASession,
+)
+from app.services.concept_graph import is_valid_concept
+from app.services.ingestion import active_batch_for_course
+from app.services.vector_store import VectorStore
+
+
+class MaintenanceConflict(RuntimeError):
+    pass
+
+
+@dataclass
+class GraphCleanupStats:
+    removed_relations: int = 0
+    removed_aliases: int = 0
+    removed_concepts: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "removed_relations": self.removed_relations,
+            "removed_aliases": self.removed_aliases,
+            "removed_concepts": self.removed_concepts,
+        }
+
+
+def ensure_no_active_batch(db: Session, course_id: str) -> None:
+    if active_batch_for_course(db, course_id) is not None:
+        raise MaintenanceConflict("Cannot run maintenance while an ingestion batch is active")
+
+
+def cleanup_stale_graph_references(db: Session, course_id: str) -> GraphCleanupStats:
+    relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
+    if not relations:
+        return GraphCleanupStats()
+
+    chunk_ids = {relation.evidence_chunk_id for relation in relations if relation.evidence_chunk_id}
+    chunks = {chunk.id: chunk for chunk in db.scalars(select(Chunk).where(Chunk.id.in_(chunk_ids))).all()} if chunk_ids else {}
+    document_ids = {chunk.document_id for chunk in chunks.values()}
+    documents = {document.id: document for document in db.scalars(select(Document).where(Document.id.in_(document_ids))).all()} if document_ids else {}
+
+    concept_ids = {
+        concept_id
+        for relation in relations
+        for concept_id in (relation.source_concept_id, relation.target_concept_id)
+        if concept_id
+    }
+    concepts = {concept.id: concept for concept in db.scalars(select(Concept).where(Concept.id.in_(concept_ids))).all()} if concept_ids else {}
+
+    stale_relation_ids: list[str] = []
+    affected_concept_ids: set[str] = set()
+    for relation in relations:
+        stale = False
+        source_concept = concepts.get(relation.source_concept_id)
+        target_concept = concepts.get(relation.target_concept_id or "")
+        if source_concept is None or not is_valid_concept(source_concept.canonical_name):
+            stale = True
+        if relation.target_concept_id and (target_concept is None or not is_valid_concept(target_concept.canonical_name)):
+            stale = True
+        if relation.evidence_chunk_id:
+            chunk = chunks.get(relation.evidence_chunk_id)
+            document = documents.get(chunk.document_id) if chunk else None
+            if chunk is None or not chunk.is_active or document is None or not document.is_active:
+                stale = True
+        if stale:
+            stale_relation_ids.append(relation.id)
+            affected_concept_ids.update(
+                concept_id
+                for concept_id in (relation.source_concept_id, relation.target_concept_id)
+                if concept_id
+            )
+
+    stats = GraphCleanupStats()
+    if stale_relation_ids:
+        stats.removed_relations = db.query(ConceptRelation).filter(ConceptRelation.id.in_(stale_relation_ids)).delete(synchronize_session=False)
+
+    if affected_concept_ids:
+        remaining_relations = db.scalars(
+            select(ConceptRelation).where(
+                ConceptRelation.course_id == course_id,
+                (
+                    ConceptRelation.source_concept_id.in_(affected_concept_ids)
+                    | ConceptRelation.target_concept_id.in_(affected_concept_ids)
+                ),
+            )
+        ).all()
+        still_referenced = {
+            concept_id
+            for relation in remaining_relations
+            for concept_id in (relation.source_concept_id, relation.target_concept_id)
+            if concept_id
+        }
+        orphan_concept_ids = sorted(affected_concept_ids - still_referenced)
+        if orphan_concept_ids:
+            stats.removed_aliases = db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(orphan_concept_ids)).delete(synchronize_session=False)
+            stats.removed_concepts = db.query(Concept).filter(
+                Concept.course_id == course_id,
+                Concept.id.in_(orphan_concept_ids),
+            ).delete(synchronize_session=False)
+
+    return stats
+
+
+def cleanup_stale_graph(db: Session, course_id: str) -> dict[str, int]:
+    ensure_no_active_batch(db, course_id)
+    stats = cleanup_stale_graph_references(db, course_id)
+    db.commit()
+    return stats.as_dict()
+
+
+def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[str, int]:
+    ensure_no_active_batch(db, course_id)
+    graph_stats = cleanup_stale_graph_references(db, course_id)
+
+    active_chunk_ids = set(
+        db.scalars(select(Chunk.id).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))).all()
+    )
+    vector_store = VectorStore(course_name=course_name)
+    stale_vector_ids = sorted(set(vector_store.list_ids(course_id)) - active_chunk_ids)
+    vector_store.delete(stale_vector_ids)
+
+    inactive_document_ids = set(
+        db.scalars(select(Document.id).where(Document.course_id == course_id, Document.is_active.is_(False))).all()
+    )
+    if inactive_document_ids:
+        db.query(IngestionJob).filter(IngestionJob.document_id.in_(inactive_document_ids)).update(
+            {"document_id": None},
+            synchronize_session=False,
+        )
+
+    inactive_version_ids = db.scalars(
+        select(DocumentVersion.id)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(
+            Document.course_id == course_id,
+            or_(DocumentVersion.is_active.is_(False), Document.is_active.is_(False)),
+        )
+    ).all()
+    deleted_chunks = db.query(Chunk).filter(Chunk.course_id == course_id, Chunk.is_active.is_(False)).delete(synchronize_session=False)
+    deleted_document_versions = (
+        db.query(DocumentVersion)
+        .filter(DocumentVersion.id.in_(inactive_version_ids))
+        .delete(synchronize_session=False)
+        if inactive_version_ids
+        else 0
+    )
+    deleted_documents = db.query(Document).filter(Document.course_id == course_id, Document.is_active.is_(False)).delete(synchronize_session=False)
+    db.commit()
+
+    return {
+        "deleted_vectors": len(stale_vector_ids),
+        "deleted_chunks": deleted_chunks,
+        "deleted_document_versions": deleted_document_versions,
+        "deleted_documents": deleted_documents,
+        "removed_graph_relations": graph_stats.removed_relations,
+        "removed_graph_concepts": graph_stats.removed_concepts,
+    }
+
+
+def delete_course_data(db: Session, course: Course) -> dict[str, int]:
+    ensure_no_active_batch(db, course.id)
+    settings = get_settings()
+    course_paths = settings.course_paths_for_name(course.name)
+    data_root = settings.data_root.resolve()
+    course_root = course_paths["course_root"].resolve()
+    if course_root != data_root and data_root not in course_root.parents:
+        raise RuntimeError(f"Refusing to delete course directory outside DATA_ROOT: {course_root}")
+
+    vector_store = VectorStore(course_name=course.name)
+    vector_ids = vector_store.list_ids(course.id)
+    vector_store.delete(vector_ids)
+
+    run_ids = db.scalars(select(AgentRun.id).where(AgentRun.course_id == course.id)).all()
+    batch_ids = db.scalars(select(IngestionBatch.id).where(IngestionBatch.course_id == course.id)).all()
+    concept_ids = db.scalars(select(Concept.id).where(Concept.course_id == course.id)).all()
+    document_ids = db.scalars(select(Document.id).where(Document.course_id == course.id)).all()
+
+    deleted_trace_events = db.query(AgentTraceEvent).filter(AgentTraceEvent.run_id.in_(run_ids)).delete(synchronize_session=False) if run_ids else 0
+    deleted_agent_runs = db.query(AgentRun).filter(AgentRun.course_id == course.id).delete(synchronize_session=False)
+    deleted_sessions = db.query(QASession).filter(QASession.course_id == course.id).delete(synchronize_session=False)
+
+    deleted_ingestion_logs = db.query(IngestionLog).filter(IngestionLog.batch_id.in_(batch_ids)).delete(synchronize_session=False) if batch_ids else 0
+    deleted_compensations = db.query(IngestionCompensationLog).filter(IngestionCompensationLog.course_id == course.id).delete(synchronize_session=False)
+    deleted_jobs = db.query(IngestionJob).filter(IngestionJob.course_id == course.id).delete(synchronize_session=False)
+    deleted_batches = db.query(IngestionBatch).filter(IngestionBatch.course_id == course.id).delete(synchronize_session=False)
+
+    deleted_relations = db.query(ConceptRelation).filter(ConceptRelation.course_id == course.id).delete(synchronize_session=False)
+    deleted_aliases = db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(concept_ids)).delete(synchronize_session=False) if concept_ids else 0
+    deleted_concepts = db.query(Concept).filter(Concept.course_id == course.id).delete(synchronize_session=False)
+
+    deleted_chunks = db.query(Chunk).filter(Chunk.course_id == course.id).delete(synchronize_session=False)
+    deleted_versions = db.query(DocumentVersion).filter(DocumentVersion.document_id.in_(document_ids)).delete(synchronize_session=False) if document_ids else 0
+    deleted_documents = db.query(Document).filter(Document.course_id == course.id).delete(synchronize_session=False)
+
+    db.delete(course)
+    db.commit()
+
+    deleted_directory = 0
+    if course_root.exists():
+        shutil.rmtree(course_root)
+        deleted_directory = 1
+
+    return {
+        "deleted_vectors": len(vector_ids),
+        "deleted_trace_events": deleted_trace_events,
+        "deleted_agent_runs": deleted_agent_runs,
+        "deleted_sessions": deleted_sessions,
+        "deleted_ingestion_logs": deleted_ingestion_logs,
+        "deleted_compensations": deleted_compensations,
+        "deleted_jobs": deleted_jobs,
+        "deleted_batches": deleted_batches,
+        "deleted_relations": deleted_relations,
+        "deleted_aliases": deleted_aliases,
+        "deleted_concepts": deleted_concepts,
+        "deleted_chunks": deleted_chunks,
+        "deleted_document_versions": deleted_versions,
+        "deleted_documents": deleted_documents,
+        "deleted_courses": 1,
+        "deleted_directory": deleted_directory,
+    }
