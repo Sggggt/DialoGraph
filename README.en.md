@@ -367,8 +367,8 @@ sequenceDiagram
     Web->>API: POST /api/files/upload or /api/ingestion/parse-uploaded-files
     API->>FS: Save archived copy
     API->>API: Parse document (PDF/PPTX/DOCX/MD/Notebook/OCR)
-    API->>API: Chunk sections (RecursiveCharacterTextSplitter)
-    API->>Model: Create embeddings (batch, async)
+    API->>API: Chunk, deduplicate and filter (text 800/120, code 700/100)
+    API->>Model: Create embeddings from metadata-enriched text (batch, async)
     API->>Qdrant: Upsert vectors
     API->>DB: Store documents, versions, chunks (commit)
     API->>Model: Extract concept graph payload (Semaphore-throttled)
@@ -386,8 +386,8 @@ flowchart TB
         direction TB
         SRC["Source Files<br/>PDF / PPTX / DOCX / MD / Notebook / HTML / Images"]
         SRC --> PARSE["Document Parsers<br/>Structured extraction + OCR"]
-        PARSE --> CHUNK["Semantic Chunking<br/>RecursiveCharacterTextSplitter<br/>chunk_size=1200, overlap=150"]
-        CHUNK --> EMB["Embedding<br/>OpenAI-compatible API<br/>async batched + hash fallback"]
+        PARSE --> CHUNK["Semantic Chunking + Dedup/Filter<br/>text=800/120<br/>code=700/100"]
+        CHUNK --> EMB["Metadata-Enriched Embedding<br/>Document / Chapter / Section / Source Type / Content Kind<br/>DB chunk.content stays original"]
         CHUNK --> META["Metadata Extraction<br/>chapter / type / page / title"]
         EMB --> VEC_W[("Vector Store Write<br/>Qdrant / FallbackJSON")]
         META --> DB_W[("Relational DB Write<br/>Document, Chunk")]
@@ -437,7 +437,9 @@ flowchart TB
 
 | Stage | Mechanism | Details |
 |-------|-----------|---------|
-| Chunking | Content-type adaptive | Code blocks 900 chars, text 1200 chars, Markdown uses heading-level separators |
+| Chunking | Evaluated best strategy `chunk_800_metadata_enriched_v1` | Text uses `chunk_size=800, overlap=120`; code uses `chunk_size=700, overlap=100`; recursive separators and Markdown heading hierarchy are still used |
+| Dedup / filtering | Document-level and chunk-level cleanup | Documents deduplicate by normalized title + checksum; chunks deduplicate by normalized content hash; filters TOC pages, page/figure numbers, mojibake, short low-information blocks, notebook output and low-information pure code |
+| Embedding text | Metadata-enriched while preserving stored content | Embedding input prepends Document / Chapter / Section / Source Type / Content Kind; `chunks.content` remains the original chunk text; Qdrant payload marks `embedding_text_version=metadata_enriched_v1` |
 | Embedding | Async batched + 3-tier fallback | OpenAI-compatible API → retry (429/5xx) → deterministic hash fallback |
 | Retrieval | Dense + lexical + RRF fusion | Two independent recall paths, RRF (k=60) fusion ranking to avoid single-path misses |
 | Grading | Term overlap + content-type weighting | Text +1.1 / code -1.8 / title match +1.4 |

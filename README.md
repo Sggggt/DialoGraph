@@ -367,8 +367,8 @@ sequenceDiagram
     前端->>API: POST /api/files/upload 或 /api/ingestion/parse-uploaded-files
     API->>文件存储: 保存归档副本
     API->>API: 解析文档（PDF/PPTX/DOCX/MD/Notebook/OCR）
-    API->>API: 切块（RecursiveCharacterTextSplitter）
-    API->>模型: 批量异步生成向量
+    API->>API: 切块、去重和过滤（text 800/120，code 700/100）
+    API->>模型: 使用元数据增强文本批量异步生成向量
     API->>Qdrant: 写入向量
     API->>数据库: 存储文档、版本、切块（commit）
     API->>模型: 抽取概念图谱（Semaphore 限流）
@@ -385,8 +385,8 @@ flowchart TB
         direction TB
         SRC["源文件<br/>PDF / PPTX / DOCX / MD / Notebook / HTML / 图片"]
         SRC --> PARSE["文档解析器<br/>结构化提取 + OCR"]
-        PARSE --> CHUNK["语义切块<br/>RecursiveCharacterTextSplitter<br/>chunk_size=1200, overlap=150"]
-        CHUNK --> EMB["向量化<br/>OpenAI 兼容 API<br/>批量异步 + 降级哈希"]
+        PARSE --> CHUNK["语义切块 + 去重/过滤<br/>text=800/120<br/>code=700/100"]
+        CHUNK --> EMB["元数据增强向量化<br/>Document / Chapter / Section / Source Type / Content Kind<br/>DB chunk.content 保持原文"]
         CHUNK --> META["元数据提取<br/>章节 / 类型 / 页码 / 标题"]
         EMB --> VEC_W[("向量存储写入<br/>Qdrant / FallbackJSON")]
         META --> DB_W[("关系数据库写入<br/>Document, Chunk")]
@@ -436,7 +436,9 @@ flowchart TB
 
 | 阶段 | 关键机制 | 说明 |
 |------|----------|------|
-| 切块 | 按内容类型自适应 | 代码块 900 字符、文本 1200 字符，Markdown 使用标题层级分隔 |
+| 切块 | 评测优选策略 `chunk_800_metadata_enriched_v1` | 普通文本 `chunk_size=800, overlap=120`；代码块 `chunk_size=700, overlap=100`；继续使用递归分隔符和 Markdown 标题层级 |
+| 去重/过滤 | 文档与 chunk 两层清理 | 文档按规范化标题 + checksum 去重；chunk 按规范化内容 hash 去重；过滤目录页、页码/图号、乱码、过短低信息块、notebook output 和低信息纯代码 |
+| 向量文本 | 元数据增强，原文入库 | embedding input 追加 Document / Chapter / Section / Source Type / Content Kind；`chunks.content` 保持原始 chunk 文本，Qdrant payload 标记 `embedding_text_version=metadata_enriched_v1` |
 | 向量化 | 批量异步 + 三级降级 | OpenAI 兼容 API → 重试（429/5xx）→ 确定性哈希降级 |
 | 检索 | 稠密 + 词法 + RRF 融合 | 两路独立召回，RRF（k=60）融合排序，避免单路漏召 |
 | 评分 | 词项重叠 + 内容类型加权 | 文本 +1.1 / 代码 -1.8 / 标题命中 +1.4 |
