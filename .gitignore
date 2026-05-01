@@ -17,6 +17,7 @@ venv/
 .vscode/
 .playwright-cli/
 output/
+retrieval_architecture.md
 *.pyc
 *.pyo
 *.pyd
