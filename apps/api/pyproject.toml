@@ -28,7 +28,8 @@ dependencies = [
   "markdown>=3.7",
   "beautifulsoup4>=4.12.3",
   "networkx>=3.4.2",
-  "portalocker>=3.0.0"
+  "portalocker>=3.0.0",
+  "sentence-transformers>=3.3.1"
 ]
 
 [project.optional-dependencies]

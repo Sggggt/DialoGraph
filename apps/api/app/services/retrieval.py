@@ -4,6 +4,7 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from rank_bm25 import BM25Okapi
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -14,6 +15,7 @@ from app.schemas import Citation, SearchFilters
 from app.services.concept_graph import get_graph_payload
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode
 from app.services.parsers import derive_chapter, is_invalid_chapter_label
+from app.services.reranker import RerankerProvider
 from app.services.vector_store import VectorStore
 
 
@@ -36,6 +38,14 @@ STORAGE_ALLOWED_SUFFIXES = {
 STORAGE_EXCLUDED_PARTS = {"output", "tmp", "scripts", ".ipynb_checkpoints", "__pycache__"}
 STORAGE_IGNORED_NAMES = {".ds_store"}
 TERMINAL_BATCH_STATES = {"completed", "failed", "partial_failed", "skipped"}
+QUERY_TYPE_CONFIG = {
+    "definition": {"alpha": 0.85, "recall_k": 60},
+    "formula": {"alpha": 0.30, "recall_k": 80},
+    "example": {"alpha": 0.70, "recall_k": 60},
+    "comparison": {"alpha": 0.75, "recall_k": 80},
+    "procedure": {"alpha": 0.75, "recall_k": 60},
+    "default": {"alpha": 0.72, "recall_k": 64},
+}
 
 
 def should_include_storage_file(path: Path) -> bool:
@@ -70,6 +80,62 @@ def score_chunk_bonus(chunk: Chunk, document: Document, query: str) -> float:
     if chunk.section and query.lower() in chunk.section.lower():
         bonus += 0.7
     return bonus
+
+
+def tokenize_for_retrieval(text: str) -> list[str]:
+    tokens = re.findall(
+        r"[a-zA-Z][a-zA-Z0-9_\-]*|[0-9]+(?:\.[0-9]+)?|[α-ωΑ-Ω]+|[\u4e00-\u9fff]|[=<>+\-*/^()]+",
+        text.lower(),
+    )
+    return [token for token in tokens if token.strip() and (len(token) > 1 or re.match(r"[\u4e00-\u9fff=<>+\-*/^()]", token))]
+
+
+def classify_query_type(query: str) -> str:
+    lower = query.lower()
+    if any(marker in lower for marker in ("what is", "define", "definition", "meaning", "concept", "什么是", "定义", "概念")):
+        return "definition"
+    if (
+        any(marker in lower for marker in ("formula", "theorem", "proof", "derive", "equation", "complexity", "o(", "公式", "定理", "证明"))
+        or re.search(r"[=∑∫√λθπσμ]|p\(|q\(|\\", query)
+    ):
+        return "formula"
+    if any(marker in lower for marker in ("example", "instance", "case", "举例", "例子")):
+        return "example"
+    if any(marker in lower for marker in ("compare", "versus", "vs", "difference", "relationship", "relate", "区别", "比较", "关系")):
+        return "comparison"
+    if any(marker in lower for marker in ("algorithm", "procedure", "steps", "how to", "流程", "步骤", "算法")):
+        return "procedure"
+    return "default"
+
+
+def query_type_config(query: str) -> dict:
+    settings = get_settings()
+    query_type = classify_query_type(query)
+    config = dict(QUERY_TYPE_CONFIG[query_type])
+    if query_type == "formula":
+        config["recall_k"] = settings.retrieval_recall_k_formula
+    elif query_type == "default":
+        config["recall_k"] = settings.retrieval_recall_k_default
+    config["query_type"] = query_type
+    return config
+
+
+def normalize_scores(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    low = min(values)
+    high = max(values)
+    if high == low:
+        return [1.0 for _ in values]
+    return [(value - low) / (high - low) for value in values]
+
+
+def clone_for_fusion(item: dict) -> dict:
+    clone = item.copy()
+    clone["metadata"] = dict(item.get("metadata") or {})
+    clone["metadata"]["scores"] = dict(clone["metadata"].get("scores") or {})
+    clone["score"] = 0.0
+    return clone
 
 
 def build_search_payload(chunk: Chunk, document: Document, query: str, score: float, scores: dict | None = None) -> dict:
@@ -140,44 +206,65 @@ async def search_chunks(db: Session, course_id: str, query: str, filters: Search
 
 async def hybrid_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
     settings = get_settings()
+    config = query_type_config(query)
+    recall_k = max(int(config["recall_k"]), top_k)
     dense_results: list[dict] = []
     if is_degraded_mode() and not settings.enable_model_fallback:
         raise RuntimeError("OPENAI_API_KEY is required for search because ENABLE_MODEL_FALLBACK is false")
     if not is_degraded_mode():
         try:
-            dense_results = await dense_search_chunks(db, course_id, query, filters, max(top_k * 4, top_k))
+            dense_results = await dense_search_chunks(db, course_id, query, filters, recall_k)
         except Exception:
             if not settings.enable_model_fallback:
                 raise
             dense_results = []
-    lexical_results = lexical_search_chunks(db, course_id, query, filters, max(top_k * 4, top_k))
+    lexical_results = lexical_search_chunks(db, course_id, query, filters, recall_k)
     if not dense_results:
         return lexical_results[:top_k]
     if not lexical_results:
-        return dense_results[:top_k]
+        return RerankerProvider.get().rerank(query, dense_results, top_k)
 
-    rrf_k = 60
+    candidates = weighted_score_fusion(
+        dense_results,
+        lexical_results,
+        alpha=float(config["alpha"]),
+        top_n=max(recall_k, top_k),
+    )
+    for item in candidates:
+        item.setdefault("metadata", {}).setdefault("scores", {})["query_type"] = config["query_type"]
+    return RerankerProvider.get().rerank(query, candidates, top_k)
+
+
+def weighted_score_fusion(dense_results: list[dict], lexical_results: list[dict], alpha: float, top_n: int) -> list[dict]:
     fused: dict[str, dict] = {}
-    for rank, item in enumerate(dense_results, start=1):
+    dense_values = [float(item.get("metadata", {}).get("scores", {}).get("dense", item["score"])) for item in dense_results]
+    lexical_values = [float(item.get("metadata", {}).get("scores", {}).get("bm25", item["score"])) for item in lexical_results]
+    dense_norm = normalize_scores(dense_values)
+    lexical_norm = normalize_scores(lexical_values)
+    for item, normalized_score in zip(dense_results, dense_norm):
         chunk_id = item["chunk_id"]
-        fused.setdefault(chunk_id, item)
+        fused.setdefault(chunk_id, clone_for_fusion(item))
         scores = fused[chunk_id].setdefault("metadata", {}).setdefault("scores", {})
         scores["dense"] = item.get("metadata", {}).get("scores", {}).get("dense", item["score"])
-        scores["rrf_dense"] = 1 / (rrf_k + rank)
-    for rank, item in enumerate(lexical_results, start=1):
+        scores["dense_norm"] = normalized_score
+        scores["fusion_alpha"] = alpha
+        fused[chunk_id]["score"] = float(fused[chunk_id].get("score", 0.0)) + (alpha * normalized_score)
+    for item, normalized_score in zip(lexical_results, lexical_norm):
         chunk_id = item["chunk_id"]
-        fused.setdefault(chunk_id, item)
+        fused.setdefault(chunk_id, clone_for_fusion(item))
         scores = fused[chunk_id].setdefault("metadata", {}).setdefault("scores", {})
+        lexical_score = item.get("metadata", {}).get("scores", {}).get("bm25", item["score"])
+        scores["bm25"] = lexical_score
         scores["lexical"] = item.get("metadata", {}).get("scores", {}).get("lexical", item["score"])
-        scores["rrf_lexical"] = 1 / (rrf_k + rank)
+        scores["bm25_norm"] = normalized_score
+        scores["fusion_alpha"] = alpha
+        fused[chunk_id]["score"] = float(fused[chunk_id].get("score", 0.0)) + ((1.0 - alpha) * normalized_score)
 
     for item in fused.values():
         scores = item.setdefault("metadata", {}).setdefault("scores", {})
-        fused_score = float(scores.get("rrf_dense", 0.0)) + float(scores.get("rrf_lexical", 0.0))
-        scores["fused"] = fused_score
-        item["score"] = fused_score + (0.001 * item.get("score", 0.0))
+        scores["fused"] = float(item["score"])
     ranked = sorted(fused.values(), key=lambda item: item["score"], reverse=True)
-    return ranked[:top_k]
+    return ranked[:top_n]
 
 
 async def graph_enhanced_search(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
@@ -265,30 +352,36 @@ async def graph_enhanced_search(db: Session, course_id: str, query: str, filters
 
 
 def lexical_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
-    query_terms = [term for term in re.findall(r"[a-zA-Z0-9_]+", query.lower()) if len(term) > 2]
-    chunks = db.scalars(
-        select(Chunk)
-        .where(Chunk.course_id == course_id, Chunk.is_active.is_(True))
+    query_terms = tokenize_for_retrieval(query)
+    rows = db.execute(
+        select(Chunk, Document)
+        .join(Document, Chunk.document_id == Document.id)
+        .where(Chunk.course_id == course_id, Chunk.is_active.is_(True), Document.is_active.is_(True))
         .order_by(Chunk.created_at.desc())
     ).all()
-    scored: list[dict] = []
-    for chunk in chunks:
-        document = db.get(Document, chunk.document_id)
-        if document is None:
-            continue
+    corpus: list[list[str]] = []
+    chunk_documents: list[tuple[Chunk, Document]] = []
+    for chunk, document in rows:
         if filters.chapter and chunk.chapter != filters.chapter:
             continue
         if filters.source_type and chunk.source_type != filters.source_type:
             continue
         if filters.tags and not set(filters.tags).intersection(set(document.tags or [])):
             continue
-        section_text = chunk.section or ""
-        haystack = f"{document.title}\n{section_text}\n{chunk.content}".lower()
-        overlap = sum(haystack.count(term) for term in query_terms)
-        if overlap <= 0 and query.lower() not in haystack:
+        corpus.append(tokenize_for_retrieval(f"{document.title}\n{chunk.section or ''}\n{chunk.content}"))
+        chunk_documents.append((chunk, document))
+    if not query_terms or not corpus:
+        return []
+    bm25 = BM25Okapi(corpus)
+    bm25_scores = bm25.get_scores(query_terms)
+    scored: list[dict] = []
+    for idx, (chunk, document) in enumerate(chunk_documents):
+        bm25_score = float(bm25_scores[idx])
+        overlap = sum(corpus[idx].count(term) for term in query_terms)
+        if bm25_score <= 0 and overlap <= 0:
             continue
-        score = float(overlap + (3 if query.lower() in haystack else 0)) + score_chunk_bonus(chunk, document, query)
-        scored.append(build_search_payload(chunk, document, query, score, {"lexical": score}))
+        score = bm25_score + (0.05 * overlap) + score_chunk_bonus(chunk, document, query)
+        scored.append(build_search_payload(chunk, document, query, score, {"bm25": bm25_score, "lexical_overlap": overlap, "lexical": score}))
     scored.sort(key=lambda item: item["score"], reverse=True)
     return scored[:top_k]
 

@@ -17,7 +17,7 @@ flowchart TB
     subgraph API_RUNTIME["后端运行时"]
         API --> ROUTES["API 路由<br/>课程 / 文件 / 搜索 / 问答 / 图谱"]
         ROUTES --> INGEST["导入服务<br/>解析 → inactive DB 版本 → 向量 upsert → 激活"]
-        ROUTES --> RETRIEVAL["检索服务<br/>稠密检索 + 词法检索 + RRF + GraphRAG 1 跳扩展"]
+        ROUTES --> RETRIEVAL["检索服务<br/>Dense 向量召回 + BM25 词面召回 + WSF 融合 + bge-reranker 重排"]
         ROUTES --> AGENT["LangGraph 智能体<br/>改写 / 路由 / 评分 / 回答 / 实时轨迹"]
         INGEST --> PARSERS["文档解析器<br/>PDF / PPTX / DOCX / Markdown / Notebook / OCR"]
         INGEST --> GRAPH["概念图谱构建器<br/>概念 + 关系"]
@@ -51,7 +51,12 @@ flowchart TB
         LLM["OpenAI 兼容端点<br/>DashScope / OpenAI / 兼容 API"]
     end
 
+    subgraph LOCAL_MODEL["本地模型缓存"]
+        RERANKER["Cross-Encoder reranker<br/>BAAI/bge-reranker-v2-m3"]
+    end
+
     API -->|向量化 / 对话 / 图谱抽取| LLM
+    RETRIEVAL -->|top-N 重排| RERANKER
 ```
 
 ## 项目组成
@@ -220,6 +225,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
 EMBEDDING_DIMENSIONS=1024
+RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
@@ -241,6 +247,28 @@ npm install
 ```powershell
 cd apps/api
 uv sync
+```
+
+首次启用检索重排前，需要下载 Cross-Encoder reranker 模型。推荐显式设置 `HF_HOME`，这样模型缓存位置可控；如果不设置，Hugging Face 会使用当前用户的默认缓存目录。
+
+```powershell
+cd apps/api
+$env:HF_HOME="C:\Study\KnowledgeGraph\models\huggingface"
+# 国内网络可选：
+# $env:HF_ENDPOINT="https://hf-mirror.com"
+@'
+from sentence_transformers import CrossEncoder
+CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512)
+print("BAAI/bge-reranker-v2-m3 downloaded")
+'@ | .\.venv\Scripts\python.exe -
+```
+
+启动 API 时如果希望复用上述缓存，也需要带上相同的 `HF_HOME`：
+
+```powershell
+cd apps/api
+$env:HF_HOME="C:\Study\KnowledgeGraph\models\huggingface"
+uv run uvicorn app.main:app --reload
 ```
 
 如需后台导入功能，安装 Worker 依赖：
@@ -396,18 +424,19 @@ flowchart TB
 
     subgraph QRY["在线查询阶段 - 用户提问时执行"]
         direction TB
-        Q["用户问题"] --> QA["查询分析<br/>分词 / 意图识别"]
+        Q["用户问题"] --> QA["查询分析<br/>分词 / 意图识别 / query type"]
         QA --> ROUTE{"路由决策"}
         ROUTE -->|直答 / 澄清| DIRECT["直接回答<br/>无需检索"]
         ROUTE -->|笔记 / 习题 / 通用| REWRITE["查询改写<br/>LLM 上下文消歧"]
         ROUTE -->|多跳 / 比较 / 关系| MULTI_HOP["多跳拆解<br/>子查询生成"]
         REWRITE --> DENSE["稠密检索<br/>向量相似度"]
-        REWRITE --> LEX["词法检索<br/>BM25 式全文匹配"]
+        REWRITE --> LEX["BM25 词面检索<br/>数据库 active chunks"]
         MULTI_HOP --> DENSE
         MULTI_HOP --> LEX
-        DENSE --> RRF["RRF 融合排序<br/>k=60"]
-        LEX --> RRF
-        RRF --> GRAPH_EXT["GraphRAG 扩展<br/>(仅多跳) 1跳邻居提权"]
+        DENSE --> WSF["WSF 融合排序<br/>query type alpha + min-max 归一化"]
+        LEX --> WSF
+        WSF --> RERANK["Cross-Encoder 重排<br/>BAAI/bge-reranker-v2-m3"]
+        RERANK --> GRAPH_EXT["GraphRAG 扩展<br/>待升级：暂不作为主检索排序路径"]
         GRAPH_EXT --> GRADE["文档评分<br/>词项重叠 + 分数阈值"]
         GRADE -->|文档不足, 重试次数不足| RETRY["重试规划<br/>扩展查询词"]
         RETRY --> DENSE
@@ -428,7 +457,7 @@ flowchart TB
     GRAPH_W -.-> KG
     DENSE --> VEC
     LEX --> DB
-    GRAPH_EXT --> KG
+    GRAPH_EXT -. "待升级" .-> KG
     GRADE -->|二次验证| DB
 ```
 
@@ -439,22 +468,25 @@ flowchart TB
 | 切块 | 评测优选策略 `chunk_800_metadata_enriched_v1` | 普通文本 `chunk_size=800, overlap=120`；代码块 `chunk_size=700, overlap=100`；继续使用递归分隔符和 Markdown 标题层级 |
 | 去重/过滤 | 文档与 chunk 两层清理 | 文档按规范化标题 + checksum 去重；chunk 按规范化内容 hash 去重；过滤目录页、页码/图号、乱码、过短低信息块、notebook output 和低信息纯代码 |
 | 向量文本 | 元数据增强，原文入库 | embedding input 追加 Document / Chapter / Section / Source Type / Content Kind；`chunks.content` 保持原始 chunk 文本，Qdrant payload 标记 `embedding_text_version=metadata_enriched_v1` |
-| 向量化 | 批量异步 + 三级降级 | OpenAI 兼容 API → 重试（429/5xx）→ 确定性哈希降级 |
-| 检索 | 稠密 + 词法 + RRF 融合 | 两路独立召回，RRF（k=60）融合排序，避免单路漏召 |
+| 向量化 | 批量异步；fallback 默认禁用 | OpenAI 兼容 API；`ENABLE_MODEL_FALLBACK=false` 时失败直接暴露，不静默降级 |
+| 检索 | Dense + BM25 + WSF + reranker | 两路独立召回，按 query type 配置 Dense/BM25 权重，min-max 归一化后 WSF 融合，再用 `BAAI/bge-reranker-v2-m3` 重排 |
 | 评分 | 词项重叠 + 内容类型加权 | 文本 +1.1 / 代码 -1.8 / 标题命中 +1.4 |
 | 一致性 | 检索二次验证 | 向量结果与数据库交叉验证，过滤已删除和不活跃切块 |
-| 图谱 | 单事务全量重建 | DELETE→INSERT→COMMIT，ACID 合规 |
+| 图谱 | 单事务全量重建；GraphRAG 待升级 | DELETE→INSERT→COMMIT，ACID 合规；图谱浏览和关系存储已可用，图谱增强检索仍需进一步评估和升级后再纳入主排序链路 |
 
 ### GraphRAG 工作流
 
-当查询被路由到“多跳/关系”分支时，系统将激活图谱增强检索（GraphRAG）。以下是其单跳扩展（1-Hop Expansion）的具体运行机制：
+当前图谱构建、图谱浏览和关系存储已落地，但 GraphRAG 增强检索仍标记为待升级能力。上一轮评估显示，直接把图谱邻居扩展并入主排序链路可能带来噪声，因此当前主检索路径优先使用 Dense + BM25 + WSF + reranker；GraphRAG 后续应升级为“语义门控 + 证据支持校验 + 重排后注入”的受控路径。
+
+计划升级后的单跳扩展（1-Hop Expansion）机制如下：
 
 ```mermaid
 graph LR
     BASE[混合检索基础 Chunk] --> REL[提取关联的 1 跳邻居关系]
     REL --> NEW[发现新证据 Chunk]
     NEW --> BOOST[计算图谱提权分]
-    BOOST --> MERGE[与基础结果融合重排]
+    BOOST --> VERIFY[证据支持校验]
+    VERIFY --> MERGE[与基础结果受控融合重排]
     BASE --> MERGE
 ```
 
@@ -466,8 +498,8 @@ graph LR
     B -->|常规检索| C[查询改写器]
     B -->|多跳/关系| C2[多跳拆解器]
     B -->|直答/澄清| G[答案生成器]
-    C --> D[混合检索器<br/>Dense+Lexical+RRF]
-    C2 --> D2[图谱增强检索器<br/>+ GraphRAG]
+    C --> D[混合检索器<br/>Dense+BM25+WSF+reranker]
+    C2 --> D2[图谱增强检索器<br/>GraphRAG 待升级]
     D --> E[文档评分器]
     D2 --> E
     E -->|有文档| F[上下文合成器]

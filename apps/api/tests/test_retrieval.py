@@ -84,7 +84,7 @@ def test_force_reparse_batch_marks_existing_files_pending(db_session, sample_cou
 
 
 @pytest.mark.asyncio
-async def test_hybrid_search_rrf_fusion(db_session, sample_course, indexed_chunks, monkeypatch):
+async def test_hybrid_search_uses_weighted_fusion_and_rerank(db_session, sample_course, indexed_chunks, monkeypatch):
     from app.services import retrieval
     from app.services.retrieval import hybrid_search_chunks
 
@@ -105,10 +105,19 @@ async def test_hybrid_search_rrf_fusion(db_session, sample_course, indexed_chunk
     async def fake_dense_search(db, course_id, query, filters, top_k):
         return [dense_payload]
 
+    class FakeReranker:
+        def rerank(self, query, candidates, top_k):
+            for item in candidates:
+                item.setdefault("metadata", {}).setdefault("scores", {})["rerank"] = item["score"]
+            return sorted(candidates, key=lambda item: item["score"], reverse=True)[:top_k]
+
     monkeypatch.setattr(retrieval, "dense_search_chunks", fake_dense_search)
+    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: FakeReranker()))
 
     results = await hybrid_search_chunks(db_session, sample_course.id, "degree centrality", SearchFilters(), 2)
     result_ids = {item["chunk_id"] for item in results}
     assert chunks[0].id in result_ids
     assert chunks[1].id in result_ids
     assert any("fused" in item["metadata"]["scores"] for item in results)
+    assert all("rerank" in item["metadata"]["scores"] for item in results)
+    assert all("query_type" in item["metadata"]["scores"] for item in results)

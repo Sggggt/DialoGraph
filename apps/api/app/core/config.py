@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     graph_extraction_chunk_limit: int = Field(default=72, ge=1, le=200)
     graph_extraction_chunks_per_document: int = Field(default=2, ge=1, le=10)
     enable_model_fallback: bool = False
+    retrieval_recall_k_default: int = Field(default=64, ge=1, le=200)
+    retrieval_recall_k_formula: int = Field(default=80, ge=1, le=200)
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_device: str = "cpu"
+    reranker_max_length: int = Field(default=512, ge=64, le=2048)
+    reranker_text_chars: int = Field(default=1800, ge=128, le=8000)
 
     @property
     def cors_origin_list(self) -> list[str]:

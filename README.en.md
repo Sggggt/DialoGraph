@@ -17,7 +17,7 @@ flowchart TB
     subgraph API_RUNTIME["API Runtime"]
         API --> ROUTES["API Routes<br/>courses / files / search / qa / graph"]
         ROUTES --> INGEST["Ingestion Service<br/>parse -> inactive DB version -> vector upsert -> activate"]
-        ROUTES --> RETRIEVAL["Retrieval Service<br/>dense + lexical + RRF + 1-hop GraphRAG"]
+        ROUTES --> RETRIEVAL["Retrieval Service<br/>Dense vector recall + BM25 lexical recall + WSF fusion + bge-reranker"]
         ROUTES --> AGENT["LangGraph Agent<br/>rewrite / route / grade / answer / live trace"]
         INGEST --> PARSERS["Document Parsers<br/>PDF / PPTX / DOCX / Markdown / Notebook / OCR"]
         INGEST --> GRAPH["Concept Graph Builder<br/>concepts + relations"]
@@ -51,7 +51,12 @@ flowchart TB
         LLM["OpenAI-compatible endpoint<br/>DashScope / OpenAI / compatible APIs"]
     end
 
+    subgraph LOCAL_MODEL["Local Model Cache"]
+        RERANKER["Cross-Encoder reranker<br/>BAAI/bge-reranker-v2-m3"]
+    end
+
     API -->|embeddings / chat / graph extraction| LLM
+    RETRIEVAL -->|top-N reranking| RERANKER
 ```
 
 ## Components
@@ -220,6 +225,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
 EMBEDDING_DIMENSIONS=1024
+RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
@@ -241,6 +247,28 @@ Install API dependencies:
 ```powershell
 cd apps/api
 uv sync
+```
+
+Before enabling retrieval reranking, download the Cross-Encoder reranker model. Setting `HF_HOME` explicitly is recommended so the cache location is predictable; otherwise Hugging Face uses the current user's default cache directory.
+
+```powershell
+cd apps/api
+$env:HF_HOME="C:\Study\KnowledgeGraph\models\huggingface"
+# Optional for mainland China networks:
+# $env:HF_ENDPOINT="https://hf-mirror.com"
+@'
+from sentence_transformers import CrossEncoder
+CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512)
+print("BAAI/bge-reranker-v2-m3 downloaded")
+'@ | .\.venv\Scripts\python.exe -
+```
+
+When starting the API, keep the same `HF_HOME` if you want to reuse that cache:
+
+```powershell
+cd apps/api
+$env:HF_HOME="C:\Study\KnowledgeGraph\models\huggingface"
+uv run uvicorn app.main:app --reload
 ```
 
 Install worker dependencies if you need background ingestion:
@@ -397,18 +425,19 @@ flowchart TB
 
     subgraph ONLINE["Online Query Stage - at question time"]
         direction TB
-        Q["User Question"] --> QA["Query Analysis<br/>tokenization / intent detection"]
+        Q["User Question"] --> QA["Query Analysis<br/>tokenization / intent detection / query type"]
         QA --> ROUTE{"Route Decision"}
         ROUTE -->|direct / clarify| DIRECT["Direct Answer<br/>no retrieval needed"]
         ROUTE -->|notes / exercises / general| REWRITE["Query Rewrite<br/>LLM context disambiguation"]
         ROUTE -->|multi-hop / compare / relations| MULTI_HOP["Multi-hop Rewrite<br/>LLM sub-query generation"]
         REWRITE --> DENSE["Dense Retrieval<br/>vector similarity"]
-        REWRITE --> LEX["Lexical Retrieval<br/>BM25-style full-text match"]
+        REWRITE --> LEX["BM25 Lexical Retrieval<br/>database active chunks"]
         MULTI_HOP --> DENSE
         MULTI_HOP --> LEX
-        DENSE --> RRF["RRF Fusion Ranking<br/>k=60"]
-        LEX --> RRF
-        RRF --> GRAPH_EXT["GraphRAG Extension<br/>(multi-hop only) 1-hop neighbor boost"]
+        DENSE --> WSF["WSF Fusion Ranking<br/>query-type alpha + min-max normalization"]
+        LEX --> WSF
+        WSF --> RERANK["Cross-Encoder Reranking<br/>BAAI/bge-reranker-v2-m3"]
+        RERANK --> GRAPH_EXT["GraphRAG Extension<br/>pending upgrade: not part of the primary ranking path yet"]
         GRAPH_EXT --> GRADE["Document Grading<br/>term overlap + score threshold"]
         GRADE -->|insufficient docs, retries remaining| RETRY["Retry Planner<br/>expand query terms"]
         RETRY --> DENSE
@@ -429,7 +458,7 @@ flowchart TB
     GRAPH_W -.-> KG
     DENSE --> VEC
     LEX --> DB
-    GRAPH_EXT --> KG
+    GRAPH_EXT -. "pending upgrade" .-> KG
     GRADE -->|secondary validation| DB
 ```
 
@@ -440,22 +469,25 @@ flowchart TB
 | Chunking | Evaluated best strategy `chunk_800_metadata_enriched_v1` | Text uses `chunk_size=800, overlap=120`; code uses `chunk_size=700, overlap=100`; recursive separators and Markdown heading hierarchy are still used |
 | Dedup / filtering | Document-level and chunk-level cleanup | Documents deduplicate by normalized title + checksum; chunks deduplicate by normalized content hash; filters TOC pages, page/figure numbers, mojibake, short low-information blocks, notebook output and low-information pure code |
 | Embedding text | Metadata-enriched while preserving stored content | Embedding input prepends Document / Chapter / Section / Source Type / Content Kind; `chunks.content` remains the original chunk text; Qdrant payload marks `embedding_text_version=metadata_enriched_v1` |
-| Embedding | Async batched + 3-tier fallback | OpenAI-compatible API → retry (429/5xx) → deterministic hash fallback |
-| Retrieval | Dense + lexical + RRF fusion | Two independent recall paths, RRF (k=60) fusion ranking to avoid single-path misses |
+| Embedding | Async batched; fallback disabled by default | OpenAI-compatible API; with `ENABLE_MODEL_FALLBACK=false`, failures are surfaced instead of silently degraded |
+| Retrieval | Dense + BM25 + WSF + reranker | Two independent recall paths, query-type-aware Dense/BM25 weights, min-max normalized WSF fusion, then `BAAI/bge-reranker-v2-m3` reranking |
 | Grading | Term overlap + content-type weighting | Text +1.1 / code -1.8 / title match +1.4 |
 | Consistency | Retrieval secondary validation | Vector results cross-validated against DB, filtering deleted and inactive chunks |
-| Graph | Single-transaction full rebuild | DELETE → INSERT → COMMIT, fully ACID-compliant |
+| Graph | Single-transaction full rebuild; GraphRAG pending upgrade | DELETE → INSERT → COMMIT, fully ACID-compliant; graph browsing and relation storage are available, while graph-enhanced retrieval needs further evaluation and upgrade before joining the primary ranking path |
 
 ### GraphRAG Mechanism
 
-When a query is routed to the "multi-hop / relations" branch, the system activates Graph-Enhanced Retrieval (GraphRAG). The following diagram illustrates its 1-hop expansion workflow:
+Graph construction, graph browsing and relation storage are implemented, but Graph-Enhanced Retrieval (GraphRAG) is currently marked as pending upgrade. The latest evaluation showed that directly merging graph-neighbor expansion into the primary ranking path may introduce noise, so the current primary retrieval path uses Dense + BM25 + WSF + reranker. GraphRAG should be upgraded into a controlled path with semantic gating, evidence-support verification and post-rerank injection.
+
+The planned 1-hop expansion workflow is:
 
 ```mermaid
 graph LR
     BASE[Hybrid Search Base Chunks] --> REL[Extract 1-Hop Neighbor Relations]
     REL --> NEW[Discover New Evidence Chunks]
     NEW --> BOOST[Calculate Graph Boost Score]
-    BOOST --> MERGE[Merge & Re-rank with Base]
+    BOOST --> VERIFY[Evidence Support Verification]
+    VERIFY --> MERGE[Controlled Merge & Re-rank with Base]
     BASE --> MERGE
 ```
 
@@ -467,8 +499,8 @@ graph LR
     B -->|retrieve| C[query_rewriter]
     B -->|multi-hop| C2[multi_hop_rewriter]
     B -->|direct/clarify| G[answer_generator]
-    C --> D[hybrid_retriever<br/>Dense+Lexical+RRF]
-    C2 --> D2[graph_enhanced_retriever<br/>+ GraphRAG]
+    C --> D[hybrid_retriever<br/>Dense+BM25+WSF+reranker]
+    C2 --> D2[graph_enhanced_retriever<br/>GraphRAG pending upgrade]
     D --> E[document_grader]
     D2 --> E
     E -->|has docs| F[context_synthesizer]
