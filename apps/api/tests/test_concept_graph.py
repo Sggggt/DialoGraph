@@ -161,7 +161,7 @@ def test_document_chapter_label_prefers_canonical_filename_over_stale_tags(sampl
     lab_document = Document(
         course_id=sample_course.id,
         title="Labs solutions",
-        source_path=r"C:\data\Algorithmic GT\storage\20260425\Labs solutions.pdf",
+        source_path="data/Algorithmic GT/storage/20260425/Labs solutions.pdf",
         source_type="pdf",
         tags=["Labs solutions"],
         checksum="checksum",
@@ -169,7 +169,7 @@ def test_document_chapter_label_prefers_canonical_filename_over_stale_tags(sampl
     visualizer_document = Document(
         course_id=sample_course.id,
         title="graph_algorithms_visualizer",
-        source_path=r"C:\data\Algorithmic GT\storage\20260425\graph_algorithms_visualizer.html",
+        source_path="data/Algorithmic GT/storage/20260425/graph_algorithms_visualizer.html",
         source_type="html",
         tags=["graph algorithms visualizer"],
         checksum="checksum",
@@ -211,7 +211,7 @@ def test_sync_graph_chapter_labels_normalizes_existing_refs(db_session, sample_c
     document = Document(
         course_id=sample_course.id,
         title="Labs solutions",
-        source_path=r"C:\data\Unit Test Course\storage\20260425\Labs solutions.pdf",
+        source_path="data/Unit Test Course/storage/20260425/Labs solutions.pdf",
         source_type="pdf",
         tags=["Labs solutions"],
         checksum="checksum",

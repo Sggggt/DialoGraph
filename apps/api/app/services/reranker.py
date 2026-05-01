@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
@@ -29,6 +30,7 @@ class RerankerProvider:
 
     def __init__(self) -> None:
         settings = get_settings()
+        os.environ.setdefault("HF_HOME", str(settings.model_cache_root))
         try:
             from sentence_transformers import CrossEncoder
         except Exception as exc:

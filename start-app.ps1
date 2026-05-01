@@ -7,10 +7,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ApiDir = Join-Path $Root "apps\api"
-$WebDir = Join-Path $Root "apps\web"
 $EnvFile = Join-Path $Root ".env"
 $InfraComposeFile = Join-Path $Root "infra\docker-compose.yml"
+$CudaComposeFile = Join-Path $Root "infra\docker-compose.cuda.yml"
 
 function Get-DotEnvValue {
   param(
@@ -29,99 +28,11 @@ function Get-DotEnvValue {
       continue
     }
     if ($cleanLine.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-      return $cleanLine.Substring($prefix.Length).Trim().Trim('"')
+      return $cleanLine.Substring($prefix.Length).Trim().Trim('"').Trim("'")
     }
   }
 
   return $DefaultValue
-}
-
-function Get-PostgresEndpoint {
-  param([string]$DatabaseUrl)
-
-  if ($DatabaseUrl -match "postgresql(?:\+[^:]+)?://(?:[^:@/]+(?::[^@/]*)?@)?([^/:]+)(?::(\d+))?/") {
-    $port = if ($Matches[2]) { [int]$Matches[2] } else { 5432 }
-    return @{ Host = $Matches[1]; Port = $port }
-  }
-
-  return @{ Host = "127.0.0.1"; Port = 5432 }
-}
-
-function Get-HttpEndpoint {
-  param(
-    [string]$Url,
-    [int]$DefaultPort
-  )
-
-  try {
-    $uri = [System.Uri]$Url
-    $port = if ($uri.IsDefaultPort) { $DefaultPort } else { $uri.Port }
-    return @{ Host = $uri.Host; Port = $port; Url = $Url.TrimEnd("/") }
-  } catch {
-    return @{ Host = "127.0.0.1"; Port = $DefaultPort; Url = $Url.TrimEnd("/") }
-  }
-}
-
-function Test-TcpPort {
-  param(
-    [string]$HostName,
-    [int]$Port
-  )
-
-  try {
-    $client = [System.Net.Sockets.TcpClient]::new()
-    $task = $client.ConnectAsync($HostName, $Port)
-    if (-not $task.Wait(2000)) {
-      $client.Dispose()
-      return $false
-    }
-    $client.Dispose()
-    return $true
-  } catch {
-    return $false
-  }
-}
-
-function Start-Infrastructure {
-  $databaseUrl = Get-DotEnvValue -Key "DATABASE_URL" -DefaultValue "postgresql+psycopg://postgres:postgres@localhost:5432/course_kg"
-  $qdrantUrl = Get-DotEnvValue -Key "QDRANT_URL" -DefaultValue "http://localhost:6333"
-  $postgres = Get-PostgresEndpoint -DatabaseUrl $databaseUrl
-  $qdrant = Get-HttpEndpoint -Url $qdrantUrl -DefaultPort 6333
-
-  Write-Host "Starting infrastructure with Docker Compose:" -ForegroundColor Cyan
-  Write-Host "  PostgreSQL, Redis, and Qdrant are managed by: $InfraComposeFile"
-  Write-Host "  Expected PostgreSQL: $($postgres.Host):$($postgres.Port)"
-  Write-Host "  Expected Qdrant: $($qdrant.Url)"
-
-  if (-not (Test-Path $InfraComposeFile)) {
-    throw "Docker Compose file not found: $InfraComposeFile"
-  }
-
-  & docker compose -f $InfraComposeFile up -d
-  if ($LASTEXITCODE -ne 0) {
-    throw "Docker Compose failed to start infrastructure. Make sure Docker Desktop is running."
-  }
-
-  $deadline = (Get-Date).AddSeconds(90)
-  do {
-    $postgresOk = Test-TcpPort -HostName $postgres.Host -Port $postgres.Port
-    $qdrantOk = Test-TcpPort -HostName $qdrant.Host -Port $qdrant.Port
-    if ($postgresOk -and $qdrantOk) {
-      Write-Host "Infrastructure is reachable." -ForegroundColor Green
-      return
-    }
-    Start-Sleep -Seconds 1
-  } while ((Get-Date) -lt $deadline)
-
-  Write-Host ""
-  Write-Host "Infrastructure did not become reachable:" -ForegroundColor Red
-  if (-not $postgresOk) {
-    Write-Host "  - PostgreSQL is not reachable at $($postgres.Host):$($postgres.Port)"
-  }
-  if (-not $qdrantOk) {
-    Write-Host "  - Qdrant is not reachable at $($qdrant.Host):$($qdrant.Port)"
-  }
-  throw "Docker Compose started, but required infrastructure ports are not ready."
 }
 
 function Test-Url {
@@ -138,7 +49,7 @@ function Wait-Url {
   param(
     [string]$Url,
     [string]$Name,
-    [int]$TimeoutSeconds = 90
+    [int]$TimeoutSeconds = 120
   )
 
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -153,100 +64,67 @@ function Wait-Url {
   throw "$Name did not become ready within $TimeoutSeconds seconds: $Url"
 }
 
-function Get-NodeVersion {
-  param([string]$NodeExe)
-  try {
-    $version = & $NodeExe --version 2>$null
-    if ($version -match '^v?(\d+)\.(\d+)\.(\d+)') {
-      return [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
-    }
-  } catch {
-    return $null
-  }
-  return $null
-}
-
-function Find-Node {
-  $candidates = New-Object System.Collections.Generic.List[string]
-
-  $pathNode = Get-Command node.exe -ErrorAction SilentlyContinue
-  if ($pathNode) {
-    $candidates.Add($pathNode.Source)
-  }
-
-  $codexNode = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
-  $candidates.Add($codexNode)
-  $candidates.Add("C:\Program Files\nodejs\node.exe")
-
-  foreach ($candidate in $candidates) {
-    if (-not (Test-Path $candidate)) {
-      continue
-    }
-    $version = Get-NodeVersion $candidate
-    if ($version -and $version -ge [version]"20.9.0") {
-      return $candidate
-    }
-  }
-
-  throw "Node.js >= 20.9.0 was not found. Install Node 20+ or run this from Codex where the bundled runtime is available."
-}
-
-function Start-Window {
+function Invoke-Compose {
   param(
-    [string]$Title,
-    [string]$WorkingDirectory,
-    [string]$Command
+    [string[]]$Arguments
   )
 
-  $wrapped = "`$Host.UI.RawUI.WindowTitle = '$Title'; $Command"
-  Start-Process powershell.exe -WorkingDirectory $WorkingDirectory -ArgumentList @(
-    "-NoExit",
-    "-ExecutionPolicy", "Bypass",
-    "-Command", $wrapped
-  )
+  & docker @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "Docker Compose failed. If an application image is missing, build it first using the README commands."
+  }
 }
 
-$BackendUrl = "http://127.0.0.1:$BackendPort/api/courses/current/graph"
+if (-not (Test-Path $InfraComposeFile)) {
+  throw "Docker Compose file not found: $InfraComposeFile"
+}
+
+$rerankerDevice = (Get-DotEnvValue -Key "RERANKER_DEVICE" -DefaultValue "cpu").ToLowerInvariant()
+if ($rerankerDevice -notin @("cpu", "cuda")) {
+  throw "Unsupported RERANKER_DEVICE='$rerankerDevice'. Only 'cpu' and 'cuda' are supported."
+}
+if ($rerankerDevice -eq "cuda" -and -not (Test-Path $CudaComposeFile)) {
+  throw "CUDA Compose file not found: $CudaComposeFile"
+}
+
+$BackendUrl = "http://127.0.0.1:$BackendPort/api/health"
 $FrontendUrl = "http://127.0.0.1:$FrontendPort$OpenPath"
+$env:API_HOST_PORT = [string]$BackendPort
+$env:WEB_HOST_PORT = [string]$FrontendPort
 
-Write-Host "Course Knowledge Base launcher" -ForegroundColor Cyan
+Write-Host "Course Knowledge Base Docker launcher" -ForegroundColor Cyan
 Write-Host "Root: $Root"
-Start-Infrastructure
+Write-Host "Reranker device: $rerankerDevice"
+Write-Host "API: http://127.0.0.1:$BackendPort/api"
+Write-Host "Web: http://127.0.0.1:$FrontendPort"
 
-if (-not (Test-Url $BackendUrl)) {
-  $pythonExe = Join-Path $ApiDir ".venv\Scripts\python.exe"
-  if (-not (Test-Path $pythonExe)) {
-    $pythonCmd = Get-Command python.exe -ErrorAction SilentlyContinue
-    if (-not $pythonCmd) {
-      throw "Backend Python was not found. Expected $pythonExe or python.exe in PATH."
-    }
-    $pythonExe = $pythonCmd.Source
-  }
+Invoke-Compose -Arguments @(
+  "compose",
+  "-f", $InfraComposeFile,
+  "-f", $CudaComposeFile,
+  "down", "--remove-orphans"
+)
 
-  Write-Host "Starting backend on port $BackendPort ..."
-  Start-Window `
-    -Title "Knowledge Base API" `
-    -WorkingDirectory $ApiDir `
-    -Command "& '$pythonExe' -m uvicorn app.main:app --host 127.0.0.1 --port $BackendPort"
+if ($rerankerDevice -eq "cuda") {
+  Write-Host "Using CUDA API profile. This requires NVIDIA driver and NVIDIA Container Toolkit." -ForegroundColor Yellow
+  Invoke-Compose -Arguments @(
+    "compose",
+    "-f", $InfraComposeFile,
+    "-f", $CudaComposeFile,
+    "--profile", "api-cuda",
+    "up", "-d",
+    "postgres", "redis", "qdrant", "web", "api-cuda"
+  )
+  $stopCommand = "docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down"
 } else {
-  Write-Host "Backend already running on port $BackendPort." -ForegroundColor Yellow
-}
-
-if (-not (Test-Url $FrontendUrl)) {
-  $nodeExe = Find-Node
-  $nextBin = Join-Path $WebDir "node_modules\next\dist\bin\next"
-  if (-not (Test-Path $nextBin)) {
-    throw "Next.js binary was not found at $nextBin. Run npm install in the repo root first."
-  }
-
-  Write-Host "Starting frontend on port $FrontendPort with $nodeExe ..."
-  $apiBase = "http://127.0.0.1:$BackendPort/api"
-  Start-Window `
-    -Title "Knowledge Base Web" `
-    -WorkingDirectory $WebDir `
-    -Command "`$env:NEXT_PUBLIC_API_BASE_URL = '$apiBase'; & '$nodeExe' '$nextBin' dev --hostname 127.0.0.1 --port $FrontendPort"
-} else {
-  Write-Host "Frontend already running on port $FrontendPort." -ForegroundColor Yellow
+  Invoke-Compose -Arguments @(
+    "compose",
+    "-f", $InfraComposeFile,
+    "--profile", "api-cpu",
+    "up", "-d",
+    "postgres", "redis", "qdrant", "web", "api-cpu"
+  )
+  $stopCommand = "docker compose -f infra/docker-compose.yml down"
 }
 
 Wait-Url -Url $BackendUrl -Name "Backend"
@@ -257,4 +135,4 @@ if (-not $NoBrowser) {
   Start-Process $FrontendUrl
 }
 
-Write-Host "Done. Close the API/Web PowerShell windows to stop the services." -ForegroundColor Green
+Write-Host "Done. Stop services with: $stopCommand" -ForegroundColor Green

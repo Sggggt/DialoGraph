@@ -192,16 +192,8 @@ Main persistence locations:
 
 ## Prerequisites
 
-- Node.js `>= 20.9.0`
-- Python `>= 3.11`
-- `uv` for Python dependency management
 - Docker Desktop or Docker Engine with Compose v2
-
-Install `uv` if needed:
-
-```powershell
-python -m pip install uv
-```
+- For GPU reranking: NVIDIA Driver + NVIDIA Container Toolkit
 
 ## Configuration
 
@@ -214,6 +206,9 @@ Copy-Item .env.example .env
 Minimum local development configuration:
 
 ```env
+API_CPU_IMAGE=course-kg-api:local
+API_CUDA_IMAGE=course-kg-api-cuda:local
+WEB_IMAGE=course-kg-web:local
 DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/knowledge_base
 QDRANT_URL=http://localhost:6333
 QDRANT_COLLECTION=knowledge_chunks
@@ -226,6 +221,7 @@ EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
 EMBEDDING_DIMENSIONS=1024
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+RERANKER_DEVICE=cpu
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
@@ -234,80 +230,36 @@ API_KEYS=
 
 If you use DashScope or another OpenAI-compatible endpoint, set `OPENAI_BASE_URL` and `OPENAI_API_KEY` accordingly.
 
-## Install Dependencies
+## Build Images
 
-Install frontend workspace dependencies from the repo root:
-
-```powershell
-npm install
-```
-
-Install API dependencies:
+The launcher only starts Compose; it does not build images. On first setup or after dependency changes, build the CPU API and Web images from the repo root:
 
 ```powershell
-cd apps/api
-uv sync
+docker build -f apps/api/Dockerfile -t course-kg-api:local .
+docker build -f apps/web/Dockerfile -t course-kg-web:local .
 ```
 
-Before enabling retrieval reranking, download the Cross-Encoder reranker model. Setting `HF_HOME` explicitly is recommended so the cache location is predictable; otherwise Hugging Face uses the current user's default cache directory.
+If you need CUDA reranking, first check whether you already have a compatible CUDA API image. If you do, set it in `.env`:
+
+```env
+API_CUDA_IMAGE=<your-cuda-api-image>
+```
+
+If you do not have one, build the project default CUDA API image:
 
 ```powershell
-cd apps/api
-$env:HF_HOME="C:\Study\KnowledgeGraph\models\huggingface"
-# Optional for mainland China networks:
-# $env:HF_ENDPOINT="https://hf-mirror.com"
-@'
-from sentence_transformers import CrossEncoder
-CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512)
-print("BAAI/bge-reranker-v2-m3 downloaded")
-'@ | .\.venv\Scripts\python.exe -
+docker build -f apps/api/Dockerfile.cuda -t course-kg-api-cuda:local .
 ```
 
-When starting the API, keep the same `HF_HOME` if you want to reuse that cache:
+## Model Cache
+
+The Cross-Encoder reranker model cache lives under repo-local `models/huggingface`, mounted inside containers as `/app/models/huggingface`. The first retrieval request can download the model automatically; after building images, you can also prefetch it:
 
 ```powershell
-cd apps/api
-$env:HF_HOME="C:\Study\KnowledgeGraph\models\huggingface"
-uv run uvicorn app.main:app --reload
+docker run --rm -v "${PWD}\models:/app/models" -e HF_HOME=/app/models/huggingface course-kg-api:local uv run python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3', max_length=512)"
 ```
 
-Install worker dependencies if you need background ingestion:
-
-```powershell
-cd apps/worker
-uv sync
-```
-
-## Build and Start Backend Infrastructure
-
-The current repository has Docker Compose for backend infrastructure only: PostgreSQL, Redis and Qdrant. It does not currently include Dockerfiles for API/Web/Worker application images.
-
-Pull the infrastructure images:
-
-```powershell
-docker compose -f infra/docker-compose.yml pull
-```
-
-Start the backend infrastructure:
-
-```powershell
-docker compose -f infra/docker-compose.yml up -d
-```
-
-Check status:
-
-```powershell
-docker compose -f infra/docker-compose.yml ps
-```
-
-Recreate containers after image updates:
-
-```powershell
-docker compose -f infra/docker-compose.yml pull
-docker compose -f infra/docker-compose.yml up -d --force-recreate
-```
-
-`docker compose build` is not useful for the current infra file because all three services use public images directly (`postgres:16`, `redis:7`, `qdrant/qdrant:v1.13.2`) and no local `build:` context is defined.
+For mainland China networks, add `-e HF_ENDPOINT=https://hf-mirror.com`.
 
 ## Start Application Services
 
@@ -317,10 +269,23 @@ Recommended Windows launcher from the repo root:
 .\start-app.ps1
 ```
 
+The launcher reads `RERANKER_DEVICE` from `.env`. Only these values are supported:
+
+```env
+RERANKER_DEVICE=cpu
+```
+
+or:
+
+```env
+RERANKER_DEVICE=cuda
+```
+
 The launcher starts:
 
-- API on `http://127.0.0.1:8000`
+- API on `http://127.0.0.1:8000/api`
 - Web on `http://127.0.0.1:3000`
+- PostgreSQL, Redis and Qdrant
 - Browser path defaults to `/graph`
 
 Run without opening a browser:
@@ -335,49 +300,21 @@ Use custom ports:
 .\start-app.ps1 -BackendPort 8001 -FrontendPort 3001 -OpenPath "/search"
 ```
 
-Manual API start:
+Stop services:
 
 ```powershell
-cd apps/api
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+docker compose -f infra/docker-compose.yml down
 ```
 
-Manual Web start:
+Stop CUDA-mode services:
 
 ```powershell
-$env:NEXT_PUBLIC_API_BASE_URL = "http://127.0.0.1:8000/api"
-npm run dev --workspace web -- --hostname 127.0.0.1 --port 3000
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down
 ```
 
-Optional worker:
+## Local Dependency Policy
 
-```powershell
-cd apps/worker
-uv run celery -A worker_app.celery_app worker --loglevel=info
-```
-
-Optional watched-folder ingestion:
-
-```powershell
-cd apps/worker
-uv run python -m worker_app.watcher
-```
-
-## Build Frontend
-
-Type-check and build the web app:
-
-```powershell
-npm run typecheck:web
-npm run build:web
-```
-
-Start the production Next.js server after build:
-
-```powershell
-$env:NEXT_PUBLIC_API_BASE_URL = "http://127.0.0.1:8000/api"
-npm run start --workspace web
-```
+Running the project no longer depends on Windows-side `.venv`, `node_modules` or `.next`. They are rebuildable caches and should not be required for startup. Keep `data/`, `models/` and `.env` on the host.
 
 ## Ingestion Flow
 

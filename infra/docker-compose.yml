@@ -1,4 +1,46 @@
 services:
+  api-cpu:
+    image: ${API_CPU_IMAGE:-course-kg-api:local}
+    container_name: course-kg-api
+    profiles:
+      - api-cpu
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/knowledge_base
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      DATA_ROOT: /app/data
+      STORAGE_ROOT: /app/data/storage
+      INGESTION_ROOT: /app/data/ingestion
+      HF_HOME: /app/models/huggingface
+      MODEL_CACHE_ROOT: /app/models/huggingface
+      RERANKER_DEVICE: cpu
+      ENABLE_MODEL_FALLBACK: "false"
+      ENABLE_DATABASE_FALLBACK: "false"
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  web:
+    image: ${WEB_IMAGE:-course-kg-web:local}
+    container_name: course-kg-web
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://127.0.0.1:${API_HOST_PORT:-8000}/api
+    ports:
+      - "${WEB_HOST_PORT:-3000}:3000"
+
   postgres:
     image: postgres:16
     container_name: course-kg-postgres

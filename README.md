@@ -192,16 +192,8 @@ data/
 
 ## 环境要求
 
-- Node.js `>= 20.9.0`
-- Python `>= 3.11`
-- `uv` Python 依赖管理工具
 - Docker Desktop 或支持 Compose v2 的 Docker Engine
-
-如需安装 `uv`：
-
-```powershell
-python -m pip install uv
-```
+- 如需使用 GPU reranker：NVIDIA Driver + NVIDIA Container Toolkit
 
 ## 配置
 
@@ -214,6 +206,9 @@ Copy-Item .env.example .env
 最小本地开发配置：
 
 ```env
+API_CPU_IMAGE=course-kg-api:local
+API_CUDA_IMAGE=course-kg-api-cuda:local
+WEB_IMAGE=course-kg-web:local
 DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/knowledge_base
 QDRANT_URL=http://localhost:6333
 QDRANT_COLLECTION=knowledge_chunks
@@ -226,6 +221,7 @@ EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
 EMBEDDING_DIMENSIONS=1024
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+RERANKER_DEVICE=cpu
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
@@ -234,80 +230,36 @@ API_KEYS=
 
 如果使用 DashScope 或其他 OpenAI 兼容端点，请相应设置 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`。
 
-## 安装依赖
+## 构建镜像
 
-在仓库根目录安装前端工作区依赖：
-
-```powershell
-npm install
-```
-
-安装后端 API 依赖：
+启动脚本只负责启动 Compose，不会自动构建镜像。首次运行或依赖变更后，在仓库根目录构建 CPU API 和 Web 镜像：
 
 ```powershell
-cd apps/api
-uv sync
+docker build -f apps/api/Dockerfile -t course-kg-api:local .
+docker build -f apps/web/Dockerfile -t course-kg-web:local .
 ```
 
-首次启用检索重排前，需要下载 Cross-Encoder reranker 模型。推荐显式设置 `HF_HOME`，这样模型缓存位置可控；如果不设置，Hugging Face 会使用当前用户的默认缓存目录。
+如果需要 CUDA reranker，先确认是否已有可用的 CUDA API 镜像。已有镜像时，在 `.env` 设置：
+
+```env
+API_CUDA_IMAGE=<your-cuda-api-image>
+```
+
+没有现成镜像时，构建项目默认 CUDA API 镜像：
 
 ```powershell
-cd apps/api
-$env:HF_HOME="C:\Study\KnowledgeGraph\models\huggingface"
-# 国内网络可选：
-# $env:HF_ENDPOINT="https://hf-mirror.com"
-@'
-from sentence_transformers import CrossEncoder
-CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512)
-print("BAAI/bge-reranker-v2-m3 downloaded")
-'@ | .\.venv\Scripts\python.exe -
+docker build -f apps/api/Dockerfile.cuda -t course-kg-api-cuda:local .
 ```
 
-启动 API 时如果希望复用上述缓存，也需要带上相同的 `HF_HOME`：
+## 模型缓存
+
+Cross-Encoder reranker 模型缓存使用仓库内 `models/huggingface`，容器内挂载为 `/app/models/huggingface`。首次检索会自动下载模型；也可以在镜像构建后预下载：
 
 ```powershell
-cd apps/api
-$env:HF_HOME="C:\Study\KnowledgeGraph\models\huggingface"
-uv run uvicorn app.main:app --reload
+docker run --rm -v "${PWD}\models:/app/models" -e HF_HOME=/app/models/huggingface course-kg-api:local uv run python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3', max_length=512)"
 ```
 
-如需后台导入功能，安装 Worker 依赖：
-
-```powershell
-cd apps/worker
-uv sync
-```
-
-## 构建并启动后端基础设施
-
-当前仓库的 Docker Compose 仅包含后端基础设施：PostgreSQL、Redis 和 Qdrant。暂不包含 API/Web/Worker 应用的 Dockerfile。
-
-拉取基础设施镜像：
-
-```powershell
-docker compose -f infra/docker-compose.yml pull
-```
-
-启动后端基础设施：
-
-```powershell
-docker compose -f infra/docker-compose.yml up -d
-```
-
-检查状态：
-
-```powershell
-docker compose -f infra/docker-compose.yml ps
-```
-
-镜像更新后重建容器：
-
-```powershell
-docker compose -f infra/docker-compose.yml pull
-docker compose -f infra/docker-compose.yml up -d --force-recreate
-```
-
-`docker compose build` 对当前基础设施配置无效，因为三个服务均直接使用公共镜像（`postgres:16`、`redis:7`、`qdrant/qdrant:v1.13.2`），未定义本地构建上下文。
+国内网络可在命令中追加 `-e HF_ENDPOINT=https://hf-mirror.com`。
 
 ## 启动应用服务
 
@@ -317,10 +269,23 @@ docker compose -f infra/docker-compose.yml up -d --force-recreate
 .\start-app.ps1
 ```
 
-启动器会运行：
+启动器会读取 `.env` 的 `RERANKER_DEVICE`，只支持：
 
-- API 服务：`http://127.0.0.1:8000`
+```env
+RERANKER_DEVICE=cpu
+```
+
+或：
+
+```env
+RERANKER_DEVICE=cuda
+```
+
+脚本会启动：
+
+- API 服务：`http://127.0.0.1:8000/api`
 - Web 前端：`http://127.0.0.1:3000`
+- PostgreSQL、Redis、Qdrant
 - 浏览器默认打开 `/graph` 页面
 
 不打开浏览器启动：
@@ -335,49 +300,21 @@ docker compose -f infra/docker-compose.yml up -d --force-recreate
 .\start-app.ps1 -BackendPort 8001 -FrontendPort 3001 -OpenPath "/search"
 ```
 
-手动启动 API：
+停止服务：
 
 ```powershell
-cd apps/api
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+docker compose -f infra/docker-compose.yml down
 ```
 
-手动启动前端：
+CUDA 模式停止服务：
 
 ```powershell
-$env:NEXT_PUBLIC_API_BASE_URL = "http://127.0.0.1:8000/api"
-npm run dev --workspace web -- --hostname 127.0.0.1 --port 3000
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down
 ```
 
-可选 Worker：
+## 本地依赖策略
 
-```powershell
-cd apps/worker
-uv run celery -A worker_app.celery_app worker --loglevel=info
-```
-
-可选目录监听导入：
-
-```powershell
-cd apps/worker
-uv run python -m worker_app.watcher
-```
-
-## 构建前端
-
-类型检查并构建 Web 应用：
-
-```powershell
-npm run typecheck:web
-npm run build:web
-```
-
-构建后启动生产模式 Next.js 服务：
-
-```powershell
-$env:NEXT_PUBLIC_API_BASE_URL = "http://127.0.0.1:8000/api"
-npm run start --workspace web
-```
+项目运行不再依赖 Windows 侧 `.venv`、`node_modules` 或 `.next`。这些目录属于可重建缓存，不应作为运行前提；数据目录 `data/`、模型目录 `models/` 和 `.env` 仍保留在宿主机。
 
 ## 导入流程
 

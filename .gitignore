@@ -18,6 +18,7 @@ venv/
 .playwright-cli/
 output/
 retrieval_architecture.md
+models/
 *.pyc
 *.pyo
 *.pyd
