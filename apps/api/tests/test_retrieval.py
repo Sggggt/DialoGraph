@@ -121,3 +121,44 @@ async def test_hybrid_search_uses_weighted_fusion_and_rerank(db_session, sample_
     assert any("fused" in item["metadata"]["scores"] for item in results)
     assert all("rerank" in item["metadata"]["scores"] for item in results)
     assert all("query_type" in item["metadata"]["scores"] for item in results)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_search_can_skip_reranker(db_session, sample_course, indexed_chunks, monkeypatch):
+    from app.services import retrieval
+    from app.services.retrieval import hybrid_search_chunks
+
+    _, chunks = indexed_chunks
+    dense_payload = {
+        "chunk_id": chunks[1].id,
+        "snippet": chunks[1].snippet,
+        "score": 0.95,
+        "citations": [],
+        "metadata": {"scores": {"dense": 0.95}},
+        "content": chunks[1].content,
+        "document_title": "Centrality Notes",
+        "source_path": "centrality.md",
+        "chapter": "L3",
+        "source_type": "markdown",
+    }
+
+    async def fake_dense_search(db, course_id, query, filters, top_k):
+        return [dense_payload]
+
+    class FakeSettings:
+        enable_model_fallback = False
+        retrieval_recall_k_default = 64
+        retrieval_recall_k_formula = 80
+        reranker_enabled = False
+
+    def fail_if_called():
+        raise AssertionError("reranker should not be called when disabled")
+
+    monkeypatch.setattr(retrieval, "dense_search_chunks", fake_dense_search)
+    monkeypatch.setattr(retrieval, "get_settings", lambda: FakeSettings())
+    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: fail_if_called()))
+
+    results = await hybrid_search_chunks(db_session, sample_course.id, "degree centrality", SearchFilters(), 2)
+    assert results
+    assert all(item["metadata"]["scores"]["rerank_enabled"] is False for item in results)
+    assert all("rerank" not in item["metadata"]["scores"] for item in results)

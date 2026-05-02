@@ -227,6 +227,10 @@ class ModelSettingsResponse(BaseModel):
     embedding_dimensions: int
     graph_extraction_chunk_limit: int
     graph_extraction_chunks_per_document: int
+    reranker_enabled: bool
+    reranker_model: str
+    reranker_device: str
+    reranker_url: str
     has_api_key: bool
     degraded_mode: bool
 
@@ -241,6 +245,58 @@ class ModelSettingsUpdate(BaseModel):
     embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
     graph_extraction_chunk_limit: int | None = Field(default=None, ge=1, le=200)
     graph_extraction_chunks_per_document: int | None = Field(default=None, ge=1, le=10)
+    reranker_enabled: bool | None = None
+    reranker_model: str | None = None
+    reranker_device: Literal["cpu", "cuda"] | None = None
+
+
+class RuntimeIssue(BaseModel):
+    code: str
+    title: str
+    message: str
+    fix_commands: list[str] = Field(default_factory=list)
+
+
+class EnvSyncStatus(BaseModel):
+    synced: bool
+    missing_keys: list[str] = Field(default_factory=list)
+    extra_keys: list[str] = Field(default_factory=list)
+    bom_keys: list[str] = Field(default_factory=list)
+
+
+class RerankerRuntimeStatus(BaseModel):
+    enabled: bool
+    device: str
+    model: str
+    url: str
+    reachable: bool
+    healthy: bool
+    reported_model: str | None = None
+    reported_device: str | None = None
+    model_matches: bool | None = None
+    device_matches: bool | None = None
+
+
+class InfrastructureStatus(BaseModel):
+    postgres: bool
+    qdrant: bool
+    redis: bool
+
+
+class RuntimeCheckResponse(BaseModel):
+    env_sync: EnvSyncStatus
+    reranker: RerankerRuntimeStatus
+    infrastructure: InfrastructureStatus
+    blocking_issues: list[RuntimeIssue] = Field(default_factory=list)
+    warnings: list[RuntimeIssue] = Field(default_factory=list)
+
+
+class StructuredApiError(BaseModel):
+    code: str
+    title: str
+    message: str
+    issues: list[RuntimeIssue] = Field(default_factory=list)
+    fix_commands: list[str] = Field(default_factory=list)
 
 
 class RelatedConcept(BaseModel):

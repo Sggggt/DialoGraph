@@ -36,6 +36,7 @@ from app.schemas import (
     QARequest,
     QAResponse,
     RefreshResponse,
+    RuntimeCheckResponse,
     SearchRequest,
     SearchResponse,
     SessionMessagesResponse,
@@ -65,7 +66,7 @@ from app.services.ingestion import (
 from app.services.ingestion_logs import TERMINAL_LOG_EVENTS, list_ingestion_logs, subscribe_ingestion_logs, unsubscribe_ingestion_logs
 from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, cleanup_stale_graph, delete_course_data
 from app.services.retrieval import get_dashboard_snapshot, get_job_status, list_course_files, search_chunks
-from app.services.runtime_settings import model_settings_payload, update_model_settings
+from app.services.runtime_settings import model_settings_payload, normalize_env_file, runtime_check_payload, update_model_settings
 from app.services.storage import save_upload
 
 router = APIRouter()
@@ -90,7 +91,44 @@ def get_model_settings() -> dict:
 
 @router.put("/settings/model", response_model=ModelSettingsResponse)
 def save_model_settings(request: ModelSettingsUpdate) -> dict:
+    normalize_env_file()
+    if request.reranker_enabled is True:
+        check = runtime_check_payload(
+            require_reranker=True,
+            expected_model=request.reranker_model,
+            expected_device=request.reranker_device,
+        )
+        if check["blocking_issues"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "runtime_check_failed",
+                    "title": "Runtime infrastructure check failed",
+                    "message": "Reranker cannot be enabled until the required infrastructure is available.",
+                    "issues": check["blocking_issues"],
+                    "fix_commands": [
+                        command
+                        for issue in check["blocking_issues"]
+                        for command in issue.get("fix_commands", [])
+                    ],
+                },
+            )
     return update_model_settings(request.model_dump())
+
+
+@router.get("/settings/runtime-check", response_model=RuntimeCheckResponse)
+def get_runtime_check(
+    require_reranker: bool | None = None,
+    reranker_model: str | None = None,
+    reranker_device: str | None = None,
+    reranker_url: str | None = None,
+) -> dict:
+    return runtime_check_payload(
+        require_reranker=require_reranker,
+        expected_model=reranker_model,
+        expected_device=reranker_device,
+        expected_url=reranker_url,
+    )
 
 
 @router.get("/courses", response_model=list[CourseSummary])

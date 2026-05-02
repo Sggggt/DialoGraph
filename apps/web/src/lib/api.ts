@@ -21,12 +21,14 @@ import type {
   QARequest,
   QAResponse,
   RefreshResponse,
+  RuntimeCheckResponse,
   SearchRequest,
   SearchResponse,
   SessionMessagesResponse,
   SessionSummary,
   TaskStatusResponse,
   UploadFileResponse,
+  StructuredApiErrorBody,
 } from "@course-kg/shared";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api";
@@ -55,7 +57,23 @@ function buildApiUrl(path: string, params?: Record<string, string | null | undef
 async function parseResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `Request failed with ${response.status}`);
+    const error = new Error(text || `Request failed with ${response.status}`) as Error & {
+      status?: number;
+      structured?: StructuredApiErrorBody;
+    };
+    error.status = response.status;
+    try {
+      const parsed = JSON.parse(text) as { detail?: StructuredApiErrorBody | string };
+      if (parsed.detail && typeof parsed.detail === "object") {
+        error.structured = parsed.detail;
+        error.message = parsed.detail.message || parsed.detail.title || error.message;
+      } else if (typeof parsed.detail === "string") {
+        error.message = parsed.detail;
+      }
+    } catch {
+      // Keep the plain text error.
+    }
+    throw error;
   }
   return response.json() as Promise<T>;
 }
@@ -98,6 +116,22 @@ export async function refreshCourse(courseId?: string | null): Promise<RefreshRe
 export async function fetchModelSettings(): Promise<ModelSettingsResponse> {
   const response = await fetch(buildApiUrl("/settings/model"), { cache: "no-store", headers: authHeaders() });
   return parseResponse<ModelSettingsResponse>(response);
+}
+
+export async function fetchRuntimeCheck(
+  requireReranker?: boolean,
+  options?: { reranker_model?: string | null; reranker_device?: string | null; reranker_url?: string | null },
+): Promise<RuntimeCheckResponse> {
+  const response = await fetch(
+    buildApiUrl("/settings/runtime-check", {
+      require_reranker: requireReranker === undefined ? null : String(requireReranker),
+      reranker_model: options?.reranker_model,
+      reranker_device: options?.reranker_device,
+      reranker_url: options?.reranker_url,
+    }),
+    { cache: "no-store", headers: authHeaders() },
+  );
+  return parseResponse<RuntimeCheckResponse>(response);
 }
 
 export async function updateModelSettings(payload: ModelSettingsUpdate): Promise<ModelSettingsResponse> {

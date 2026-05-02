@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import os
 import threading
 from typing import Any
+
+import httpx
 
 from app.core.config import get_settings
 
@@ -30,26 +31,41 @@ class RerankerProvider:
 
     def __init__(self) -> None:
         settings = get_settings()
-        os.environ.setdefault("HF_HOME", str(settings.model_cache_root))
-        try:
-            from sentence_transformers import CrossEncoder
-        except Exception as exc:
-            raise RerankerUnavailableError(
-                "sentence-transformers is required for reranking; install the rerank extra"
-            ) from exc
-        try:
-            self.model = CrossEncoder(settings.reranker_model, max_length=settings.reranker_max_length, device=settings.reranker_device)
-        except Exception as exc:
-            raise RerankerUnavailableError(f"Failed to load reranker model {settings.reranker_model}: {exc}") from exc
+        self.url = settings.reranker_url
+        self.model = settings.reranker_model
+        self.timeout = httpx.Timeout(60.0, connect=5.0)
 
     def rerank(self, query: str, candidates: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
         if not candidates:
             return []
         settings = get_settings()
-        pairs = [[query, (item.get("content") or item.get("snippet") or "")[: settings.reranker_text_chars]] for item in candidates]
-        scores = self.model.predict(pairs, show_progress_bar=False)
-        for item, score in zip(candidates, scores):
-            score_value = float(score)
+        payload = {
+            "model": self.model,
+            "query": query,
+            "top_k": top_k,
+            "candidates": [
+                {
+                    "id": item["chunk_id"],
+                    "text": (item.get("content") or item.get("snippet") or "")[: settings.reranker_text_chars],
+                }
+                for item in candidates
+            ],
+        }
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(self.url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            raise RerankerUnavailableError(f"Reranker service unavailable at {self.url}: {exc}") from exc
+
+        scores_by_id = {str(item["id"]): float(item["score"]) for item in data.get("results", [])}
+        if len(scores_by_id) != len(candidates):
+            raise RerankerUnavailableError(
+                f"Reranker service returned {len(scores_by_id)} scores for {len(candidates)} candidates"
+            )
+        for item in candidates:
+            score_value = scores_by_id[str(item["chunk_id"])]
             item.setdefault("metadata", {}).setdefault("scores", {})["rerank"] = score_value
             item["score"] = score_value
         return sorted(candidates, key=lambda item: item["score"], reverse=True)[:top_k]

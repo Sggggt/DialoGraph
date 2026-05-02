@@ -64,6 +64,26 @@ function Wait-Url {
   throw "$Name did not become ready within $TimeoutSeconds seconds: $Url"
 }
 
+function Wait-ContainerHealthy {
+  param(
+    [string]$ContainerName,
+    [string]$Name,
+    [int]$TimeoutSeconds = 120
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    $status = (& docker inspect --format "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}" $ContainerName 2>$null)
+    if ($LASTEXITCODE -eq 0 -and ($status -eq "healthy" -or $status -eq "running")) {
+      Write-Host "$Name is ready: $ContainerName" -ForegroundColor Green
+      return
+    }
+    Start-Sleep -Seconds 1
+  }
+
+  throw "$Name did not become ready within $TimeoutSeconds seconds: $ContainerName"
+}
+
 function Invoke-Compose {
   param(
     [string[]]$Arguments
@@ -75,15 +95,32 @@ function Invoke-Compose {
   }
 }
 
+function Get-DotEnvBool {
+  param(
+    [string]$Key,
+    [bool]$DefaultValue
+  )
+
+  $rawValue = (Get-DotEnvValue -Key $Key -DefaultValue ($(if ($DefaultValue) { "true" } else { "false" }))).ToLowerInvariant()
+  if ($rawValue -in @("true", "1", "yes", "on")) {
+    return $true
+  }
+  if ($rawValue -in @("false", "0", "no", "off")) {
+    return $false
+  }
+  throw "Unsupported $Key='$rawValue'. Use true or false."
+}
+
 if (-not (Test-Path $InfraComposeFile)) {
   throw "Docker Compose file not found: $InfraComposeFile"
 }
 
+$rerankerEnabled = Get-DotEnvBool -Key "RERANKER_ENABLED" -DefaultValue $true
 $rerankerDevice = (Get-DotEnvValue -Key "RERANKER_DEVICE" -DefaultValue "cpu").ToLowerInvariant()
-if ($rerankerDevice -notin @("cpu", "cuda")) {
+if ($rerankerEnabled -and $rerankerDevice -notin @("cpu", "cuda")) {
   throw "Unsupported RERANKER_DEVICE='$rerankerDevice'. Only 'cpu' and 'cuda' are supported."
 }
-if ($rerankerDevice -eq "cuda" -and -not (Test-Path $CudaComposeFile)) {
+if ($rerankerEnabled -and $rerankerDevice -eq "cuda" -and -not (Test-Path $CudaComposeFile)) {
   throw "CUDA Compose file not found: $CudaComposeFile"
 }
 
@@ -94,7 +131,10 @@ $env:WEB_HOST_PORT = [string]$FrontendPort
 
 Write-Host "Course Knowledge Base Docker launcher" -ForegroundColor Cyan
 Write-Host "Root: $Root"
-Write-Host "Reranker device: $rerankerDevice"
+Write-Host "Reranker enabled: $rerankerEnabled"
+if ($rerankerEnabled) {
+  Write-Host "Reranker device: $rerankerDevice"
+}
 Write-Host "API: http://127.0.0.1:$BackendPort/api"
 Write-Host "Web: http://127.0.0.1:$FrontendPort"
 
@@ -105,28 +145,39 @@ Invoke-Compose -Arguments @(
   "down", "--remove-orphans"
 )
 
-if ($rerankerDevice -eq "cuda") {
-  Write-Host "Using CUDA API profile. This requires NVIDIA driver and NVIDIA Container Toolkit." -ForegroundColor Yellow
+if (-not $rerankerEnabled) {
+  Invoke-Compose -Arguments @(
+    "compose",
+    "-f", $InfraComposeFile,
+    "up", "-d",
+    "postgres", "redis", "qdrant", "api", "web"
+  )
+  $stopCommand = "docker compose -f infra/docker-compose.yml down"
+} elseif ($rerankerDevice -eq "cuda") {
+  Write-Host "Using CUDA reranker runtime. This requires NVIDIA driver and NVIDIA Container Toolkit." -ForegroundColor Yellow
   Invoke-Compose -Arguments @(
     "compose",
     "-f", $InfraComposeFile,
     "-f", $CudaComposeFile,
-    "--profile", "api-cuda",
+    "--profile", "reranker-cuda",
     "up", "-d",
-    "postgres", "redis", "qdrant", "web", "api-cuda"
+    "postgres", "redis", "qdrant", "reranker-cuda", "api", "web"
   )
   $stopCommand = "docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down"
 } else {
   Invoke-Compose -Arguments @(
     "compose",
     "-f", $InfraComposeFile,
-    "--profile", "api-cpu",
+    "--profile", "reranker-cpu",
     "up", "-d",
-    "postgres", "redis", "qdrant", "web", "api-cpu"
+    "postgres", "redis", "qdrant", "reranker-cpu", "api", "web"
   )
   $stopCommand = "docker compose -f infra/docker-compose.yml down"
 }
 
+if ($rerankerEnabled) {
+  Wait-ContainerHealthy -ContainerName "text-reranker-runtime" -Name "Reranker"
+}
 Wait-Url -Url $BackendUrl -Name "Backend"
 Wait-Url -Url $FrontendUrl -Name "Frontend"
 

@@ -1,9 +1,8 @@
 services:
-  api-cpu:
-    image: ${API_CPU_IMAGE:-course-kg-api:local}
+  api:
+    image: ${API_IMAGE:-course-kg-api:local}
+    pull_policy: never
     container_name: course-kg-api
-    profiles:
-      - api-cpu
     env_file:
       - ../.env
     environment:
@@ -13,16 +12,14 @@ services:
       DATA_ROOT: /app/data
       STORAGE_ROOT: /app/data/storage
       INGESTION_ROOT: /app/data/ingestion
-      HF_HOME: /app/models/huggingface
-      MODEL_CACHE_ROOT: /app/models/huggingface
-      RERANKER_DEVICE: cpu
+      RERANKER_ENABLED: ${RERANKER_ENABLED:-true}
+      RERANKER_URL: http://reranker:8080/rerank
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
     ports:
       - "${API_HOST_PORT:-8000}:8000"
     volumes:
       - ../data:/app/data
-      - ../models:/app/models
     depends_on:
       - postgres
       - redis
@@ -35,11 +32,35 @@ services:
 
   web:
     image: ${WEB_IMAGE:-course-kg-web:local}
+    pull_policy: never
     container_name: course-kg-web
     environment:
       NEXT_PUBLIC_API_BASE_URL: http://127.0.0.1:${API_HOST_PORT:-8000}/api
     ports:
       - "${WEB_HOST_PORT:-3000}:3000"
+
+  reranker-cpu:
+    image: ${RERANKER_CPU_IMAGE:-text-reranker-runtime:cpu}
+    pull_policy: never
+    container_name: text-reranker-runtime
+    profiles:
+      - reranker-cpu
+    environment:
+      HF_HOME: /models/huggingface
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      RERANKER_DEVICE: cpu
+      RERANKER_MAX_LENGTH: ${RERANKER_MAX_LENGTH:-512}
+    volumes:
+      - ../models:/models
+    networks:
+      default:
+        aliases:
+          - reranker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
 
   postgres:
     image: postgres:16

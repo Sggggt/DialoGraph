@@ -2,301 +2,369 @@
 
 # DialoGraph
 
-DialoGraph 是一个本地课程知识库系统。它把 PDF、PPT/PPTX、DOCX、Markdown、TXT、Notebook、HTML 和图片资料解析成可检索的文本块、向量索引、概念卡片、知识图谱关系和带引用的问答会话。
+DialoGraph 是一个 Docker-first 的本地课程知识库系统。它将 PDF、PPT/PPTX、DOCX、Markdown、TXT、Notebook、HTML 和图片资料解析为可检索的文本块、向量索引、概念图谱和带引用的问答结果。
 
-系统已经支持多课程隔离：每门课程有独立的文件目录、导入批次、图谱、检索结果和问答历史。
+系统默认使用真实 PostgreSQL、Qdrant、Redis 和 OpenAI-compatible 模型 API。模型 fallback 与数据库 fallback 默认关闭。
 
 ## 系统架构
 
 ```mermaid
 flowchart TB
-    U["用户浏览器"] --> W["Next.js 前端<br/>apps/web"]
-    W -->|HTTP / SSE + API Key| SECURITY["认证与跨域中间件<br/>API Key / CORS 白名单"]
-    SECURITY --> API["FastAPI 后端<br/>apps/api"]
+    U["用户浏览器"] --> WEB["Next.js Web<br/>course-kg-web"]
+    WEB -->|"HTTP / SSE"| API["FastAPI API<br/>course-kg-api"]
 
-    subgraph API_RUNTIME["后端运行时"]
-        API --> ROUTES["API 路由<br/>课程 / 文件 / 搜索 / 问答 / 图谱"]
-        ROUTES --> INGEST["导入服务<br/>解析 → inactive DB 版本 → 向量 upsert → 激活"]
-        ROUTES --> RETRIEVAL["检索服务<br/>Dense 向量召回 + BM25 词面召回 + WSF 融合 + bge-reranker 重排"]
-        ROUTES --> AGENT["LangGraph 智能体<br/>改写 / 路由 / 评分 / 回答 / 实时轨迹"]
-        INGEST --> PARSERS["文档解析器<br/>PDF / PPTX / DOCX / Markdown / Notebook / OCR"]
-        INGEST --> GRAPH["概念图谱构建器<br/>概念 + 关系"]
-        INGEST --> COMP["补偿恢复<br/>IngestionCompensationLog"]
-        AGENT --> TRACE["SSE 轨迹发布<br/>agent_trace_events"]
+    subgraph APP["项目应用镜像"]
+        WEB
+        API --> ROUTES["API Routes<br/>courses / files / ingestion / search / qa / graph / settings"]
+        ROUTES --> INGEST["Ingestion Pipeline<br/>parse -> chunk -> embed -> vector upsert -> graph extraction"]
+        ROUTES --> RETRIEVAL["Retrieval Pipeline<br/>Dense recall + BM25 recall + WSF fusion + rerank"]
+        ROUTES --> AGENT["Agent QA<br/>rewrite / route / retrieve / grade / answer / trace"]
+        ROUTES --> GRAPH["Knowledge Graph<br/>concepts / relations / chapters / node detail"]
     end
 
-    subgraph WORKERS["可选后台组件"]
-        CELERY["Celery Worker<br/>apps/worker"] --> INGEST
-        WATCHER["目录监听器"] --> CELERY
+    subgraph INFRA["可复用基础设施"]
+        POSTGRES[("postgres:16<br/>metadata, chunks, graph, QA sessions")]
+        REDIS[("redis:7<br/>broker / runtime cache")]
+        QDRANT[("qdrant/qdrant:v1.13.2<br/>knowledge_chunks vectors")]
+        RERANK_CPU["text-reranker-runtime:cpu<br/>CrossEncoder rerank"]
+        RERANK_CUDA["text-reranker-runtime:cuda<br/>CrossEncoder rerank + GPU"]
     end
 
-    subgraph STORES["存储层"]
-        DB[("PostgreSQL<br/>主元数据存储")]
-        SQLITE[("SQLite 降级<br/>仅显式兼容路径")]
-        QDRANT[("Qdrant<br/>默认向量存储: knowledge_chunks")]
-        FALLBACK[("Fallback JSON 向量索引<br/>仅 fallback_compat 测试")]
-        FS["本地数据目录<br/>data/<课程名>/"]
-        REDIS[("Redis<br/>Celery 消息代理")]
+    subgraph HOST["宿主机挂载目录"]
+        DATA["data/<br/>course files, ingestion artifacts, DB data"]
+        MODELS["models/<br/>Hugging Face cache"]
     end
 
-    API --> DB
-    API -. "ENABLE_DATABASE_FALLBACK=true" .-> SQLITE
+    subgraph MODEL["外部模型 API"]
+        LLM["OpenAI-compatible endpoint<br/>embeddings / chat / graph extraction"]
+    end
+
+    API --> POSTGRES
+    API --> REDIS
     API --> QDRANT
-    COMP --> QDRANT
-    API -. "ENABLE_MODEL_FALLBACK=true" .-> FALLBACK
-    API --> FS
-    CELERY --> REDIS
+    API -->|"HTTP rerank via RERANKER_URL"| RERANK_CPU
+    API -. "RERANKER_DEVICE=cuda" .-> RERANK_CUDA
+    API -->|"real API, fallback disabled"| LLM
 
-    subgraph MODEL["模型提供方"]
-        LLM["OpenAI 兼容端点<br/>DashScope / OpenAI / 兼容 API"]
-    end
-
-    subgraph LOCAL_MODEL["本地模型缓存"]
-        RERANKER["Cross-Encoder reranker<br/>BAAI/bge-reranker-v2-m3"]
-    end
-
-    API -->|向量化 / 对话 / 图谱抽取| LLM
-    RETRIEVAL -->|top-N 重排| RERANKER
+    POSTGRES --- DATA
+    REDIS --- DATA
+    QDRANT --- DATA
+    API --- DATA
+    RERANK_CPU --- MODELS
+    RERANK_CUDA --- MODELS
 ```
 
-## 项目组成
+API 镜像保持轻量，不包含 PyTorch、CUDA 或 `sentence-transformers`。重排模型运行在独立的通用 `text-reranker-runtime:*` 容器中；`RERANKER_ENABLED=true` 时启用，CPU/CUDA 由 `.env` 的 `RERANKER_DEVICE` 控制。
 
-- `apps/web`：Next.js 前端工作台，包含上传、搜索、问答、图谱、概念卡片和设置页面。
-- `apps/api`：FastAPI 后端，负责课程管理、文件导入、解析、切块、向量化、检索、知识图谱构建和智能体问答。
-- `apps/worker`：可选后台组件，包含 Celery 导入 Worker 和目录监听器。
-- `packages/shared`：前后端共享的 TypeScript 数据契约。
-- `infra`：本地基础设施，包含 PostgreSQL、Redis、Qdrant 的 Docker Compose 配置。
+## 目录结构
 
-## 数据模型
+```text
+apps/api/             FastAPI 后端
+apps/web/             Next.js 前端
+apps/worker/          可选后台 worker
+packages/shared/      前后端共享 TypeScript 契约
+infra/                Docker Compose 与通用 reranker runtime
+data/                 本地持久化数据
+models/               本地模型缓存
+```
 
-系统使用 SQLAlchemy ORM 管理以下核心表：
+运行时主要持久化目录：
+
+```text
+data/postgres         PostgreSQL 数据
+data/qdrant           Qdrant 数据
+data/redis            Redis 数据
+data/storage          上传和归档文件
+data/ingestion        解析产物
+models/huggingface    reranker 模型缓存
+```
+
+## 数据模型架构
 
 ```mermaid
 erDiagram
     Course ||--o{ Document : has
     Course ||--o{ Concept : has
     Course ||--o{ IngestionBatch : has
+    Course ||--o{ IngestionJob : has
+    Course ||--o{ QASession : has
+    Course ||--o{ AgentRun : has
     Document ||--o{ DocumentVersion : versions
     Document ||--o{ Chunk : chunks
     DocumentVersion ||--o{ Chunk : chunks
     Concept ||--o{ ConceptAlias : aliases
-    Concept ||--o{ ConceptRelation : source_relations
+    Concept ||--o{ ConceptRelation : source
+    Concept ||--o{ ConceptRelation : target
     IngestionBatch ||--o{ IngestionJob : jobs
     IngestionBatch ||--o{ IngestionLog : logs
     IngestionJob ||--o{ IngestionCompensationLog : compensations
-    Course ||--o{ IngestionCompensationLog : vector_compensations
     QASession ||--o{ AgentRun : runs
     AgentRun ||--o{ AgentTraceEvent : traces
 ```
 
-关键约束：
+核心表：
 
-- `Course.name` UNIQUE — 课程名唯一
-- `Concept(course_id, normalized_name)` UNIQUE — 同课程内概念去重
-- `DocumentVersion(document_id, version)` UNIQUE — 文档版本号唯一
-- 所有主键使用 `UUID v4`（`String(36)`），分布式友好
-- `TimestampMixin` 自动维护 `created_at` / `updated_at`
-- 模式演进通过启动时的 `SCHEMA_PATCHES`（`ALTER TABLE ADD COLUMN`）实现
-
-## 跨存储协调
-
-系统涉及三类存储，各有不同的事务保障：
-
-| 存储 | 技术 | 事务保障 |
-|------|------|----------|
-| 关系数据库 | SQLAlchemy (PG/SQLite) | `autocommit=False`，完整 ACID |
-| 向量索引 | Qdrant / FallbackJSON | 无分布式事务 |
-| 文件系统 | 本地磁盘 | 无事务 |
-
-**跨存储一致性策略**：
-
-- **图谱构建**采用单事务模式（DELETE→INSERT→单次 COMMIT），ACID 合规。
-- **文档解析**采用两阶段激活：先提交 inactive 的新版本和 chunks，向量 upsert 成功后再激活新版本并停用旧版本。
-- **检索层**对向量存储返回的结果用数据库做二次验证（过滤已删除或不活跃的 chunk），防御跨存储不一致。
-- **批量操作**的异常处理采用 `rollback()→get()→标记 failed→commit()` 模式，单文件失败不污染批次。
-- **进程重启恢复**：`finalize_interrupted_batches()` 在 FastAPI 生命周期启动时处理 pending 的向量补偿日志，并将未完成的批次标记为失败。
+- `courses`：课程工作区，课程名唯一。
+- `documents` / `document_versions`：文档与版本，支持 inactive 新版本到 active 版本的两阶段切换。
+- `chunks`：可检索文本块，保存原始 chunk 内容、摘要、章节、页码、来源类型和 embedding 状态。
+- `concepts` / `concept_aliases` / `concept_relations`：概念、别名和图谱关系；关系可关联 `evidence_chunk_id`。
+- `ingestion_batches` / `ingestion_jobs` / `ingestion_logs` / `ingestion_compensation_logs`：导入批次、单文件任务、SSE 日志和向量补偿记录。
+- `qa_sessions` / `agent_runs` / `agent_trace_events`：问答会话、Agent 运行记录和节点级 trace。
 
 ## 并发与异步模型
 
+```mermaid
+flowchart LR
+    REQ["FastAPI request"] --> ASYNC["async route handlers"]
+    ASYNC --> BG["BackgroundTasks<br/>batch ingestion"]
+    ASYNC --> LLM["async model calls<br/>httpx / thread offload"]
+    BG --> LOCKS["source_path locks<br/>batch mutex"]
+    BG --> DBTX["SQLAlchemy transaction"]
+    BG --> VECTOR["Qdrant upsert"]
+    BG --> LOGS["SSE ingestion logs"]
+    AGENT["Agent graph"] --> NODE["node execution"]
+    NODE --> TRACE["commit current_node + trace event"]
 ```
-FastAPI (uvicorn) ─── 异步 API 路由
-  ├── BackgroundTasks ─── async callable / Celery 入口
-  │     └── run_uploaded_files_ingestion（复用事件循环）
-  ├── LLM 调用 ─── httpx.AsyncClient / asyncio.to_thread(curl)
-  ├── 图谱抽取 ─── asyncio.gather() + Semaphore(2)
-  └── QA 流式输出 ─── SSE token + trace 事件
-```
 
-**并发控制机制**：
+并发控制：
 
-| 机制 | 位置 | 保护范围 |
-|------|------|----------|
-| SQLAlchemy 会话 | `autocommit=False` | 数据库事务隔离 |
-| `source_path` 应用锁 | `ingest_file` | 同一文件导入串行化 |
-| 非终态批次互斥 | `create_sync_batch` / `create_uploaded_files_batch` | 同课程同一时间只保留一个活跃导入批次 |
-| `asyncio.Semaphore(2)` | `extract_llm_graph_payloads` | LLM API 并发限流 |
-| `portalocker` / 进程锁 | `FallbackVectorStore` | fallback JSON 向量文件多进程互斥 |
-| LRU 锁注册表 | `_VECTOR_FILE_LOCKS` / `_SOURCE_PATH_LOCKS` | 长期运行时限制锁表增长 |
-| fsync 文件写入 | `_write`（临时文件+替换+fsync） | fallback 向量文件写入完整性 |
-
-**设计决策**：智能体流程中每个 LangGraph 节点执行时都会 `db.commit()` 更新 `current_node` 和追踪事件。这是有意的可观测性设计，使前端能通过 `/tasks/{run_id}` 实时追踪智能体执行进度。
+- SQLAlchemy 会话使用显式事务，导入失败时回滚当前文件或当前批次的受影响部分。
+- 同一课程同一时间只保留一个非终态导入批次，避免重复解析和重复写向量。
+- 同一文件通过 `source_path` 应用层锁串行化导入。
+- 图谱抽取使用有限并发，避免模型 API 过载。
+- Agent 每个节点都会提交 `current_node` 和 `agent_trace_events`，前端可实时轮询或流式展示进度。
+- Qdrant 写入失败时通过补偿日志记录待恢复操作，应用启动时会执行中断批次收敛和补偿处理。
 
 ## 降级策略
 
-默认降级功能是上锁的：
+默认配置：
 
 ```env
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
-这意味着系统不会静默降级到假向量化、抽取式答案、本地 JSON 向量索引或 SQLite。默认要求：
+默认行为：
 
-- `OPENAI_API_KEY` 可用，用于向量化、对话和图谱抽取。
-- `QDRANT_URL` 指向可访问的 Qdrant 实例。
-- `DATABASE_URL` 指向可访问的 PostgreSQL 实例。
+- 模型 API 不可用时直接失败，不静默切换到假 embedding 或抽取式回答。
+- PostgreSQL 不可用时直接失败，不静默切换到 SQLite。
+- Qdrant 不可用时检索失败，不把本地 JSON fallback 当作生产检索路径。
+- `/api/health` 会返回 `degraded_mode`，评估和正式运行应要求其为 `false`。
 
-只有在本地离线调试时才建议显式解锁：
+fallback 仅用于显式的离线开发或兼容性测试，不应用于系统质量评估或生产数据判断。
 
-```env
-ENABLE_MODEL_FALLBACK=true
-ENABLE_DATABASE_FALLBACK=true
+## 导入流程
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant Web as Web
+    participant API as API
+    participant FS as data/storage
+    participant DB as PostgreSQL
+    participant Model as Model API
+    participant Qdrant as Qdrant
+
+    User->>Web: 上传或选择课程文件
+    Web->>API: POST /api/files/upload
+    API->>FS: 保存归档文件
+    API->>DB: 创建 document/job
+    Web->>API: POST /api/ingestion/parse-uploaded-files
+    API->>DB: 创建 ingestion batch
+    API-->>Web: batch_id
+    API->>API: 解析 PDF/PPT/DOCX/MD/Notebook/HTML/Image
+    API->>API: chunk、去重、过滤低信息块
+    API->>Model: 生成 metadata-enriched embedding
+    API->>Qdrant: upsert vectors
+    API->>DB: 激活 document version 和 chunks
+    API->>Model: 抽取概念与关系
+    API->>DB: 单事务重建图谱
+    API-->>Web: SSE 批次日志与最终状态
 ```
 
-解锁后，系统可能使用确定性本地哈希向量、抽取式回退答案，或 `data/<课程名>/ingestion/vector_index.json` 作为向量索引兜底。这些结果只适合开发验证，不适合作为正式知识库质量判断。
+导入写入策略：
 
-数据库层的 SQLite 降级同样必须显式开启。生产环境不要依赖 SQLite fallback，也不要把 fallback 兼容性测试作为默认验收门禁。
+- 文档解析产物写入 `data/ingestion`。
+- 上传和归档文件写入 `data/storage`。
+- chunk 原文进入 PostgreSQL，embedding 文本会额外拼接文档、章节、section、来源类型等元数据。
+- 向量写入 Qdrant 后再激活新版本，降低 DB 与向量库不一致的概率。
+- 图谱关系写入 PostgreSQL，关系 evidence 指向真实 chunk。
 
-## 数据目录结构
+## RAG 架构
 
-默认数据根目录是 `data/`。每门课程会创建独立目录：
+```mermaid
+flowchart TB
+    subgraph OFFLINE["离线索引阶段"]
+        SRC["Course files"] --> PARSE["Document parsers"]
+        PARSE --> CHUNK["Semantic chunking<br/>dedup + filtering"]
+        CHUNK --> EMBTXT["Metadata-enriched embedding text"]
+        EMBTXT --> EMB["Embedding API"]
+        EMB --> VEC[("Qdrant knowledge_chunks")]
+        CHUNK --> DBW[("PostgreSQL chunks")]
+        CHUNK --> GRAPH_EXTRACT["LLM graph extraction"]
+        GRAPH_EXTRACT --> KG[("Concepts + Relations")]
+    end
+
+    subgraph ONLINE["在线查询阶段"]
+        Q["User query"] --> QT["Query type classifier"]
+        QT --> DENSE["Dense vector recall"]
+        QT --> BM25["BM25 lexical recall"]
+        DENSE --> WSF["Weighted Score Fusion<br/>query-type alpha + min-max"]
+        BM25 --> WSF
+        WSF --> RERANK["Optional external bge-reranker<br/>HTTP runtime"]
+        RERANK --> TOPK["Top-K chunks"]
+        TOPK --> ANSWER["Chat model answer<br/>with citations"]
+    end
+
+    VEC --> DENSE
+    DBW --> BM25
+    KG -. "pending controlled GraphRAG" .-> ONLINE
+```
+
+当前主检索路径：
 
 ```text
-data/
-  <课程名>/
-    storage/       上传文件和归档副本
-    ingestion/     解析 JSON 和可选的降级向量索引 vector_index.json
-    source/        可选的监听源文件目录
-  qdrant/          Qdrant 持久化存储
-  postgres/        PostgreSQL 持久化存储
-  redis/           Redis 持久化存储
+Dense 向量召回 + BM25 词面召回 + WSF 融合 + 可选外部 bge-reranker 重排
 ```
 
-主要持久化位置：
+## GraphRAG 工作流
 
-- 图谱节点和关系：PostgreSQL 表 `concepts`、`concept_relations`。
-- 问答历史：PostgreSQL 表 `qa_sessions`，消息在 `transcript` 字段。
-- 智能体运行轨迹：`agent_runs`、`agent_trace_events`。
-- 文档、版本、切块和导入批次：`documents`、`document_versions`、`chunks`、`ingestion_batches`、`ingestion_jobs`。
-- 向量索引：Qdrant 集合 `knowledge_chunks`。
+图谱构建、图谱浏览和关系存储已经可用；GraphRAG 增强检索仍是待升级能力，进入主排序链路前需要完成语义门控和 evidence 支持性验证。
 
-## 环境要求
+```mermaid
+flowchart LR
+    BASE["Hybrid retrieval top chunks"] --> SEED["Find concepts and relations<br/>from evidence chunks"]
+    SEED --> HOP["1-hop relation expansion"]
+    HOP --> EVIDENCE["Candidate evidence chunks"]
+    EVIDENCE --> GATE["Semantic gate<br/>query-relation-evidence support"]
+    GATE --> MERGE["Controlled merge"]
+    MERGE --> RERANK["Rerank with base candidates"]
+    RERANK --> FINAL["Final top-K context"]
+```
 
-- Docker Desktop 或支持 Compose v2 的 Docker Engine
-- 如需使用 GPU reranker：NVIDIA Driver + NVIDIA Container Toolkit
+升级原则：
+
+- 图谱扩展只能补充候选 evidence，不能绕过文本证据直接提升答案。
+- 关系必须由 evidence chunk 支持，且 relation type 要通过语义校验。
+- comparison / relationship 类问题优先启用图谱门控；普通定义类问题默认走主检索路径。
+
+## 智能体问答流程
+
+```mermaid
+flowchart TB
+    Q["User question"] --> ANALYZE["query_analyzer"]
+    ANALYZE --> ROUTER["router"]
+    ROUTER -->|"direct / clarify"| ANSWER["answer_generator"]
+    ROUTER -->|"retrieve"| REWRITE["query_rewriter"]
+    ROUTER -->|"multi-hop / relation"| MULTIHOP["multi_hop_rewriter"]
+    REWRITE --> RETRIEVE["hybrid_retriever<br/>Dense + BM25 + WSF + optional rerank"]
+    MULTIHOP --> RETRIEVE
+    RETRIEVE --> GRADE["document_grader"]
+    GRADE -->|"insufficient, retry available"| RETRY["retry_planner"]
+    RETRY --> REWRITE
+    GRADE -->|"has evidence"| CONTEXT["context_synthesizer"]
+    CONTEXT --> ANSWER
+    ANSWER --> CITE["citation_checker"]
+    CITE --> SELF["self_check"]
+    SELF --> FINAL["final response + trace"]
+```
+
+Agent 运行信息写入 `agent_runs`，节点事件写入 `agent_trace_events`。`/api/tasks/{run_id}` 和 `/api/agent/runs/{run_id}` 用于查询运行状态。
 
 ## 配置
 
-创建根目录环境变量文件：
+创建环境文件：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-最小本地开发配置：
+关键配置：
 
 ```env
-API_CPU_IMAGE=course-kg-api:local
-API_CUDA_IMAGE=course-kg-api-cuda:local
+API_IMAGE=course-kg-api:local
 WEB_IMAGE=course-kg-web:local
+RERANKER_CPU_IMAGE=text-reranker-runtime:cpu
+RERANKER_CUDA_IMAGE=text-reranker-runtime:cuda
+
 DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/knowledge_base
 QDRANT_URL=http://localhost:6333
-QDRANT_COLLECTION=knowledge_chunks
 REDIS_URL=redis://localhost:6379/0
-COURSE_NAME=Sample Course
-DATA_ROOT=./data
-OPENAI_API_KEY=
+
 OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=
 EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
-EMBEDDING_DIMENSIONS=1024
+
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+RERANKER_ENABLED=true
 RERANKER_DEVICE=cpu
+
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
-CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
-API_KEYS=
 ```
 
-如果使用 DashScope 或其他 OpenAI 兼容端点，请相应设置 `OPENAI_BASE_URL` 和 `OPENAI_API_KEY`。
+`RERANKER_ENABLED=false` 时，检索链路直接输出 WSF 融合结果，不启动 reranker runtime；这不是 fallback。`RERANKER_DEVICE` 只支持 `cpu` 和 `cuda`，仅在启用 reranker 时生效。
+
+前端设置页可以直接切换 reranker。启用前，Web 会调用 `/api/settings/runtime-check` 检查 `.env` / `.env.example` key 同步、reranker runtime、模型缓存、PostgreSQL、Qdrant 与 Redis 连通性；如果基础设施不完整，会弹出结构化错误窗口并给出修复命令，不会静默保存失败配置。
+
+## 验证已有基础设施
+
+```powershell
+docker run --rm postgres:16 postgres --version
+docker run --rm redis:7 redis-server --version
+docker image inspect qdrant/qdrant:v1.13.2
+docker run --rm text-reranker-runtime:cpu python -c "import torch; print(torch.__version__)"
+docker run --rm --gpus all text-reranker-runtime:cuda python -c "import torch; print(torch.cuda.is_available())"
+```
+
+CUDA 验证应输出 `True`。如果不是，先检查 NVIDIA Driver 和 NVIDIA Container Toolkit。
 
 ## 构建镜像
 
-启动脚本只负责启动 Compose，不会自动构建镜像。首次运行或依赖变更后，在仓库根目录构建 CPU API 和 Web 镜像：
+只构建缺少或需要更新的镜像：
 
 ```powershell
 docker build -f apps/api/Dockerfile -t course-kg-api:local .
 docker build -f apps/web/Dockerfile -t course-kg-web:local .
+docker build -f infra/reranker/Dockerfile.cpu -t text-reranker-runtime:cpu infra/reranker
+docker build -f infra/reranker/Dockerfile.cuda -t text-reranker-runtime:cuda infra/reranker
 ```
 
-如果需要 CUDA reranker，先确认是否已有可用的 CUDA API 镜像。已有镜像时，在 `.env` 设置：
-
-```env
-API_CUDA_IMAGE=<your-cuda-api-image>
-```
-
-没有现成镜像时，构建项目默认 CUDA API 镜像：
-
-```powershell
-docker build -f apps/api/Dockerfile.cuda -t course-kg-api-cuda:local .
-```
+`text-reranker-runtime:*` 是通用基础设施镜像，可被其他项目复用。已有等价镜像时可在 `.env` 中设置自己的镜像名。
 
 ## 模型缓存
 
-Cross-Encoder reranker 模型缓存使用仓库内 `models/huggingface`，容器内挂载为 `/app/models/huggingface`。首次检索会自动下载模型；也可以在镜像构建后预下载：
+Reranker 模型从宿主机挂载，不打进镜像：
 
-```powershell
-docker run --rm -v "${PWD}\models:/app/models" -e HF_HOME=/app/models/huggingface course-kg-api:local uv run python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3', max_length=512)"
+```text
+models/huggingface -> /models/huggingface
 ```
 
-国内网络可在命令中追加 `-e HF_ENDPOINT=https://hf-mirror.com`。
+预下载模型：
 
-## 启动应用服务
+```powershell
+docker run --rm -v "${PWD}\models:/models" -e HF_HOME=/models/huggingface text-reranker-runtime:cpu python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3', max_length=512, device='cpu')"
+```
 
-推荐使用仓库根目录的 Windows 启动器：
+需要 Hugging Face 镜像源时可追加：
+
+```powershell
+-e HF_ENDPOINT=https://hf-mirror.com
+```
+
+## 启动
+
+启动完整应用：
 
 ```powershell
 .\start-app.ps1
 ```
 
-启动器会读取 `.env` 的 `RERANKER_DEVICE`，只支持：
-
-```env
-RERANKER_DEVICE=cpu
-```
-
-或：
-
-```env
-RERANKER_DEVICE=cuda
-```
-
-脚本会启动：
-
-- API 服务：`http://127.0.0.1:8000/api`
-- Web 前端：`http://127.0.0.1:3000`
-- PostgreSQL、Redis、Qdrant
-- 浏览器默认打开 `/graph` 页面
-
-不打开浏览器启动：
+常用参数：
 
 ```powershell
 .\start-app.ps1 -NoBrowser
-```
-
-使用自定义端口：
-
-```powershell
 .\start-app.ps1 -BackendPort 8001 -FrontendPort 3001 -OpenPath "/search"
 ```
 
@@ -304,182 +372,53 @@ RERANKER_DEVICE=cuda
 
 ```powershell
 docker compose -f infra/docker-compose.yml down
-```
-
-CUDA 模式停止服务：
-
-```powershell
 docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down
 ```
 
-## 本地依赖策略
+## API 端点
 
-项目运行不再依赖 Windows 侧 `.venv`、`node_modules` 或 `.next`。这些目录属于可重建缓存，不应作为运行前提；数据目录 `data/`、模型目录 `models/` 和 `.env` 仍保留在宿主机。
-
-## 导入流程
-
-```mermaid
-sequenceDiagram
-    participant 用户
-    participant 前端
-    participant API
-    participant 文件存储 as 课程存储
-    participant 数据库 as PostgreSQL
-    participant 模型 as 模型 API
-    participant Qdrant
-
-    用户->>前端: 上传或同步课程文件
-    前端->>API: POST /api/files/upload 或 /api/ingestion/parse-uploaded-files
-    API->>文件存储: 保存归档副本
-    API->>API: 解析文档（PDF/PPTX/DOCX/MD/Notebook/OCR）
-    API->>API: 切块、去重和过滤（text 800/120，code 700/100）
-    API->>模型: 使用元数据增强文本批量异步生成向量
-    API->>Qdrant: 写入向量
-    API->>数据库: 存储文档、版本、切块（commit）
-    API->>模型: 抽取概念图谱（Semaphore 限流）
-    API->>数据库: 重建图谱（单事务 DELETE→INSERT→COMMIT）
-    API-->>前端: 通过 SSE 流推送批次状态
-```
-## RAG 检索增强生成架构
-
-下图展示了系统完整的 RAG（检索增强生成）管线，包含离线索引阶段和在线查询阶段：
-
-```mermaid
-flowchart TB
-    subgraph IDX["离线索引阶段 - 导入时执行"]
-        direction TB
-        SRC["源文件<br/>PDF / PPTX / DOCX / MD / Notebook / HTML / 图片"]
-        SRC --> PARSE["文档解析器<br/>结构化提取 + OCR"]
-        PARSE --> CHUNK["语义切块 + 去重/过滤<br/>text=800/120<br/>code=700/100"]
-        CHUNK --> EMB["元数据增强向量化<br/>Document / Chapter / Section / Source Type / Content Kind<br/>DB chunk.content 保持原文"]
-        CHUNK --> META["元数据提取<br/>章节 / 类型 / 页码 / 标题"]
-        EMB --> VEC_W[("向量存储写入<br/>Qdrant / FallbackJSON")]
-        META --> DB_W[("关系数据库写入<br/>Document, Chunk")]
-        CHUNK --> LLM_G["LLM 图谱抽取<br/>Semaphore 限流"]
-        LLM_G --> GRAPH_W[("知识图谱写入<br/>Concept, Relation<br/>单事务 ACID")]
-    end
-
-    subgraph QRY["在线查询阶段 - 用户提问时执行"]
-        direction TB
-        Q["用户问题"] --> QA["查询分析<br/>分词 / 意图识别 / query type"]
-        QA --> ROUTE{"路由决策"}
-        ROUTE -->|直答 / 澄清| DIRECT["直接回答<br/>无需检索"]
-        ROUTE -->|笔记 / 习题 / 通用| REWRITE["查询改写<br/>LLM 上下文消歧"]
-        ROUTE -->|多跳 / 比较 / 关系| MULTI_HOP["多跳拆解<br/>子查询生成"]
-        REWRITE --> DENSE["稠密检索<br/>向量相似度"]
-        REWRITE --> LEX["BM25 词面检索<br/>数据库 active chunks"]
-        MULTI_HOP --> DENSE
-        MULTI_HOP --> LEX
-        DENSE --> WSF["WSF 融合排序<br/>query type alpha + min-max 归一化"]
-        LEX --> WSF
-        WSF --> RERANK["Cross-Encoder 重排<br/>BAAI/bge-reranker-v2-m3"]
-        RERANK --> GRAPH_EXT["GraphRAG 扩展<br/>待升级：暂不作为主检索排序路径"]
-        GRAPH_EXT --> GRADE["文档评分<br/>词项重叠 + 分数阈值"]
-        GRADE -->|文档不足, 重试次数不足| RETRY["重试规划<br/>扩展查询词"]
-        RETRY --> DENSE
-        GRADE -->|有相关文档| CTX["上下文合成<br/>top-K 摘录拼接"]
-        CTX --> GEN["答案生成<br/>LLM + 课程上下文约束"]
-        GEN --> CITE["引用检查<br/>过滤无关引用"]
-        CITE --> SELF["自检<br/>状态闭合"]
-    end
-
-    subgraph STR["存储层"]
-        VEC[("Qdrant<br/>向量索引")]
-        DB[("PostgreSQL<br/>元数据 + 切块")]
-        KG[("知识图谱<br/>概念 + 关系")]
-    end
-
-    VEC_W -.-> VEC
-    DB_W -.-> DB
-    GRAPH_W -.-> KG
-    DENSE --> VEC
-    LEX --> DB
-    GRAPH_EXT -. "待升级" .-> KG
-    GRADE -->|二次验证| DB
-```
-
-**核心设计要点**：
-
-| 阶段 | 关键机制 | 说明 |
-|------|----------|------|
-| 切块 | 评测优选策略 `chunk_800_metadata_enriched_v1` | 普通文本 `chunk_size=800, overlap=120`；代码块 `chunk_size=700, overlap=100`；继续使用递归分隔符和 Markdown 标题层级 |
-| 去重/过滤 | 文档与 chunk 两层清理 | 文档按规范化标题 + checksum 去重；chunk 按规范化内容 hash 去重；过滤目录页、页码/图号、乱码、过短低信息块、notebook output 和低信息纯代码 |
-| 向量文本 | 元数据增强，原文入库 | embedding input 追加 Document / Chapter / Section / Source Type / Content Kind；`chunks.content` 保持原始 chunk 文本，Qdrant payload 标记 `embedding_text_version=metadata_enriched_v1` |
-| 向量化 | 批量异步；fallback 默认禁用 | OpenAI 兼容 API；`ENABLE_MODEL_FALLBACK=false` 时失败直接暴露，不静默降级 |
-| 检索 | Dense + BM25 + WSF + reranker | 两路独立召回，按 query type 配置 Dense/BM25 权重，min-max 归一化后 WSF 融合，再用 `BAAI/bge-reranker-v2-m3` 重排 |
-| 评分 | 词项重叠 + 内容类型加权 | 文本 +1.1 / 代码 -1.8 / 标题命中 +1.4 |
-| 一致性 | 检索二次验证 | 向量结果与数据库交叉验证，过滤已删除和不活跃切块 |
-| 图谱 | 单事务全量重建；GraphRAG 待升级 | DELETE→INSERT→COMMIT，ACID 合规；图谱浏览和关系存储已可用，图谱增强检索仍需进一步评估和升级后再纳入主排序链路 |
-
-### GraphRAG 工作流
-
-当前图谱构建、图谱浏览和关系存储已落地，但 GraphRAG 增强检索仍标记为待升级能力。上一轮评估显示，直接把图谱邻居扩展并入主排序链路可能带来噪声，因此当前主检索路径优先使用 Dense + BM25 + WSF + reranker；GraphRAG 后续应升级为“语义门控 + 证据支持校验 + 重排后注入”的受控路径。
-
-计划升级后的单跳扩展（1-Hop Expansion）机制如下：
-
-```mermaid
-graph LR
-    BASE[混合检索基础 Chunk] --> REL[提取关联的 1 跳邻居关系]
-    REL --> NEW[发现新证据 Chunk]
-    NEW --> BOOST[计算图谱提权分]
-    BOOST --> VERIFY[证据支持校验]
-    VERIFY --> MERGE[与基础结果受控融合重排]
-    BASE --> MERGE
-```
-
-## 智能体问答流程
-
-```mermaid
-graph LR
-    A[查询分析器] --> B[路由器]
-    B -->|常规检索| C[查询改写器]
-    B -->|多跳/关系| C2[多跳拆解器]
-    B -->|直答/澄清| G[答案生成器]
-    C --> D[混合检索器<br/>Dense+BM25+WSF+reranker]
-    C2 --> D2[图谱增强检索器<br/>GraphRAG 待升级]
-    D --> E[文档评分器]
-    D2 --> E
-    E -->|有文档| F[上下文合成器]
-    E -->|重试 < 2| R[重试规划器]
-    R --> D
-    F --> G
-    G --> H[引用检查器]
-    H --> I[自检器]
-```
-
-每个节点执行时实时更新 `AgentRun.current_node` 和 `AgentTraceEvent`（每节点一次 commit），支持前端进度追踪。
-
-## 主要 API 端点
-
-- `GET /api/courses` — 课程列表
-- `POST /api/courses` — 创建课程
-- `GET /api/courses/current/dashboard?course_id=...` — 课程仪表盘
-- `GET /api/courses/current/graph?course_id=...` — 课程图谱
-- `GET /api/graph/chapters/{chapter}?course_id=...` — 章节图谱
-- `GET /api/graph/nodes/{concept_id}?course_id=...` — 概念节点详情
-- `GET /api/concepts?course_id=...` — 概念卡片列表
-- `POST /api/files/upload?course_id=...` — 上传文件
-- `POST /api/ingestion/parse-uploaded-files` — 解析已上传文件
-- `POST /api/ingestion/parse-storage?course_id=...` — 解析存储目录
-- `GET /api/ingestion/batches/{batch_id}` — 批次状态
-- `GET /api/ingestion/batches/{batch_id}/logs` — 批次日志（SSE 流）
-- `POST /api/search` — 混合检索
-- `POST /api/qa` — 智能体问答
-- `POST /api/qa/stream` — 流式智能体问答（SSE 流）
-- `POST /api/agent` — 智能体调用
-- `GET /api/tasks/{run_id}` — 智能体运行状态
-- `GET /api/sessions?course_id=...` — 会话列表
-- `GET /api/sessions/{session_id}/messages` — 会话消息
-- `DELETE /api/sessions/{session_id}` — 删除会话
-- `GET /api/settings/model` — 模型设置
-- `PUT /api/settings/model` — 更新模型设置
+| Method | Path | 用途 |
+|---|---|---|
+| GET | `/api/health` | 健康检查与 degraded 状态 |
+| GET | `/api/settings/model` | 读取模型配置 |
+| PUT | `/api/settings/model` | 更新模型配置 |
+| GET | `/api/settings/runtime-check` | 检查 `.env` 同步、reranker runtime 与基础设施状态 |
+| GET | `/api/courses` | 课程列表 |
+| POST | `/api/courses` | 创建课程 |
+| DELETE | `/api/courses/{course_id}` | 删除课程及其数据 |
+| GET | `/api/courses/current/dashboard` | 当前课程仪表盘 |
+| POST | `/api/courses/current/refresh` | 刷新当前课程状态 |
+| GET | `/api/course-files` | 课程文件列表 |
+| DELETE | `/api/course-files` | 删除课程文件 |
+| POST | `/api/maintenance/cleanup-stale-data` | 清理陈旧数据 |
+| POST | `/api/maintenance/cleanup-stale-graph` | 清理陈旧图谱 |
+| GET | `/api/courses/current/graph` | 课程图谱 |
+| GET | `/api/graph/chapters/{chapter}` | 章节图谱 |
+| GET | `/api/graph/nodes/{concept_id}` | 概念节点详情 |
+| GET | `/api/concepts` | 概念卡片 |
+| POST | `/api/files/upload` | 上传文件 |
+| POST | `/api/ingestion/parse-uploaded-files` | 解析已上传文件 |
+| POST | `/api/ingestion/parse-storage` | 解析课程 storage 目录 |
+| GET | `/api/ingestion/batches/{batch_id}` | 导入批次状态 |
+| GET | `/api/ingestion/batches/{batch_id}/logs` | 导入日志 SSE |
+| GET | `/api/jobs/{job_id}` | 单文件任务状态 |
+| POST | `/api/search` | 混合检索 |
+| POST | `/api/qa` | Agent 问答 |
+| POST | `/api/qa/stream` | Agent 问答 SSE |
+| POST | `/api/agent` | Agent 调用 |
+| GET | `/api/agent/runs/{run_id}` | Agent 运行状态 |
+| GET | `/api/tasks/{run_id}` | Agent 运行状态别名 |
+| GET | `/api/sessions` | 会话列表 |
+| GET | `/api/sessions/{session_id}` | 会话摘要 |
+| GET | `/api/sessions/{session_id}/messages` | 会话消息 |
+| DELETE | `/api/sessions/{session_id}` | 删除会话 |
 
 ## 开发说明
 
-- `.env`、`data/`、本地数据库和生成的日志文件不要提交到 Git。
-- `ingestion/` 目录包含派生的解析产物，可从存储的源文件重新生成。
-- `storage/` 目录包含上传或复制的源文件，删除后将无法重新导入。
-- API 在启动时使用轻量级模式补丁（`SCHEMA_PATCHES` + `ALTER TABLE ADD COLUMN`）而非 Alembic 迁移。
-- 认证和生产级授权尚未实现。
-- `FallbackVectorStore` 使用线程级锁和原子临时文件写入；适用于单进程部署，不适用于多 Worker 配置。
-- `finalize_interrupted_batches()` 在启动时运行，将未完成的批次标记为失败，提供导入管线的崩溃恢复。
+- 默认不使用模型 fallback 或数据库 fallback。
+- 不把 `.env`、`data/`、`models/`、`output/` 提交到 Git。
+- API 容器只承载项目后端依赖；PyTorch/CUDA 只存在于通用 reranker runtime。
+- 生产数据应使用 PostgreSQL + Qdrant，不依赖 SQLite 或 JSON fallback。
+- API 启动时会执行轻量 schema patch 和中断导入批次收敛，不使用 Alembic 迁移。
+- 课程数据按课程隔离，上传文件、解析产物、chunks、图谱、QA 会话都绑定 `course_id`。
+- `retrieval_architecture.md` 属于本地设计草稿，当前 README 是项目架构说明的主要入口。

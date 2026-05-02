@@ -222,7 +222,7 @@ async def hybrid_search_chunks(db: Session, course_id: str, query: str, filters:
     if not dense_results:
         return lexical_results[:top_k]
     if not lexical_results:
-        return RerankerProvider.get().rerank(query, dense_results, top_k)
+        return rerank_or_return(query, dense_results, top_k)
 
     candidates = weighted_score_fusion(
         dense_results,
@@ -232,7 +232,16 @@ async def hybrid_search_chunks(db: Session, course_id: str, query: str, filters:
     )
     for item in candidates:
         item.setdefault("metadata", {}).setdefault("scores", {})["query_type"] = config["query_type"]
-    return RerankerProvider.get().rerank(query, candidates, top_k)
+    return rerank_or_return(query, candidates, top_k)
+
+
+def rerank_or_return(query: str, candidates: list[dict], top_k: int) -> list[dict]:
+    settings = get_settings()
+    if settings.reranker_enabled:
+        return RerankerProvider.get().rerank(query, candidates, top_k)
+    for item in candidates:
+        item.setdefault("metadata", {}).setdefault("scores", {})["rerank_enabled"] = False
+    return candidates[:top_k]
 
 
 def weighted_score_fusion(dense_results: list[dict], lexical_results: list[dict], alpha: float, top_n: int) -> list[dict]:

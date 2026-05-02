@@ -35,6 +35,46 @@ describe("api client", () => {
     );
   });
 
+  it("fetches runtime checks with reranker requirement", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        env_sync: { synced: true, missing_keys: [], extra_keys: [], bom_keys: [] },
+        reranker: { enabled: true, device: "cpu", model: "model", url: "http://reranker:8080/rerank", reachable: true, healthy: true },
+        infrastructure: { postgres: true, qdrant: true, redis: true },
+        blocking_issues: [],
+        warnings: [],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchRuntimeCheck } = await import("./api");
+
+    await fetchRuntimeCheck(true);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/settings/runtime-check?require_reranker=true",
+      expect.objectContaining({ headers: { "X-API-Key": "test-key" } }),
+    );
+  });
+
+  it("throws structured API errors", async () => {
+    const body = {
+      detail: {
+        code: "runtime_check_failed",
+        title: "Runtime infrastructure check failed",
+        message: "Reranker cannot be enabled.",
+        issues: [{ code: "reranker_unreachable", title: "Missing", message: "No runtime", fix_commands: [".\\start-app.ps1"] }],
+        fix_commands: [".\\start-app.ps1"],
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status: 409 })));
+    const { updateModelSettings } = await import("./api");
+
+    await expect(updateModelSettings({ reranker_enabled: true })).rejects.toMatchObject({
+      status: 409,
+      structured: body.detail,
+    });
+  });
+
   it("adds API key to batch log URLs for EventSource", async () => {
     const { getBatchLogUrl } = await import("./api");
 

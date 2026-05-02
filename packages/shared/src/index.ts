@@ -236,6 +236,10 @@ export interface ModelSettingsResponse {
   embedding_dimensions: number;
   graph_extraction_chunk_limit: number;
   graph_extraction_chunks_per_document: number;
+  reranker_enabled: boolean;
+  reranker_model: string;
+  reranker_device: "cpu" | "cuda";
+  reranker_url: string;
   has_api_key: boolean;
   degraded_mode: boolean;
 }
@@ -250,6 +254,58 @@ export interface ModelSettingsUpdate {
   embedding_dimensions?: number | null;
   graph_extraction_chunk_limit?: number | null;
   graph_extraction_chunks_per_document?: number | null;
+  reranker_enabled?: boolean | null;
+  reranker_model?: string | null;
+  reranker_device?: "cpu" | "cuda" | null;
+}
+
+export interface RuntimeIssue {
+  code: string;
+  title: string;
+  message: string;
+  fix_commands: string[];
+}
+
+export interface EnvSyncStatus {
+  synced: boolean;
+  missing_keys: string[];
+  extra_keys: string[];
+  bom_keys: string[];
+}
+
+export interface RerankerRuntimeStatus {
+  enabled: boolean;
+  device: string;
+  model: string;
+  url: string;
+  reachable: boolean;
+  healthy: boolean;
+  reported_model?: string | null;
+  reported_device?: string | null;
+  model_matches?: boolean | null;
+  device_matches?: boolean | null;
+}
+
+export interface InfrastructureStatus {
+  postgres: boolean;
+  qdrant: boolean;
+  redis: boolean;
+}
+
+export interface RuntimeCheckResponse {
+  env_sync: EnvSyncStatus;
+  reranker: RerankerRuntimeStatus;
+  infrastructure: InfrastructureStatus;
+  blocking_issues: RuntimeIssue[];
+  warnings: RuntimeIssue[];
+}
+
+export interface StructuredApiErrorBody {
+  code: string;
+  title: string;
+  message: string;
+  issues: RuntimeIssue[];
+  fix_commands: string[];
 }
 
 export interface RelatedConcept {

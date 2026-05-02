@@ -1,14 +1,35 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import type { ModelSettingsUpdate } from "@course-kg/shared";
+import { useEffect, useMemo, useState } from "react";
+import type { ModelSettingsUpdate, RuntimeCheckResponse, RuntimeIssue, StructuredApiErrorBody } from "@course-kg/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, EyeOff, KeyRound, Loader2, PencilLine, RotateCcw, Save, ServerCog, ShieldAlert } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  EyeOff,
+  KeyRound,
+  Loader2,
+  PencilLine,
+  RotateCcw,
+  Save,
+  ServerCog,
+  ShieldAlert,
+  SlidersHorizontal,
+  XCircle,
+} from "lucide-react";
 
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { fetchModelSettings, updateModelSettings } from "@/lib/api";
+import { fetchModelSettings, fetchRuntimeCheck, updateModelSettings } from "@/lib/api";
 
 type SettingsForm = {
   base_url: string;
@@ -20,20 +41,133 @@ type SettingsForm = {
   graph_extraction_chunks_per_document: string;
   api_key: string;
   clear_api_key: boolean;
+  reranker_enabled: boolean;
+  reranker_model: string;
+  reranker_device: "cpu" | "cuda";
 };
+
+type ErrorDialogState = {
+  title: string;
+  message: string;
+  status?: number;
+  issues: RuntimeIssue[];
+  fixCommands: string[];
+};
+
+function errorDialogFromUnknown(error: unknown): ErrorDialogState {
+  const typed = error as Error & { status?: number; structured?: StructuredApiErrorBody };
+  if (typed?.structured) {
+    return {
+      title: typed.structured.title || "操作失败",
+      message: typed.structured.message || typed.message,
+      status: typed.status,
+      issues: typed.structured.issues ?? [],
+      fixCommands: typed.structured.fix_commands ?? [],
+    };
+  }
+  return {
+    title: "操作失败",
+    message: typed?.message || "请求没有成功完成。",
+    status: typed?.status,
+    issues: [],
+    fixCommands: [],
+  };
+}
+
+function runtimeIssueDialog(check: RuntimeCheckResponse): ErrorDialogState | null {
+  if (!check.blocking_issues.length) {
+    return null;
+  }
+  return {
+    title: "基础设施检测未通过",
+    message: "当前运行环境不满足本次操作的前置条件，请按提示修复后重试。",
+    issues: check.blocking_issues,
+    fixCommands: Array.from(new Set(check.blocking_issues.flatMap((issue) => issue.fix_commands))),
+  };
+}
+
+function RuntimeStatusBadge({ check }: { check?: RuntimeCheckResponse }) {
+  if (!check) {
+    return <span className="text-white/42">未检测</span>;
+  }
+  if (!check.reranker.enabled) {
+    return <span className="text-white/58">未启用</span>;
+  }
+  if (check.reranker.healthy && check.reranker.model_matches !== false && check.reranker.device_matches !== false) {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-emerald-100">
+        <CheckCircle2 className="size-4" />
+        可用
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5 text-amber-100">
+      <AlertTriangle className="size-4" />
+      需处理
+    </span>
+  );
+}
+
+function ErrorDialog({ state, onClose }: { state: ErrorDialogState | null; onClose: () => void }) {
+  return (
+    <Dialog open={Boolean(state)} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-xl rounded-3xl border border-white/10 bg-[#101826] p-6 text-white shadow-2xl">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 text-lg">
+            <ShieldAlert className="size-5 text-amber-200" />
+            {state?.title}
+          </DialogTitle>
+          <DialogDescription className="text-sm leading-6 text-white/64">
+            {state?.message}
+            {state?.status ? <span className="ml-2 text-white/40">HTTP {state.status}</span> : null}
+          </DialogDescription>
+        </DialogHeader>
+
+        {state?.issues.length ? (
+          <div className="grid gap-3">
+            {state.issues.map((issue) => (
+              <div key={`${issue.code}:${issue.title}`} className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
+                <p className="text-sm font-semibold text-white">{issue.title}</p>
+                <p className="mt-1 text-sm leading-6 text-white/62">{issue.message}</p>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {state?.fixCommands.length ? (
+          <div className="rounded-2xl border border-cyan-100/10 bg-cyan-100/[0.04] p-4">
+            <p className="text-xs uppercase tracking-[0.22em] text-cyan-100/58">修复命令</p>
+            <pre className="mt-3 overflow-x-auto whitespace-pre-wrap text-xs leading-6 text-cyan-50/78">
+              {state.fixCommands.join("\n")}
+            </pre>
+          </div>
+        ) : null}
+
+        <DialogFooter className="border-white/10 bg-white/[0.03]">
+          <Button type="button" className="rounded-full" onClick={onClose}>
+            关闭
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 export function SettingsWorkspace() {
   const queryClient = useQueryClient();
   const settingsQuery = useQuery({ queryKey: ["model-settings"], queryFn: fetchModelSettings });
+  const runtimeQuery = useQuery({ queryKey: ["runtime-check"], queryFn: () => fetchRuntimeCheck(), retry: false });
   const [form, setForm] = useState<SettingsForm | null>(null);
-  const [saved, setSaved] = useState(false);
+  const [savedMessage, setSavedMessage] = useState<string | null>(null);
   const [apiKeyEditing, setApiKeyEditing] = useState(false);
+  const [errorDialog, setErrorDialog] = useState<ErrorDialogState | null>(null);
 
   useEffect(() => {
     if (!settingsQuery.data) {
       return;
     }
-    const nextForm = {
+    setForm({
       base_url: settingsQuery.data.base_url,
       resolve_ip: settingsQuery.data.resolve_ip ?? "",
       embedding_model: settingsQuery.data.embedding_model,
@@ -43,25 +177,41 @@ export function SettingsWorkspace() {
       graph_extraction_chunks_per_document: String(settingsQuery.data.graph_extraction_chunks_per_document ?? 2),
       api_key: "",
       clear_api_key: false,
-    };
-    queueMicrotask(() => {
-      setForm(nextForm);
-      setApiKeyEditing(false);
+      reranker_enabled: settingsQuery.data.reranker_enabled,
+      reranker_model: settingsQuery.data.reranker_model,
+      reranker_device: settingsQuery.data.reranker_device,
     });
+    setApiKeyEditing(false);
   }, [settingsQuery.data]);
 
   const saveMutation = useMutation({
     mutationFn: (payload: ModelSettingsUpdate) => updateModelSettings(payload),
     onSuccess: async () => {
       setApiKeyEditing(false);
-      setSaved(true);
-      window.setTimeout(() => setSaved(false), 1800);
+      setSavedMessage("已保存");
+      window.setTimeout(() => setSavedMessage(null), 1800);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["model-settings"] }),
+        queryClient.invalidateQueries({ queryKey: ["runtime-check"] }),
         queryClient.invalidateQueries({ queryKey: ["courses"] }),
       ]);
     },
+    onError: (error) => setErrorDialog(errorDialogFromUnknown(error)),
   });
+
+  const settings = settingsQuery.data;
+  const showApiKeyMask = Boolean(settings?.has_api_key && !apiKeyEditing && !form?.clear_api_key);
+
+  const statusCards = useMemo(() => {
+    if (!settings) {
+      return [];
+    }
+    return [
+      { label: "Embedding", value: settings.embedding_model },
+      { label: "Chat / Graph", value: settings.chat_model },
+      { label: "Reranker", value: settings.reranker_enabled ? `${settings.reranker_model} (${settings.reranker_device})` : "Disabled" },
+    ];
+  }, [settings]);
 
   if (settingsQuery.isLoading || !form) {
     return <LoadingBlock rows={4} />;
@@ -70,17 +220,15 @@ export function SettingsWorkspace() {
     return <ErrorBlock message={(settingsQuery.error as Error).message} />;
   }
 
-  const settings = settingsQuery.data;
-  const showApiKeyMask = Boolean(settings?.has_api_key && !apiKeyEditing && !form.clear_api_key);
   const updateForm = <K extends keyof SettingsForm>(key: K, value: SettingsForm[K]) => {
     setForm((current) => (current ? { ...current, [key]: value } : current));
   };
 
-  const handleSubmit = () => {
+  const buildPayload = (): ModelSettingsUpdate => {
     const dimensions = Number.parseInt(form.embedding_dimensions, 10);
     const graphChunkLimit = Number.parseInt(form.graph_extraction_chunk_limit, 10);
     const graphChunksPerDocument = Number.parseInt(form.graph_extraction_chunks_per_document, 10);
-    saveMutation.mutate({
+    return {
       base_url: form.base_url.trim(),
       resolve_ip: form.resolve_ip.trim() || null,
       embedding_model: form.embedding_model.trim(),
@@ -90,39 +238,104 @@ export function SettingsWorkspace() {
       graph_extraction_chunks_per_document: Number.isFinite(graphChunksPerDocument) ? graphChunksPerDocument : undefined,
       api_key: form.api_key.trim() || null,
       clear_api_key: form.clear_api_key,
-    });
+      reranker_enabled: form.reranker_enabled,
+      reranker_model: form.reranker_model.trim(),
+      reranker_device: form.reranker_device,
+    };
+  };
+
+  const handleSubmit = async () => {
+    try {
+      const check = await fetchRuntimeCheck(form.reranker_enabled, {
+        reranker_model: form.reranker_model.trim(),
+        reranker_device: form.reranker_device,
+      });
+      const dialog = runtimeIssueDialog(check);
+      if (dialog) {
+        setErrorDialog(dialog);
+        await queryClient.invalidateQueries({ queryKey: ["runtime-check"] });
+        return;
+      }
+      saveMutation.mutate(buildPayload());
+    } catch (error) {
+      setErrorDialog(errorDialogFromUnknown(error));
+    }
+  };
+
+  const handleRerankerToggle = async () => {
+    if (saveMutation.isPending) {
+      return;
+    }
+    const nextEnabled = !form.reranker_enabled;
+    if (nextEnabled) {
+      try {
+        const check = await fetchRuntimeCheck(true, {
+          reranker_model: form.reranker_model.trim(),
+          reranker_device: form.reranker_device,
+        });
+        const dialog = runtimeIssueDialog(check);
+        if (dialog) {
+          setErrorDialog(dialog);
+          await queryClient.invalidateQueries({ queryKey: ["runtime-check"] });
+          return;
+        }
+      } catch (error) {
+        setErrorDialog(errorDialogFromUnknown(error));
+        return;
+      }
+    }
+    updateForm("reranker_enabled", nextEnabled);
+    saveMutation.mutate(
+      { ...buildPayload(), reranker_enabled: nextEnabled },
+      {
+        onSuccess: () => {
+          const message = nextEnabled ? "Reranker 已启用" : "已切换为 Dense + BM25 + WSF，无 rerank";
+          setSavedMessage(message);
+          window.setTimeout(() => setSavedMessage(null), 1800);
+        },
+      },
+    );
+  };
+
+  const handleRuntimeCheck = async () => {
+    const result = await runtimeQuery.refetch();
+    if (result.error) {
+      setErrorDialog(errorDialogFromUnknown(result.error));
+    }
   };
 
   return (
     <div className="kg-page">
       <section className="glass-panel relative overflow-hidden rounded-[34px] p-6 lg:p-8">
-        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(86,217,255,0.12),transparent_32%),radial-gradient(circle_at_88%_20%,rgba(124,92,255,0.10),transparent_28%)]" />
         <div className="relative z-10 grid gap-7 xl:grid-cols-[minmax(320px,0.72fr)_minmax(520px,1.28fr)]">
           <div className="space-y-6">
             <div>
-              <p className="section-kicker">模型 API</p>
-              <h2 className="glow-text mt-2 text-4xl font-semibold text-white">通用模型接口设置</h2>
+              <p className="section-kicker">模型与检索基础设施</p>
+              <h2 className="glow-text mt-2 text-4xl font-semibold text-white">运行时设置</h2>
               <p className="mt-4 max-w-xl text-sm leading-7 text-cyan-50/62">
-                这里配置 OpenAI-compatible 接口。可以使用 OpenAI、阿里兼容模式、Kimi 兼容模式或任何实现相同协议的服务。
-                保存后会写入项目根目录 .env，并刷新后端运行时配置。
+                配置 OpenAI-compatible 模型接口和可选 reranker。启用 reranker 前会检测 runtime、环境参数和基础设施状态。
               </p>
             </div>
 
             <div className="grid gap-3">
               <div className="border-l border-white/10 px-4 py-3">
-                <p className="text-xs uppercase tracking-[0.26em] text-white/42">当前状态</p>
-                <p className="mt-2 text-xl font-semibold text-white">{settings?.degraded_mode ? "未就绪" : "外部 API"}</p>
-              </div>
-              <div className="border-l border-white/10 px-4 py-3">
-                <p className="text-xs uppercase tracking-[0.26em] text-white/42">API Key</p>
+                <p className="text-xs uppercase tracking-[0.26em] text-white/42">模型 API</p>
                 <p className="mt-2 flex items-center gap-2 text-sm text-white/68">
                   {settings?.has_api_key ? <CheckCircle2 className="size-4 text-emerald-200" /> : <ShieldAlert className="size-4 text-amber-200" />}
-                  {settings?.has_api_key ? "已配置" : "未配置"}
+                  {settings?.has_api_key ? "API Key 已配置" : "API Key 未配置"}
                 </p>
               </div>
               <div className="border-l border-white/10 px-4 py-3">
-                <p className="text-xs uppercase tracking-[0.26em] text-white/42">Provider</p>
-                <p className="mt-2 text-sm text-white/68">OpenAI Compatible</p>
+                <p className="text-xs uppercase tracking-[0.26em] text-white/42">Reranker Runtime</p>
+                <p className="mt-2 text-sm text-white/68">
+                  <RuntimeStatusBadge check={runtimeQuery.data} />
+                </p>
+              </div>
+              <div className="border-l border-white/10 px-4 py-3">
+                <p className="text-xs uppercase tracking-[0.26em] text-white/42">环境参数</p>
+                <p className="mt-2 text-sm text-white/68">
+                  {runtimeQuery.data?.env_sync.synced ? "与 .env.example 同步" : "需要检查 .env"}
+                </p>
               </div>
             </div>
           </div>
@@ -131,90 +344,97 @@ export function SettingsWorkspace() {
             className="relative z-10 grid gap-5"
             onSubmit={(event) => {
               event.preventDefault();
-              handleSubmit();
+              void handleSubmit();
             }}
           >
+            <div className="rounded-3xl border border-white/10 bg-white/[0.035] p-5">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <p className="flex items-center gap-2 text-sm font-semibold text-white">
+                    <SlidersHorizontal className="size-4 text-cyan-100/70" />
+                    Reranker
+                  </p>
+                  <p className="mt-2 text-sm leading-6 text-white/58">
+                    关闭后检索直接使用 Dense + BM25 + WSF 排序，不启动 reranker runtime；这不是 fallback。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={form.reranker_enabled}
+                  disabled={saveMutation.isPending}
+                  onClick={() => void handleRerankerToggle()}
+                  className={`relative h-8 w-16 rounded-full border transition ${
+                    form.reranker_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
+                  } disabled:cursor-not-allowed disabled:opacity-60`}
+                >
+                  <span
+                    className={`absolute top-1 size-6 rounded-full bg-white shadow transition ${
+                      form.reranker_enabled ? "left-9" : "left-1"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <div className="mt-5 grid gap-4 md:grid-cols-2">
+                <label className="flex flex-col gap-2">
+                  <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Reranker 模型</span>
+                  <Input
+                    value={form.reranker_model}
+                    disabled={!form.reranker_enabled}
+                    onChange={(event) => updateForm("reranker_model", event.target.value)}
+                    className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white"
+                  />
+                </label>
+                <label className="flex flex-col gap-2">
+                  <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">设备</span>
+                  <select
+                    value={form.reranker_device}
+                    disabled={!form.reranker_enabled}
+                    onChange={(event) => updateForm("reranker_device", event.target.value as "cpu" | "cuda")}
+                    className="h-12 rounded-2xl border border-white/10 bg-[#111927] px-4 text-sm text-white outline-none"
+                  >
+                    <option value="cpu">cpu</option>
+                    <option value="cuda">cuda</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
             <div className="grid gap-5 md:grid-cols-2">
               <label className="flex flex-col gap-2 md:col-span-2">
                 <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Base URL</span>
-                <Input
-                  value={form.base_url}
-                  onChange={(event) => updateForm("base_url", event.target.value)}
-                  placeholder="例如 https://api.openai.com/v1 或 https://dashscope.aliyuncs.com/compatible-mode/v1"
-                  className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white placeholder:text-white/28"
-                />
+                <Input value={form.base_url} onChange={(event) => updateForm("base_url", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
               <label className="flex flex-col gap-2 md:col-span-2">
                 <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">DNS Override IP</span>
-                <Input
-                  value={form.resolve_ip}
-                  onChange={(event) => updateForm("resolve_ip", event.target.value)}
-                  placeholder="可选；例如 39.96.198.249，留空使用系统 DNS"
-                  className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white placeholder:text-white/28"
-                />
+                <Input value={form.resolve_ip} onChange={(event) => updateForm("resolve_ip", event.target.value)} placeholder="可选；留空使用系统 DNS" className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white placeholder:text-white/28" />
               </label>
 
               <label className="flex flex-col gap-2">
                 <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Embedding 模型</span>
-                <Input
-                  value={form.embedding_model}
-                  onChange={(event) => updateForm("embedding_model", event.target.value)}
-                  className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white"
-                />
+                <Input value={form.embedding_model} onChange={(event) => updateForm("embedding_model", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
               <label className="flex flex-col gap-2">
                 <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Chat / 图谱模型</span>
-                <Input
-                  value={form.chat_model}
-                  onChange={(event) => updateForm("chat_model", event.target.value)}
-                  className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white"
-                />
+                <Input value={form.chat_model} onChange={(event) => updateForm("chat_model", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
               <label className="flex flex-col gap-2">
                 <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">向量维度</span>
-                <Input
-                  type="number"
-                  min={1}
-                  max={8192}
-                  value={form.embedding_dimensions}
-                  onChange={(event) => updateForm("embedding_dimensions", event.target.value)}
-                  className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white"
-                />
+                <Input type="number" min={1} max={8192} value={form.embedding_dimensions} onChange={(event) => updateForm("embedding_dimensions", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
               <label className="flex flex-col gap-2">
-                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">图谱最多阅读多少个片段</span>
-                <Input
-                  type="number"
-                  min={1}
-                  max={200}
-                  placeholder="推荐 120；默认 72；上限 200"
-                  value={form.graph_extraction_chunk_limit ?? ""}
-                  onChange={(event) => updateForm("graph_extraction_chunk_limit", event.target.value)}
-                  className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white"
-                />
-                <span className="text-xs leading-5 text-white/42">
-                  推荐 120；默认 72。想明显增加概念可用 160，接近上限 200 时会明显变慢并增加模型调用成本。
-                </span>
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">图谱最大读取片段</span>
+                <Input type="number" min={1} max={200} value={form.graph_extraction_chunk_limit} onChange={(event) => updateForm("graph_extraction_chunk_limit", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
               <label className="flex flex-col gap-2">
-                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">每个文件重点抽几个片段</span>
-                <Input
-                  type="number"
-                  min={1}
-                  max={10}
-                  placeholder="推荐 3；默认 2；上限 10"
-                  value={form.graph_extraction_chunks_per_document ?? ""}
-                  onChange={(event) => updateForm("graph_extraction_chunks_per_document", event.target.value)}
-                  className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white"
-                />
-                <span className="text-xs leading-5 text-white/42">
-                  推荐 3；默认 2。课件很长时可用 4-5；超过 6 通常只适合少量文件精细重建。
-                </span>
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">每文档重点片段</span>
+                <Input type="number" min={1} max={10} value={form.graph_extraction_chunks_per_document} onChange={(event) => updateForm("graph_extraction_chunks_per_document", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
               <label className="flex flex-col gap-2">
@@ -232,14 +452,7 @@ export function SettingsWorkspace() {
                     autoComplete="off"
                   />
                   {showApiKeyMask ? (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setApiKeyEditing(true);
-                        updateForm("api_key", "");
-                      }}
-                      className="inline-flex items-center gap-1 rounded-full border border-white/8 px-2.5 py-1 text-xs text-white/55 transition hover:border-cyan-200/24 hover:text-cyan-100"
-                    >
+                    <button type="button" onClick={() => setApiKeyEditing(true)} className="inline-flex items-center gap-1 rounded-full border border-white/8 px-2.5 py-1 text-xs text-white/55 transition hover:border-cyan-200/24 hover:text-cyan-100">
                       <PencilLine className="size-3.5" />
                       修改
                     </button>
@@ -249,33 +462,31 @@ export function SettingsWorkspace() {
               </label>
             </div>
 
-            <div className="grid gap-3">
-              <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
-                <input
-                  type="checkbox"
-                  checked={form.clear_api_key}
-                  onChange={(event) => {
-                    updateForm("clear_api_key", event.target.checked);
-                    if (event.target.checked) {
-                      setApiKeyEditing(false);
-                      updateForm("api_key", "");
-                    }
-                  }}
-                  className="size-4 accent-rose-300"
-                />
-                清除当前 API key
-              </label>
-            </div>
+            <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
+              <input
+                type="checkbox"
+                checked={form.clear_api_key}
+                onChange={(event) => {
+                  updateForm("clear_api_key", event.target.checked);
+                  if (event.target.checked) {
+                    setApiKeyEditing(false);
+                    updateForm("api_key", "");
+                  }
+                }}
+                className="size-4 accent-rose-300"
+              />
+              清除当前 API key
+            </label>
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-5">
               <p className="text-xs leading-6 text-white/42">
-                所有设置保存后都会热更新到后端运行时，不需要重启 API。新发起的解析、检索、问答和图谱生成会立即使用这里的配置。
+                保存前会检查运行时和环境参数；启用 reranker 时必须能访问对应 runtime。
               </p>
               <div className="flex items-center gap-2">
-                {saved ? <span className="text-sm text-emerald-100">已保存</span> : null}
-                <Button type="button" variant="outline" className="rounded-full" onClick={() => settingsQuery.refetch()}>
+                {savedMessage ? <span className="text-sm text-emerald-100">{savedMessage}</span> : null}
+                <Button type="button" variant="outline" className="rounded-full" onClick={() => void handleRuntimeCheck()}>
                   <RotateCcw data-icon="inline-start" />
-                  重新载入
+                  检测
                 </Button>
                 <Button type="submit" className="rounded-full" disabled={saveMutation.isPending}>
                   {saveMutation.isPending ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Save data-icon="inline-start" />}
@@ -288,20 +499,34 @@ export function SettingsWorkspace() {
       </section>
 
       <section className="grid gap-4 lg:grid-cols-3">
-        {[
-          { label: "Embedding", value: settings?.embedding_model, icon: ServerCog },
-          { label: "Chat / Graph", value: settings?.chat_model, icon: ServerCog },
-          { label: "Graph Coverage", value: `${settings?.graph_extraction_chunk_limit ?? 72} 个片段 / 每文件 ${settings?.graph_extraction_chunks_per_document ?? 2} 个`, icon: ServerCog },
-        ].map(({ label, value, icon: Icon }) => (
+        {statusCards.map(({ label, value }) => (
           <div key={label} className="glass-panel rounded-[24px] p-5">
             <div className="flex items-center gap-3">
-              <Icon className="size-4 text-cyan-100/70" />
+              <ServerCog className="size-4 text-cyan-100/70" />
               <p className="text-xs uppercase tracking-[0.24em] text-white/42">{label}</p>
             </div>
             <p className="mt-3 break-all text-sm text-white/72">{value}</p>
           </div>
         ))}
       </section>
+
+      {runtimeQuery.data?.warnings.length ? (
+        <section className="glass-panel rounded-[24px] p-5">
+          <p className="flex items-center gap-2 text-sm font-semibold text-amber-100">
+            <XCircle className="size-4" />
+            运行时警告
+          </p>
+          <div className="mt-3 grid gap-2">
+            {runtimeQuery.data.warnings.map((issue) => (
+              <p key={issue.code} className="text-sm leading-6 text-white/58">
+                {issue.title}: {issue.message}
+              </p>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      <ErrorDialog state={errorDialog} onClose={() => setErrorDialog(null)} />
     </div>
   );
 }
