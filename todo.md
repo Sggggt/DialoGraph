@@ -105,6 +105,50 @@
 - [ ] 为 model-bridge 添加代理感知能力（读取 `HTTP_PROXY`/`HTTPS_PROXY` 或 `.env` 代理配置）
 - [ ] 添加零向量监控：ingestion 完成后抽样检查 qdrant 向量非零率，发现异常立即告警
 
+### 工业级上下文管理
+
+> 当前 QA 的上下文管理处于基础版：前端不传递 history，后端硬编码取 `[-8:]` 条，无 Token 预算、无压缩策略、无可配置项。以下任务将上下文管理提升至工业级。
+
+#### 前后端历史同步
+
+- [ ] 前端 `qa-workspace.tsx`：发送请求时显式携带 `history`（从 `turns` 组装 `ChatMessage[]`）
+- [ ] 后端 `create_agent_run_context()`：优先使用请求中的 `history`，与 `session.transcript` 做合并校验（防篡改/防丢失）
+- [ ] 后端：当前端 `history` 与 `transcript` 不一致时，以数据库为准并打日志警告
+
+#### Token 预算与截断策略
+
+- [ ] 引入 tokenizer（`tiktoken` 或模型自带 tokenizer）计算对话历史 Token 数
+- [ ] 定义 `chat_context_window` 和 `chat_history_budget_tokens` 配置项（默认留 60% 给历史，40% 给检索上下文）
+- [ ] 实现 `truncate_history_by_tokens()`：按 Token 预算截断，保留最近完整轮次，不切割单条消息
+- [ ] 实现 `estimate_context_tokens()`：在发送 LLM 请求前预估总 Token（history + system prompt + retrieved chunks + question）
+
+#### 上下文压缩与摘要
+
+- [ ] 实现滑动窗口摘要：当历史超出 Token 预算时，对最早的 N 轮对话调用轻量 LLM 生成摘要，替换原始文本
+- [ ] 实现关键信息提取：从长历史中抽取实体、主题、已确认的事实，生成 "running memory" 注入系统提示
+- [ ] 为 `QASession` 添加 `summary` 字段，缓存会话级摘要，避免重复计算
+
+#### 可配置化与策略选择
+
+- [ ] `core/config.py` 添加上下文管理配置：
+  - `chat_history_strategy: Literal["truncate", "summarize", "sliding_window"]`
+  - `chat_history_max_turns: int`
+  - `chat_history_max_tokens: int`
+  - `chat_summary_trigger_turns: int`
+- [ ] `schemas.py` 添加 `ContextManagementSettings` 和更新接口
+- [ ] Settings 前端页面添加上下文管理策略选择器
+
+#### 边界与异常处理
+
+- [ ] 处理并发请求时的历史顺序问题：同一 session 的两个并发请求，确保 transcript 追加顺序正确
+- [ ] 处理流式中断：若 `streamAnswer` 中途断开，已生成的部分 answer 是否写入 transcript 需可配置
+- [ ] 超长单轮消息防护：单条 user/assistant 消息超过 Token 阈值时拒绝或截断
+
+#### 测试
+
+- [ ] 编写 `test_context_manager.py`：测试 Token 截断、摘要替换、预算计算
+- [ ] 编写 E2E 测试：验证 10 轮对话后仍能正确引用第 1 轮的内容（摘要质量测试）
+
 ---
 
 ## P1 🟠 重要（影响可维护性、扩展性和代码健康）
@@ -281,9 +325,10 @@
 | P0 紧急（GraphRAG） | 13 | 7 | 54% |
 | P0 紧急（测试 + 安全） | 15 | 14 | 93% |
 | P0 紧急（外部服务/数据质量） | 8 | 6 | 75% |
+| P0 紧急（工业级上下文管理） | 18 | 0 | 0% |
 | P1 重要（代码重构 + DevOps） | 27 | 3 | 11% |
 | P1 重要（效果评估） | 24 | 0 | 0% |
 | P1 重要（图谱增量更新） | 3 | 0 | 0% |
 | P2 改善 | 16 | 0 | 0% |
 | P3 锦上添花 | 12 | 0 | 0% |
-| **总计** | **141** | **48** | **34%** |
+| **总计** | **159** | **48** | **30%** |
