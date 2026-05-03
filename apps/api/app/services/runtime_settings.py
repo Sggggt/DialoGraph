@@ -17,19 +17,23 @@ ENV_EXAMPLE_PATH = WORKSPACE_ROOT / ".env.example"
 
 def model_settings_payload() -> dict:
     settings = get_settings()
+    env_entries = _env_entries(ENV_PATH)
+    real_base_url = env_entries.get("OPENAI_BASE_URL", settings.openai_base_url)
+    model_bridge_enabled = env_entries.get("MODEL_BRIDGE_ENABLED", "false").lower() == "true"
     return {
         "provider": "openai_compatible",
-        "base_url": settings.openai_base_url,
+        "base_url": real_base_url,
+        "model_bridge_enabled": model_bridge_enabled,
         "resolve_ip": settings.openai_resolve_ip,
         "embedding_model": settings.embedding_model,
         "chat_model": settings.chat_model,
         "embedding_dimensions": settings.embedding_dimensions,
         "graph_extraction_chunk_limit": settings.graph_extraction_chunk_limit,
         "graph_extraction_chunks_per_document": settings.graph_extraction_chunks_per_document,
-        "reranker_enabled": settings.reranker_enabled,
-        "reranker_model": settings.reranker_model,
-        "reranker_device": settings.reranker_device,
-        "reranker_url": settings.reranker_url,
+        "reranker_enabled": False,
+        "reranker_model": "",
+        "reranker_device": "cpu",
+        "reranker_url": "",
         "has_api_key": bool(settings.openai_api_key),
         "degraded_mode": not settings.openai_api_key,
     }
@@ -192,16 +196,7 @@ def _check_model_bridge() -> bool | None:
     return False
 
 
-def runtime_check_payload(
-    require_reranker: bool | None = None,
-    expected_model: str | None = None,
-    expected_device: str | None = None,
-    expected_url: str | None = None,
-) -> dict:
-    settings = get_settings()
-    reranker_model = expected_model or settings.reranker_model
-    reranker_device = expected_device or settings.reranker_device
-    reranker_url = expected_url or settings.reranker_url
+def runtime_check_payload() -> dict:
     env_sync = env_sync_status()
     blocking_issues: list[dict] = []
     warnings: list[dict] = []
@@ -232,53 +227,6 @@ def runtime_check_payload(
             )
         )
 
-    reranker_required = settings.reranker_enabled if require_reranker is None else require_reranker
-    reranker_status = {
-        "enabled": settings.reranker_enabled,
-        "device": reranker_device,
-        "model": reranker_model,
-        "url": reranker_url,
-        "reachable": False,
-        "healthy": False,
-        "reported_model": None,
-        "reported_device": None,
-        "model_matches": None,
-        "device_matches": None,
-    }
-    if reranker_required:
-        health_url = reranker_url.rsplit("/", 1)[0].rstrip("/") + "/health"
-        with suppress(Exception):
-            response = httpx.get(health_url, timeout=3.0)
-            reranker_status["reachable"] = True
-            reranker_status["healthy"] = response.status_code == 200
-            if response.headers.get("content-type", "").startswith("application/json"):
-                data = response.json()
-                reranker_status["reported_model"] = data.get("model")
-                reranker_status["reported_device"] = data.get("device")
-                reranker_status["model_matches"] = data.get("model") == reranker_model
-                reranker_status["device_matches"] = data.get("device") == reranker_device
-        if not reranker_status["reachable"] or not reranker_status["healthy"]:
-            blocking_issues.append(
-                _runtime_issue(
-                    "reranker_unreachable",
-                    "Reranker runtime is not reachable",
-                    "Reranker is enabled, but the HTTP runtime did not respond successfully.",
-                    [
-                        ".\\start-app.ps1",
-                        "docker compose -f infra/docker-compose.yml --profile reranker-cpu up -d reranker-cpu",
-                    ],
-                )
-            )
-        elif reranker_status["model_matches"] is False or reranker_status["device_matches"] is False:
-            blocking_issues.append(
-                _runtime_issue(
-                    "reranker_mismatch",
-                    "Reranker runtime does not match .env",
-                    "The running reranker reports a different model or device than the application settings.",
-                    [".\\start-app.ps1"],
-                )
-            )
-
     infrastructure = {
         "postgres": _check_postgres(),
         "qdrant": _check_qdrant(),
@@ -299,7 +247,18 @@ def runtime_check_payload(
             )
     return {
         "env_sync": env_sync,
-        "reranker": reranker_status,
+        "reranker": {
+            "enabled": False,
+            "device": "cpu",
+            "model": "",
+            "url": "",
+            "reachable": False,
+            "healthy": False,
+            "reported_model": None,
+            "reported_device": None,
+            "model_matches": None,
+            "device_matches": None,
+        },
         "infrastructure": infrastructure,
         "blocking_issues": blocking_issues,
         "warnings": warnings,
@@ -311,15 +270,13 @@ def update_model_settings(payload: dict) -> dict:
     updates: dict[str, str | int | bool | None] = {}
     key_map = {
         "base_url": "openai_base_url",
+        "model_bridge_enabled": "model_bridge_enabled",
         "resolve_ip": "openai_resolve_ip",
         "embedding_model": "embedding_model",
         "chat_model": "chat_model",
         "embedding_dimensions": "embedding_dimensions",
         "graph_extraction_chunk_limit": "graph_extraction_chunk_limit",
         "graph_extraction_chunks_per_document": "graph_extraction_chunks_per_document",
-        "reranker_enabled": "reranker_enabled",
-        "reranker_model": "reranker_model",
-        "reranker_device": "reranker_device",
     }
     for key, env_key in key_map.items():
         value = payload.get(key)

@@ -9,7 +9,6 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $EnvFile = Join-Path $Root ".env"
 $InfraComposeFile = Join-Path $Root "infra\docker-compose.yml"
-$CudaComposeFile = Join-Path $Root "infra\docker-compose.cuda.yml"
 
 function Get-DotEnvValue {
   param(
@@ -124,8 +123,6 @@ if (-not (Test-Path $InfraComposeFile)) {
   throw "Docker Compose file not found: $InfraComposeFile"
 }
 
-$rerankerEnabled = Get-DotEnvBool -Key "RERANKER_ENABLED" -DefaultValue $true
-$rerankerDevice = (Get-DotEnvValue -Key "RERANKER_DEVICE" -DefaultValue "cpu").ToLowerInvariant()
 $modelBridgeEnabled = Get-DotEnvBool -Key "MODEL_BRIDGE_ENABLED" -DefaultValue $false
 $modelBridgePortRaw = Get-DotEnvValue -Key "MODEL_BRIDGE_PORT" -DefaultValue "8765"
 $openAiBaseUrl = Get-DotEnvValue -Key "OPENAI_BASE_URL" -DefaultValue "https://api.openai.com/v1"
@@ -134,12 +131,6 @@ try {
   $modelBridgePort = [int]$modelBridgePortRaw
 } catch {
   throw "Unsupported MODEL_BRIDGE_PORT='$modelBridgePortRaw'. Use an integer port."
-}
-if ($rerankerEnabled -and $rerankerDevice -notin @("cpu", "cuda")) {
-  throw "Unsupported RERANKER_DEVICE='$rerankerDevice'. Only 'cpu' and 'cuda' are supported."
-}
-if ($rerankerEnabled -and $rerankerDevice -eq "cuda" -and -not (Test-Path $CudaComposeFile)) {
-  throw "CUDA Compose file not found: $CudaComposeFile"
 }
 if ($modelBridgeEnabled -and ($modelBridgePort -lt 1 -or $modelBridgePort -gt 65535)) {
   throw "Unsupported MODEL_BRIDGE_PORT='$modelBridgePort'. Use a port between 1 and 65535."
@@ -173,7 +164,7 @@ if ($modelBridgeEnabled) {
       "--port", [string]$modelBridgePort,
       "--target-base-url", $openAiBaseUrl
     )
-    if ($openAiResolveIp) {
+    if ($openAiResolveIp -and $openAiResolveIp -ne "__none__") {
       $bridgeArgs += @("--resolve-ip", $openAiResolveIp)
     }
     Start-Process -WindowStyle Hidden -FilePath $pythonCommand.Source -ArgumentList $bridgeArgs
@@ -189,10 +180,6 @@ if ($modelBridgeEnabled) {
 
 Write-Host "Course Knowledge Base Docker launcher" -ForegroundColor Cyan
 Write-Host "Root: $Root"
-Write-Host "Reranker enabled: $rerankerEnabled"
-if ($rerankerEnabled) {
-  Write-Host "Reranker device: $rerankerDevice"
-}
 Write-Host "Model bridge enabled: $modelBridgeEnabled"
 if ($modelBridgeEnabled) {
   Write-Host "Model bridge: http://127.0.0.1:$modelBridgePort"
@@ -203,43 +190,18 @@ Write-Host "Web: http://127.0.0.1:$FrontendPort"
 Invoke-Compose -Arguments @(
   "compose",
   "-f", $InfraComposeFile,
-  "-f", $CudaComposeFile,
   "down", "--remove-orphans"
 )
 
-if (-not $rerankerEnabled) {
-  Invoke-Compose -Arguments @(
-    "compose",
-    "-f", $InfraComposeFile,
-    "up", "-d",
-    "postgres", "redis", "qdrant", "api", "web"
-  )
-  $stopCommand = "docker compose -f infra/docker-compose.yml down"
-} elseif ($rerankerDevice -eq "cuda") {
-  Write-Host "Using CUDA reranker runtime. This requires NVIDIA driver and NVIDIA Container Toolkit." -ForegroundColor Yellow
-  Invoke-Compose -Arguments @(
-    "compose",
-    "-f", $InfraComposeFile,
-    "-f", $CudaComposeFile,
-    "--profile", "reranker-cuda",
-    "up", "-d",
-    "postgres", "redis", "qdrant", "reranker-cuda", "api", "web"
-  )
-  $stopCommand = "docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down"
-} else {
-  Invoke-Compose -Arguments @(
-    "compose",
-    "-f", $InfraComposeFile,
-    "--profile", "reranker-cpu",
-    "up", "-d",
-    "postgres", "redis", "qdrant", "reranker-cpu", "api", "web"
-  )
-  $stopCommand = "docker compose -f infra/docker-compose.yml down"
-}
+Invoke-Compose -Arguments @(
+  "compose",
+  "-f", $InfraComposeFile,
+  "up", "-d",
+  "postgres", "redis", "qdrant", "api", "web"
+)
+$stopCommand = "docker compose -f infra/docker-compose.yml down"
 
-if ($rerankerEnabled) {
-  Wait-ContainerHealthy -ContainerName "text-reranker-runtime" -Name "Reranker"
-}
+
 Wait-Url -Url $BackendUrl -Name "Backend"
 Wait-Url -Url $FrontendUrl -Name "Frontend"
 

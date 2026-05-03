@@ -1,6 +1,6 @@
 # DialoGraph 工程改进 TODO
 
-> 基于工程水平分析报告和 ACID 事务审计报告，按优先级排列的改进清单。
+> 基于工程水平分析报告、ACID 事务审计报告和架构深度评审，按优先级排列的改进清单。
 > 当前总评：**B+ / A-（78/100）**，目标：**A（90+/100）**
 
 ---
@@ -47,7 +47,7 @@
 ### GraphRAG：图谱增强检索
 
 > 当前向量检索和知识图谱完全独立，图谱关系未被用于增强检索。
-> 以下任务实现「向量召回 → 图谱扩展 → 重排序」管线。
+> 以下任务实现「向量召回 → 图谱扩展 → 轻量精排」管线。
 
 #### 核心管线
 
@@ -92,13 +92,26 @@
 - [x] 为 `ensure_schema()` 中的 DDL 操作消除字符串拼接，改用参数化或 SQLAlchemy DDL API
 - [x] 对 `top_k` 等用户输入参数添加上限约束（如 `Field(le=50)`）
 
+### 外部服务稳定性与数据质量
+
+> 基于架构评审报告，解决 model-bridge 网络连通性和历史零向量问题。
+
+- [x] 修复 model-bridge：`__none__` 被传入 curl `--resolve` 导致的 502 Bad Gateway
+- [x] 修复 model-bridge：`start-app.ps1` 对 `OPENAI_RESOLVE_IP` 为 `__none__` 时的过滤逻辑
+- [x] 移除外部 reranker 运行时：用纯 Python `lightweight_rerank()` 替代 CrossEncoder 容器（~2GB 镜像移除）
+- [x] 清理环境变量：从 `.env` / `.env.example` / `config.py` / `schemas.py` 中移除所有 `RERANKER_*` 配置
+- [x] 清理前端 UI：从 Settings 页面移除 reranker 开关、模型输入、设备选择器和运行时状态检查
+- [x] 更新项目文档：README（双语版）移除 reranker 架构图节点、构建说明和模型缓存章节
+- [ ] 为 model-bridge 添加代理感知能力（读取 `HTTP_PROXY`/`HTTPS_PROXY` 或 `.env` 代理配置）
+- [ ] 添加零向量监控：ingestion 完成后抽样检查 qdrant 向量非零率，发现异常立即告警
+
 ---
 
-## P1 🟠 重要（影响可维护性和代码健康）
+## P1 🟠 重要（影响可维护性、扩展性和代码健康）
 
 ### 后端代码重构
 
-- [ ] 拆分 `api.py`（375 行）为子 Router 模块：
+- [ ] 拆分 `api.py`（546 行）为子 Router 模块：
   - [ ] `routes/courses.py` — 课程管理
   - [ ] `routes/ingestion.py` — 文件导入与批次
   - [ ] `routes/search.py` — 搜索与检索
@@ -112,6 +125,9 @@
 - [ ] 提取公共 `source_type_from_path()` 到 `core/utils.py`，消除三处重复
 - [ ] 合并 `choose_llm_graph_chunks()` 的重复定义（`ingestion.py` 和 `concept_graph.py`）
 - [ ] 将 `ensure_schema()` 从模块级执行改为 FastAPI lifespan 事件中调用
+- [ ] 为 EmbeddingProvider / ChatProvider / VectorStore 定义 Protocol/ABC 接口，通过依赖注入传入
+- [ ] 统一 DB Session 管理：消除手动 `SessionLocal()`，全部使用 `Depends(get_db)` 或明确的后台任务 session 工厂
+- [ ] 将 `get_settings()` 从服务类内部调用改为构造函数注入，降低测试耦合
 
 ### 前端代码重构
 
@@ -127,10 +143,19 @@
 
 ### DevOps
 
-- [ ] 编写 `apps/api/Dockerfile`
-- [ ] 编写 `apps/web/Dockerfile`
-- [ ] 更新 `infra/docker-compose.yml` 加入 API + Web 服务编排
+- [x] 编写 `apps/api/Dockerfile`
+- [x] 编写 `apps/web/Dockerfile`（当前为 dev 模式）
+- [ ] 更新 `apps/web/Dockerfile` 支持生产构建（`npm run build` + `next start`）
+- [x] 更新 `infra/docker-compose.yml` 加入 API + Web 服务编排
 - [ ] 添加 API 版本前缀 `/api/v1/`
+
+### 知识图谱增量更新
+
+> 当前 `rebuild_course_graph` 是 wipe+full rebuild，课程规模增大后不可持续。
+
+- [ ] 将 `rebuild_course_graph` 从全量重建改为增量 merge：只处理新增/变更文档的 chunks
+- [ ] 为概念/关系添加更新标记或版本号，支持部分更新而非全量替换
+- [ ] 评估并发度：将 graph extraction 的 `semaphore=2` 改为可配置，大课程可适度提升
 
 ### 系统效果评估
 
@@ -143,9 +168,9 @@
   - [ ] Hit@3 / Hit@6
   - [ ] Precision@K
   - [ ] NDCG@K
-- [ ] 对比实验：Dense only vs Lexical only vs Hybrid (RRF)，验证混合检索增益
+- [ ] 对比实验：Dense only vs Lexical only vs Hybrid (WSF)，验证混合检索增益
 - [ ] 对比实验：不同 `chunk_size`（800 / 1200 / 1600）对检索效果的影响
-- [ ] 对比实验：不同 RRF `k` 值（30 / 60 / 100）对融合排序的影响
+- [ ] 对比实验：不同 `alpha` 权重（0.3 / 0.7 / 0.85）对不同类型查询的影响
 
 #### 知识图谱质量评估
 
@@ -177,15 +202,21 @@
   - [ ] 引用质量（Citation Quality）1-5 分
 - [ ] 实现评估报告生成器，输出 Markdown 格式报告（按难度/类别分组统计）
 
+### 数据库迁移
+
+- [ ] 引入 Alembic 管理数据库迁移，替换手写 `SCHEMA_PATCHES`
+- [ ] 为 SQLite fallback 数据库添加迁移兼容
+
 ---
 
-## P2 🟡 改善（提升工程规范和性能）
+## P2 🟡 改善（提升工程规范、性能和兼容性）
 
 ### 性能优化
 
+- [ ] 为 BM25 索引添加按课程缓存（Redis 或内存 LRU），chunk 变更时增量更新而非全量重建
+- [ ] 限制 lexical_search 的内存占用：分页加载 chunks 或建立倒排索引，避免大课程全表扫描
 - [ ] 将 SQLAlchemy 切换到 async 引擎（`create_async_engine` + `AsyncSession`）
 - [ ] Agent 图节点中的 DB 操作改为通过 service 层间接调用，解耦持久化
-- [ ] `lexical_search_chunks` 全表扫描优化：添加数据库全文索引或使用 `rank_bm25`
 
 ### 代码规范
 
@@ -200,16 +231,22 @@
 - [ ] 添加 Web Vitals / 性能监控
 - [ ] 添加 i18n 框架（next-intl 或 react-i18next），统一中英文管理
 - [ ] 为 `NetworkCanvas` 组件添加大图谱的虚拟化/懒加载
+- [ ] `network-canvas.tsx` 解耦 ECharts 私有 API，使用公开配置实现力导向布局控制
+
+### 基础设施兼容性
+
+- [ ] 对齐 Qdrant 客户端与服务端版本（当前 client 1.17.1 vs server 1.13.2）
+- [ ] 为 `.env` 挂载添加只读模式（`ro`），避免容器内写入导致文件竞争
+- [ ] 评估 model-bridge 的可移植性：为 Linux/macOS 提供等效启动脚本（`start-app.sh`）
 
 ---
 
 ## P3 🔵 锦上添花（长期规划）
 
-### 数据库与数据管理
+### 数据管理
 
-- [ ] 引入 Alembic 管理数据库迁移，替换手写 `SCHEMA_PATCHES`
-- [ ] 为 SQLite fallback 数据库添加迁移兼容
 - [ ] 添加数据备份/恢复脚本
+- [ ] 实现跨课程的知识迁移（概念别名、通用公式库）
 
 ### CI/CD
 
@@ -228,11 +265,11 @@
 
 ### 架构演进
 
-- [ ] 为 Service 层添加 Protocol/ABC 抽象接口
 - [ ] 考虑将 Celery Worker 改为 FastAPI BackgroundTasks + asyncio（简化部署）
 - [ ] 添加 rate limiting 中间件
 - [ ] 添加 structured logging（JSON 格式日志）
 - [ ] 考虑添加 OpenTelemetry 可观测性
+- [ ] 为 SQLite fallback 数据库添加迁移兼容
 
 ---
 
@@ -240,11 +277,13 @@
 
 | 阶段 | 总任务数 | 已完成 | 进度 |
 |------|---------|--------|------|
-| P0 紧急（事务/并发/锁/跨存储） | 18 | 14 | 78% |
+| P0 紧急（事务/并发/锁/跨存储） | 22 | 18 | 82% |
 | P0 紧急（GraphRAG） | 13 | 7 | 54% |
 | P0 紧急（测试 + 安全） | 15 | 14 | 93% |
-| P1 重要（代码重构 + DevOps） | 20 | 0 | 0% |
+| P0 紧急（外部服务/数据质量） | 8 | 6 | 75% |
+| P1 重要（代码重构 + DevOps） | 27 | 3 | 11% |
 | P1 重要（效果评估） | 24 | 0 | 0% |
-| P2 改善 | 12 | 0 | 0% |
-| P3 锦上添花 | 14 | 0 | 0% |
-| **总计** | **116** | **35** | **30%** |
+| P1 重要（图谱增量更新） | 3 | 0 | 0% |
+| P2 改善 | 16 | 0 | 0% |
+| P3 锦上添花 | 12 | 0 | 0% |
+| **总计** | **141** | **48** | **34%** |

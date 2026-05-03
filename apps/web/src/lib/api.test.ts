@@ -48,7 +48,7 @@ describe("api client", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { fetchRuntimeCheck } = await import("./api");
 
-    await fetchRuntimeCheck(true);
+    await fetchRuntimeCheck();
 
     expect(fetchMock).toHaveBeenCalledWith(
       "http://api.test/api/settings/runtime-check?require_reranker=true",

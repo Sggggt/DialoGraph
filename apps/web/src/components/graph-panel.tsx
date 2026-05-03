@@ -1,17 +1,18 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import type { GraphNodeDetail } from "@course-kg/shared";
 import { motion } from "framer-motion";
-import { Boxes, ChevronDown, Expand, Lock, Minimize2, Move, RefreshCw, ScanSearch, Unlock } from "lucide-react";
+import { Boxes, ChevronDown, Expand, Lock, Minimize2, Network, RefreshCw, ScanSearch, Unlock } from "lucide-react";
 
 import { useCourseContext } from "@/components/course-context";
-import { fetchChapterGraph, fetchDashboard, fetchGraph, fetchGraphNode } from "@/lib/api";
+import { fetchChapterGraph, fetchDashboard, fetchGraph, fetchGraphNode, rebuildGraph } from "@/lib/api";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { NetworkCanvas, type NetworkCanvasHandle } from "@/components/network-canvas";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { useLocalStorage } from "@/hooks/use-local-storage";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 type SelectedNode = { id: string; category: string } | null;
 
@@ -28,6 +29,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
   const [chapterMenuOpen, setChapterMenuOpen] = useState(false);
+  const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
   const canvasRef = useRef<NetworkCanvasHandle | null>(null);
   const fullscreenRef = useRef<HTMLDivElement | null>(null);
 
@@ -35,6 +37,16 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
     queryKey: ["graph", selectedCourseId, selectedChapter],
     queryFn: () => (selectedChapter ? fetchChapterGraph(selectedChapter, selectedCourseId) : fetchGraph(selectedCourseId)),
     enabled: Boolean(selectedCourseId),
+  });
+  const rebuildMutation = useMutation({
+    mutationFn: () => rebuildGraph(selectedCourseId),
+    onSuccess: () => {
+      graphQuery.refetch();
+      setRebuildDialogOpen(false);
+    },
+    onError: () => {
+      setRebuildDialogOpen(false);
+    },
   });
   const detailQuery = useQuery({
     queryKey: ["graph-node", selectedCourseId, detailNodeId],
@@ -169,9 +181,20 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <motion.button whileHover={{ y: -1 }} whileTap={{ scale: 0.98 }} type="button" className="action-chip rounded-full px-4 py-2 text-xs uppercase tracking-[0.22em]" onClick={() => canvasRef.current?.fitView()}>
-              <Move className="mr-2 inline size-4" />
-              适配视图
+            <motion.button
+              whileHover={{ y: -1 }}
+              whileTap={{ scale: 0.98 }}
+              type="button"
+              disabled={rebuildMutation.isPending}
+              className="action-chip rounded-full px-4 py-2 text-xs uppercase tracking-[0.22em]"
+              onClick={() => setRebuildDialogOpen(true)}
+            >
+              {rebuildMutation.isPending ? (
+                <RefreshCw className="mr-2 inline size-4 animate-spin" />
+              ) : (
+                <Network className="mr-2 inline size-4" />
+              )}
+              {rebuildMutation.isPending ? "重建中..." : "重建图谱"}
             </motion.button>
             <motion.button
               whileHover={{ y: -1 }}
@@ -180,11 +203,12 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
               className="action-chip rounded-full px-4 py-2 text-xs uppercase tracking-[0.22em]"
               onClick={() => {
                 canvasRef.current?.resetView();
+                canvasRef.current?.fitView();
                 setIsLocked(false);
               }}
             >
               <RefreshCw className="mr-2 inline size-4" />
-              重置
+              重置视图
             </motion.button>
             <motion.button
               whileHover={{ y: -1 }}
@@ -230,6 +254,60 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
           )}
         </div>
       </motion.section>
+
+      <Dialog
+        open={rebuildDialogOpen}
+        onOpenChange={(open) => {
+          if (!open && !rebuildMutation.isPending) {
+            setRebuildDialogOpen(false);
+          }
+        }}
+      >
+        <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl" showCloseButton={!rebuildMutation.isPending}>
+          <DialogHeader className="border-b border-white/8 px-6 py-5">
+            <DialogTitle>确认重建图谱</DialogTitle>
+            <DialogDescription>重建将调用 LLM 重新抽取课程概念与关系，会消耗 token 并需要 1~2 分钟。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 px-6 py-5">
+            {rebuildMutation.isPending ? (
+              <div>
+                <p className="text-sm text-white/72">图谱重建中，请稍候...</p>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8">
+                  <div className="h-full w-2/3 animate-pulse rounded-full bg-[linear-gradient(90deg,#64dfff,#7b7cff,#64dfff)]" />
+                </div>
+              </div>
+            ) : rebuildMutation.isError ? (
+              <p className="rounded-2xl border border-rose-200/16 bg-rose-300/[0.055] px-4 py-3 text-sm leading-6 text-rose-50/78">
+                重建失败：{(rebuildMutation.error as Error)?.message || "未知错误"}
+              </p>
+            ) : (
+              <p className="rounded-2xl border border-white/10 bg-white/[0.035] px-4 py-3 text-sm leading-6 text-white/68">
+                确认后立即执行，期间请勿关闭页面。
+              </p>
+            )}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={rebuildMutation.isPending}
+                onClick={() => setRebuildDialogOpen(false)}
+                className="rounded-full border border-white/12 px-4 py-2 text-sm text-white/70 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
+              >
+                {rebuildMutation.isError ? "关闭" : "取消"}
+              </button>
+              {!rebuildMutation.isError && !rebuildMutation.isPending ? (
+                <button
+                  type="button"
+                  disabled={!selectedCourseId}
+                  onClick={() => rebuildMutation.mutate()}
+                  className="rounded-full border border-cyan-200/24 bg-cyan-300/[0.08] px-4 py-2 text-sm text-cyan-50/82 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
+                >
+                  确认重建
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {!isFullscreen ? (
         <motion.section initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} className="glass-panel kg-scroll-panel min-w-0 rounded-[28px] p-5">

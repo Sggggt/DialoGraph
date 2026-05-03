@@ -60,11 +60,13 @@ function scoreLabel(key: string) {
   return labels[key] ?? key;
 }
 
-function resultChapter(result: SearchResult) {
+function resultChapter(result: SearchResult | undefined) {
+  if (!result) return "通用";
   return result.chapter ?? (result.metadata.chapter as string | undefined) ?? result.citations[0]?.chapter ?? "通用";
 }
 
-function resultSourceType(result: SearchResult) {
+function resultSourceType(result: SearchResult | undefined) {
+  if (!result) return "未知";
   return result.source_type ?? (result.metadata.source_type as string | undefined) ?? "未知";
 }
 
@@ -549,9 +551,10 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     onSuccess: (data, searchText) => {
       setSearchResults({ results: data.results, degraded_mode: Boolean(data.degraded_mode) });
       setSearchHistory((current) => [searchText, ...current.filter((item) => item !== searchText)].slice(0, 50));
-      const nextChapter = chapter || resultChapter(data.results[0]) || (dashboardQuery.data?.tree[0]?.title ?? "");
+      const firstResult = data.results[0];
+      const nextChapter = chapter || (firstResult ? resultChapter(firstResult) : undefined) || (dashboardQuery.data?.tree[0]?.title ?? "");
       setSelectedChapter(nextChapter);
-      setActiveChunkId(data.results[0]?.chunk_id ?? null);
+      setActiveChunkId(firstResult?.chunk_id ?? null);
     },
     onError: () => {
       setSearchResults({ results: [], degraded_mode: false });

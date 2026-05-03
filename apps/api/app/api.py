@@ -27,6 +27,7 @@ from app.schemas import (
     DeleteCourseResponse,
     DeleteResponse,
     GraphNodeDetail,
+    RebuildGraphResponse,
     GraphResponse,
     IngestionBatchSummary,
     JobStatusResponse,
@@ -44,7 +45,7 @@ from app.schemas import (
     TaskStatusResponse,
     UploadFileResponse,
 )
-from app.services.concept_graph import get_concept_cards, get_graph_node_detail, get_graph_payload
+from app.services.concept_graph import get_concept_cards, get_graph_node_detail, get_graph_payload, rebuild_course_graph
 from app.services.embeddings import is_degraded_mode
 from app.services.agent_graph import run_agent, run_to_task_status, stream_agent_events
 from app.services.ingestion import (
@@ -92,43 +93,12 @@ def get_model_settings() -> dict:
 @router.put("/settings/model", response_model=ModelSettingsResponse)
 def save_model_settings(request: ModelSettingsUpdate) -> dict:
     normalize_env_file()
-    if request.reranker_enabled is True:
-        check = runtime_check_payload(
-            require_reranker=True,
-            expected_model=request.reranker_model,
-            expected_device=request.reranker_device,
-        )
-        if check["blocking_issues"]:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "runtime_check_failed",
-                    "title": "Runtime infrastructure check failed",
-                    "message": "Reranker cannot be enabled until the required infrastructure is available.",
-                    "issues": check["blocking_issues"],
-                    "fix_commands": [
-                        command
-                        for issue in check["blocking_issues"]
-                        for command in issue.get("fix_commands", [])
-                    ],
-                },
-            )
     return update_model_settings(request.model_dump())
 
 
 @router.get("/settings/runtime-check", response_model=RuntimeCheckResponse)
-def get_runtime_check(
-    require_reranker: bool | None = None,
-    reranker_model: str | None = None,
-    reranker_device: str | None = None,
-    reranker_url: str | None = None,
-) -> dict:
-    return runtime_check_payload(
-        require_reranker=require_reranker,
-        expected_model=reranker_model,
-        expected_device=reranker_device,
-        expected_url=reranker_url,
-    )
+def get_runtime_check() -> dict:
+    return runtime_check_payload()
 
 
 @router.get("/courses", response_model=list[CourseSummary])
@@ -198,6 +168,12 @@ def cleanup_course_stale_graph(course_id: str | None = None, db: Session = Depen
         return cleanup_stale_graph(db, course.id)
     except MaintenanceConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/maintenance/rebuild-graph", response_model=RebuildGraphResponse)
+async def rebuild_graph_endpoint(course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, course_id)
+    return await rebuild_course_graph(db, course.id)
 
 
 @router.get("/courses/current/graph", response_model=GraphResponse)

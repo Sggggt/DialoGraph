@@ -17,7 +17,7 @@ flowchart TB
         WEB
         API --> ROUTES["API Routes<br/>courses / files / ingestion / search / qa / graph / settings"]
         ROUTES --> INGEST["Ingestion Pipeline<br/>parse -> chunk -> embed -> vector upsert -> graph extraction"]
-        ROUTES --> RETRIEVAL["Retrieval Pipeline<br/>Dense recall + BM25 recall<br/>WSF when both channels hit + rerank"]
+        ROUTES --> RETRIEVAL["Retrieval Pipeline<br/>Dense recall + BM25 recall<br/>WSF when both channels hit + lightweight_rerank"]
         ROUTES --> AGENT["Agent QA<br/>analyze / route / rewrite / retrieve / grade / answer / trace"]
         ROUTES --> GRAPH["Knowledge Graph<br/>concepts / relations / chapters / node detail"]
     end
@@ -26,13 +26,11 @@ flowchart TB
         POSTGRES[("postgres:16<br/>metadata, chunks, graph, QA sessions")]
         REDIS[("redis:7<br/>broker / runtime cache")]
         QDRANT[("qdrant/qdrant:v1.13.2<br/>knowledge_chunks vectors")]
-        RERANK_CPU["text-reranker-runtime:cpu<br/>CrossEncoder rerank"]
-        RERANK_CUDA["text-reranker-runtime:cuda<br/>CrossEncoder rerank + GPU"]
+
     end
 
     subgraph HOST["Host-Mounted Directories"]
         DATA["data/<br/>course files, ingestion artifacts, DB data"]
-        MODELS["models/<br/>Hugging Face cache"]
         BRIDGE["Optional Windows model bridge<br/>127.0.0.1:${MODEL_BRIDGE_PORT}<br/>curl.exe forwarding"]
     end
 
@@ -43,8 +41,6 @@ flowchart TB
     API --> POSTGRES
     API --> REDIS
     API --> QDRANT
-    API -->|"HTTP rerank via RERANKER_URL"| RERANK_CPU
-    API -. "RERANKER_DEVICE=cuda" .-> RERANK_CUDA
     API -->|"MODEL_BRIDGE_ENABLED=false<br/>real API, fallback disabled"| LLM
     API -. "MODEL_BRIDGE_ENABLED=true<br/>http://host.docker.internal:${MODEL_BRIDGE_PORT}" .-> BRIDGE
     BRIDGE -. "Windows curl.exe<br/>forwards to OPENAI_BASE_URL" .-> LLM
@@ -53,11 +49,9 @@ flowchart TB
     REDIS --- DATA
     QDRANT --- DATA
     API --- DATA
-    RERANK_CPU --- MODELS
-    RERANK_CUDA --- MODELS
 ```
 
-The API image stays lightweight and does not include PyTorch, CUDA or `sentence-transformers`. Reranking runs in the reusable `text-reranker-runtime:*` container when `RERANKER_ENABLED=true`; CPU/CUDA selection is controlled by `RERANKER_DEVICE`. Model API traffic has two mutually exclusive paths: by default the API container calls `OPENAI_BASE_URL` directly; on Windows Docker Desktop, when the host can reach the provider but Linux containers cannot complete the provider TLS handshake, `MODEL_BRIDGE_ENABLED=true` starts a host-side model bridge and points the API container to `http://host.docker.internal:${MODEL_BRIDGE_PORT}`. The bridge only forwards to the real OpenAI-compatible provider; it does not replace the model and is not fallback.
+The API image stays lightweight and does not include PyTorch, CUDA or `sentence-transformers`. Retrieval uses a pure-Python `lightweight_rerank()` based on query-term overlap density with documents, combined with WSF fused-score weighting, with zero external model dependencies. Model API traffic has two mutually exclusive paths: by default the API container calls `OPENAI_BASE_URL` directly; on Windows Docker Desktop, when the host can reach the provider but Linux containers cannot complete the provider TLS handshake, `MODEL_BRIDGE_ENABLED=true` starts a host-side model bridge and points the API container to `http://host.docker.internal:${MODEL_BRIDGE_PORT}`. The bridge only forwards to the real OpenAI-compatible provider; it does not replace the model and is not fallback.
 
 ## Repository Layout
 
@@ -66,9 +60,8 @@ apps/api/             FastAPI backend
 apps/web/             Next.js frontend
 apps/worker/          Optional background worker
 packages/shared/      Shared TypeScript contracts
-infra/                Docker Compose and reusable reranker runtime
+infra/                Docker Compose infrastructure orchestration
 data/                 Local persistent data
-models/               Local model cache
 ```
 
 Main runtime persistence:
@@ -79,7 +72,6 @@ data/qdrant           Qdrant data
 data/redis            Redis data
 data/storage          Uploaded and archived files
 data/ingestion        Derived parsing artifacts
-models/huggingface    Reranker model cache
 ```
 
 ## Data Model Architecture
@@ -215,9 +207,7 @@ flowchart TB
         DENSE --> WSF["Weighted Score Fusion<br/>when BM25 also hits"]
         BM25 --> WSF
         DENSE --> DENSE_ONLY["Dense-only candidates<br/>when lexical channel has no hit"]
-        WSF --> RERANK["Optional external bge-reranker<br/>HTTP runtime"]
-        DENSE_ONLY --> RERANK
-        RERANK --> TOPK["Top-K chunks"]
+        WSF --> TOPK["Top-K chunks"]
         TOPK --> ANSWER["Chat model answer<br/>with citations"]
     end
 
@@ -229,7 +219,7 @@ flowchart TB
 The primary retrieval path is:
 
 ```text
-Dense vector recall + BM25 lexical recall; WSF runs when both channels hit; dense-only results skip WSF; the external bge-reranker runs when enabled.
+Dense vector recall + BM25 lexical recall; WSF runs when both channels hit; dense-only results skip WSF; lightweight_rerank is applied as the final ranking step.
 ```
 
 ## GraphRAG Workflow
@@ -289,8 +279,6 @@ Important settings:
 ```env
 API_IMAGE=course-kg-api:local
 WEB_IMAGE=course-kg-web:local
-RERANKER_CPU_IMAGE=text-reranker-runtime:cpu
-RERANKER_CUDA_IMAGE=text-reranker-runtime:cuda
 
 DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/course_kg
 QDRANT_URL=http://localhost:6333
@@ -305,24 +293,29 @@ CHAT_MODEL=qwen-plus
 MODEL_BRIDGE_ENABLED=false
 MODEL_BRIDGE_PORT=8765
 
-RERANKER_MODEL=BAAI/bge-reranker-v2-m3
-RERANKER_ENABLED=true
-RERANKER_DEVICE=cpu
-RERANKER_CANDIDATE_LIMIT=12
-
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
 The default example above targets DashScope's OpenAI-compatible endpoint, so `OPENAI_BASE_URL`, `EMBEDDING_MODEL`, `CHAT_MODEL` and `EMBEDDING_DIMENSIONS` must be treated as one matched set. When using another OpenAI-compatible provider, change all of them together and keep the embedding output dimension aligned with `EMBEDDING_DIMENSIONS`. With an empty `OPENAI_API_KEY`, Docker services can start, but upload parsing, search and QA model calls will fail; a real key is required before full-chain validation. Do not enable `ENABLE_MODEL_FALLBACK` or `ENABLE_DATABASE_FALLBACK`.
 
-When `RERANKER_ENABLED=false`, retrieval returns the WSF-fused ranking directly and the reranker runtime is not started. This is not fallback. `RERANKER_DEVICE` only supports `cpu` and `cuda`, and only matters when reranking is enabled. `RERANKER_CANDIDATE_LIMIT` caps how many WSF candidates are sent to the cross-encoder reranker; keep it lower on CPU and raise it when CUDA is available.
-
-The frontend Settings page can toggle reranking directly. Before enabling it, Web calls `/api/settings/runtime-check` to verify `.env` / `.env.example` key sync, the reranker runtime, model cache, PostgreSQL, Qdrant and Redis connectivity. If infrastructure is incomplete, the UI opens a structured error dialog with repair commands instead of silently saving a broken configuration.
+The frontend Settings page shows runtime status. Web calls `/api/settings/runtime-check` to verify `.env` / `.env.example` key sync, PostgreSQL, Qdrant and Redis connectivity. If infrastructure is incomplete, the UI opens a structured error dialog with repair commands instead of silently saving a broken configuration.
 
 `MODEL_BRIDGE_ENABLED=true` is only for Windows Docker Desktop environments where the host can reach the OpenAI-compatible provider but Linux containers cannot complete the provider TLS handshake. The launcher starts `infra/model-bridge/model_bridge.py` on the host and points the API container at `http://host.docker.internal:${MODEL_BRIDGE_PORT}`. The bridge forwards the original request to `OPENAI_BASE_URL` with optional `OPENAI_RESOLVE_IP`; it does not replace the model or enable fallback.
 
+## Pull Base Images
+
+Infrastructure images are pulled directly from Docker Hub and do not need local builds:
+
+```powershell
+docker pull postgres:16
+docker pull redis:7
+docker pull qdrant/qdrant:v1.13.2
+```
+
 ## Validate Base Images
+
+Confirm the images were downloaded correctly:
 
 ```powershell
 docker run --rm postgres:16 postgres --version
@@ -330,7 +323,7 @@ docker run --rm redis:7 redis-server --version
 docker image inspect qdrant/qdrant:v1.13.2
 ```
 
-These commands only verify that Docker can fetch PostgreSQL, Redis and Qdrant base images. `text-reranker-runtime:*` is built locally by this project; validate it after the build step below.
+Project application images (API, Web) are built in the next section.
 
 ## Build Images
 
@@ -339,20 +332,9 @@ Build only missing or changed images:
 ```powershell
 docker build -f apps/api/Dockerfile -t course-kg-api:local .
 docker build -f apps/web/Dockerfile -t course-kg-web:local .
-docker build -f infra/reranker/Dockerfile.cpu -t text-reranker-runtime:cpu infra/reranker
-docker build -f infra/reranker/Dockerfile.cuda -t text-reranker-runtime:cuda infra/reranker
 ```
 
-On a new machine, build at least the API, Web and CPU reranker images. Build the CUDA reranker only when `RERANKER_DEVICE=cuda`. `text-reranker-runtime:*` is reusable infrastructure and can be shared across projects. If an equivalent image already exists, set its image name in `.env`.
-
-Validate the reranker images after building them:
-
-```powershell
-docker run --rm text-reranker-runtime:cpu python -c "import torch; print(torch.__version__)"
-docker run --rm --gpus all text-reranker-runtime:cuda python -c "import torch; print(torch.cuda.is_available())"
-```
-
-The CUDA check should print `True`. If it does not, verify the NVIDIA Driver and NVIDIA Container Toolkit first.
+On a new machine, build at least the API and Web images.
 
 ## System Python Tests
 
@@ -366,25 +348,7 @@ python -m pytest
 
 This path is for local unit tests; Docker runtime diagnostics should still use the container environment.
 
-## Model Cache
 
-The reranker model is mounted from the host and is not baked into images:
-
-```text
-models/huggingface -> /models/huggingface
-```
-
-Prefetch the model:
-
-```powershell
-docker run --rm -v "${PWD}\models:/models" -e HF_HOME=/models/huggingface text-reranker-runtime:cpu python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3', max_length=512, device='cpu')"
-```
-
-When a Hugging Face mirror is needed, add:
-
-```powershell
--e HF_ENDPOINT=https://hf-mirror.com
-```
 
 ## Start
 
@@ -394,7 +358,7 @@ Start the full application:
 .\start-app.ps1
 ```
 
-The launcher reads the repository-root `.env`, chooses the CPU/CUDA reranker path from `RERANKER_ENABLED` and `RERANKER_DEVICE`, and rewrites the API container's PostgreSQL, Qdrant, Redis and reranker URLs to Docker-network service names. Do not copy the README's host-side `localhost` database URLs into compose; compose already uses `postgres`, `qdrant`, `redis` and `reranker` inside the Docker network.
+The launcher reads the repository-root `.env` and rewrites the API container's PostgreSQL, Qdrant and Redis URLs to Docker-network service names. Do not copy the README's host-side `localhost` database URLs into compose; compose already uses `postgres`, `qdrant` and `redis` inside the Docker network.
 
 Common options:
 
@@ -407,12 +371,11 @@ Stop services:
 
 ```powershell
 docker compose -f infra/docker-compose.yml down
-docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down
 ```
 
 ## Docker End-to-End Smoke Test
 
-After startup, run a disposable-course smoke test for the API, dependent services, database, Qdrant, reranker and real model calls:
+After startup, run a disposable-course smoke test for the API, dependent services, database, Qdrant and real model calls:
 
 ```powershell
 python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
@@ -435,7 +398,7 @@ The FastAPI OpenAPI schema is exposed at `/openapi.json`. The table below follow
 | GET | `/api/health` | Health and degraded status |
 | GET | `/api/settings/model` | Read model settings |
 | PUT | `/api/settings/model` | Update model settings |
-| GET | `/api/settings/runtime-check` | Check `.env` sync, reranker runtime and infrastructure status |
+| GET | `/api/settings/runtime-check` | Check `.env` sync and infrastructure status |
 | GET | `/api/courses` | List courses |
 | POST | `/api/courses` | Create course |
 | DELETE | `/api/courses/{course_id}` | Delete course and data |
@@ -470,7 +433,7 @@ The FastAPI OpenAPI schema is exposed at `/openapi.json`. The table below follow
 
 - Model fallback and database fallback are disabled by default.
 - Do not commit `.env`, `data/`, `models/` or `output/`.
-- The API container only carries project backend dependencies; PyTorch/CUDA live only in the reusable reranker runtime.
+- The API container only carries project backend dependencies and stays lightweight.
 - Production data should use PostgreSQL + Qdrant, not SQLite or JSON fallback.
 - API startup applies lightweight schema patches and finalizes interrupted ingestion batches; Alembic migrations are not used.
 - Course data is isolated by `course_id`; uploaded files, parser artifacts, chunks, graph records and QA sessions are course-scoped.

@@ -225,6 +225,23 @@ export interface CleanupStaleGraphResponse {
   removed_concepts: number;
 }
 
+export interface RebuildGraphResponse {
+  graph_rebuilt: boolean;
+  concepts: number;
+  relations: number;
+  graph_nodes: number;
+  graph_edges: number;
+  graph_extraction_provider: string;
+  graph_extraction_chunk_limit: number;
+  graph_extraction_chunks_per_document: number;
+  graph_llm_selected_chunks: number;
+  graph_llm_source_documents: number;
+  graph_llm_success_chunks: number;
+  graph_llm_failed_chunks: number;
+  graph_total_active_chunks: number;
+  graph_source_documents: number;
+}
+
 export interface DeleteCourseResponse {
   deleted: boolean;
   deleted_vectors: number;
@@ -263,6 +280,7 @@ export interface ModelSettingsResponse {
   reranker_model: string;
   reranker_device: "cpu" | "cuda";
   reranker_url: string;
+  model_bridge_enabled: boolean;
   has_api_key: boolean;
   degraded_mode: boolean;
 }
@@ -280,6 +298,7 @@ export interface ModelSettingsUpdate {
   reranker_enabled?: boolean | null;
   reranker_model?: string | null;
   reranker_device?: "cpu" | "cuda" | null;
+  model_bridge_enabled?: boolean | null;
 }
 
 export interface RuntimeIssue {

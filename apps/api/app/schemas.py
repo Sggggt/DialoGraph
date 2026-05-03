@@ -216,6 +216,23 @@ class CleanupStaleGraphResponse(BaseModel):
     removed_concepts: int = 0
 
 
+class RebuildGraphResponse(BaseModel):
+    graph_rebuilt: bool
+    concepts: int
+    relations: int
+    graph_nodes: int
+    graph_edges: int
+    graph_extraction_provider: str
+    graph_extraction_chunk_limit: int
+    graph_extraction_chunks_per_document: int
+    graph_llm_selected_chunks: int
+    graph_llm_source_documents: int
+    graph_llm_success_chunks: int
+    graph_llm_failed_chunks: int
+    graph_total_active_chunks: int
+    graph_source_documents: int
+
+
 class DeleteCourseResponse(BaseModel):
     deleted: bool
     deleted_vectors: int = 0
@@ -244,16 +261,17 @@ class RefreshResponse(BaseModel):
 class ModelSettingsResponse(BaseModel):
     provider: Literal["openai_compatible"] = "openai_compatible"
     base_url: str
+    model_bridge_enabled: bool = False
     resolve_ip: str | None = None
     embedding_model: str
     chat_model: str
     embedding_dimensions: int
     graph_extraction_chunk_limit: int
     graph_extraction_chunks_per_document: int
-    reranker_enabled: bool
-    reranker_model: str
-    reranker_device: str
-    reranker_url: str
+    reranker_enabled: bool = False
+    reranker_model: str = ""
+    reranker_device: str = "cpu"
+    reranker_url: str = ""
     has_api_key: bool
     degraded_mode: bool
 
@@ -262,15 +280,13 @@ class ModelSettingsUpdate(BaseModel):
     api_key: str | None = None
     clear_api_key: bool = False
     base_url: str | None = None
+    model_bridge_enabled: bool | None = None
     resolve_ip: str | None = None
     embedding_model: str | None = None
     chat_model: str | None = None
     embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
     graph_extraction_chunk_limit: int | None = Field(default=None, ge=1, le=200)
     graph_extraction_chunks_per_document: int | None = Field(default=None, ge=1, le=10)
-    reranker_enabled: bool | None = None
-    reranker_model: str | None = None
-    reranker_device: Literal["cpu", "cuda"] | None = None
 
 
 class RuntimeIssue(BaseModel):
@@ -287,19 +303,6 @@ class EnvSyncStatus(BaseModel):
     bom_keys: list[str] = Field(default_factory=list)
 
 
-class RerankerRuntimeStatus(BaseModel):
-    enabled: bool
-    device: str
-    model: str
-    url: str
-    reachable: bool
-    healthy: bool
-    reported_model: str | None = None
-    reported_device: str | None = None
-    model_matches: bool | None = None
-    device_matches: bool | None = None
-
-
 class InfrastructureStatus(BaseModel):
     postgres: bool
     qdrant: bool
@@ -309,7 +312,7 @@ class InfrastructureStatus(BaseModel):
 
 class RuntimeCheckResponse(BaseModel):
     env_sync: EnvSyncStatus
-    reranker: RerankerRuntimeStatus
+    reranker: dict = Field(default_factory=dict)
     infrastructure: InfrastructureStatus
     blocking_issues: list[RuntimeIssue] = Field(default_factory=list)
     warnings: list[RuntimeIssue] = Field(default_factory=list)

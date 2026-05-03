@@ -69,7 +69,7 @@ class ModelBridgeHandler(BaseHTTPRequestHandler):
                 config_file.write("retry = 2\n")
                 config_file.write("retry-delay = 1\n")
                 config_file.write("retry-all-errors\n")
-                if BridgeConfig.resolve_ip:
+                if BridgeConfig.resolve_ip and BridgeConfig.resolve_ip != "__none__":
                     config_file.write(f'resolve = "{parsed.hostname}:{port}:{BridgeConfig.resolve_ip}"\n')
                 config_file.write(f'header = "Authorization: {auth_header}"\n')
                 config_file.write('header = "Content-Type: application/json"\n')

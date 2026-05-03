@@ -41,9 +41,7 @@ type SettingsForm = {
   graph_extraction_chunks_per_document: string;
   api_key: string;
   clear_api_key: boolean;
-  reranker_enabled: boolean;
-  reranker_model: string;
-  reranker_device: "cpu" | "cuda";
+  model_bridge_enabled: boolean;
 };
 
 type ErrorDialogState = {
@@ -90,23 +88,7 @@ function RuntimeStatusBadge({ check }: { check?: RuntimeCheckResponse }) {
   if (!check) {
     return <span className="text-white/42">未检测</span>;
   }
-  if (!check.reranker.enabled) {
-    return <span className="text-white/58">未启用</span>;
-  }
-  if (check.reranker.healthy && check.reranker.model_matches !== false && check.reranker.device_matches !== false) {
-    return (
-      <span className="inline-flex items-center gap-1.5 text-emerald-100">
-        <CheckCircle2 className="size-4" />
-        可用
-      </span>
-    );
-  }
-  return (
-    <span className="inline-flex items-center gap-1.5 text-amber-100">
-      <AlertTriangle className="size-4" />
-      需处理
-    </span>
-  );
+  return <span className="text-white/58">已移除</span>;
 }
 
 function ErrorDialog({ state, onClose }: { state: ErrorDialogState | null; onClose: () => void }) {
@@ -177,9 +159,7 @@ export function SettingsWorkspace() {
       graph_extraction_chunks_per_document: String(settingsQuery.data.graph_extraction_chunks_per_document ?? 2),
       api_key: "",
       clear_api_key: false,
-      reranker_enabled: settingsQuery.data.reranker_enabled,
-      reranker_model: settingsQuery.data.reranker_model,
-      reranker_device: settingsQuery.data.reranker_device,
+      model_bridge_enabled: settingsQuery.data.model_bridge_enabled ?? false,
     });
     setApiKeyEditing(false);
   }, [settingsQuery.data]);
@@ -209,7 +189,7 @@ export function SettingsWorkspace() {
     return [
       { label: "向量模型", value: settings.embedding_model },
       { label: "对话 / 图谱模型", value: settings.chat_model },
-      { label: "重排序模型", value: settings.reranker_enabled ? `${settings.reranker_model} (${settings.reranker_device})` : "未启用" },
+      { label: "精排策略", value: "LightweightRerank (零模型)" },
     ];
   }, [settings]);
 
@@ -238,18 +218,13 @@ export function SettingsWorkspace() {
       graph_extraction_chunks_per_document: Number.isFinite(graphChunksPerDocument) ? graphChunksPerDocument : undefined,
       api_key: form.api_key.trim() || null,
       clear_api_key: form.clear_api_key,
-      reranker_enabled: form.reranker_enabled,
-      reranker_model: form.reranker_model.trim(),
-      reranker_device: form.reranker_device,
+      model_bridge_enabled: form.model_bridge_enabled,
     };
   };
 
   const handleSubmit = async () => {
     try {
-      const check = await fetchRuntimeCheck(form.reranker_enabled, {
-        reranker_model: form.reranker_model.trim(),
-        reranker_device: form.reranker_device,
-      });
+      const check = await fetchRuntimeCheck();
       const dialog = runtimeIssueDialog(check);
       if (dialog) {
         setErrorDialog(dialog);
@@ -260,41 +235,6 @@ export function SettingsWorkspace() {
     } catch (error) {
       setErrorDialog(errorDialogFromUnknown(error));
     }
-  };
-
-  const handleRerankerToggle = async () => {
-    if (saveMutation.isPending) {
-      return;
-    }
-    const nextEnabled = !form.reranker_enabled;
-    if (nextEnabled) {
-      try {
-        const check = await fetchRuntimeCheck(true, {
-          reranker_model: form.reranker_model.trim(),
-          reranker_device: form.reranker_device,
-        });
-        const dialog = runtimeIssueDialog(check);
-        if (dialog) {
-          setErrorDialog(dialog);
-          await queryClient.invalidateQueries({ queryKey: ["runtime-check"] });
-          return;
-        }
-      } catch (error) {
-        setErrorDialog(errorDialogFromUnknown(error));
-        return;
-      }
-    }
-    updateForm("reranker_enabled", nextEnabled);
-    saveMutation.mutate(
-      { ...buildPayload(), reranker_enabled: nextEnabled },
-      {
-        onSuccess: () => {
-          const message = nextEnabled ? "Reranker 已启用" : "已切换为 Dense + BM25 + WSF，无 rerank";
-          setSavedMessage(message);
-          window.setTimeout(() => setSavedMessage(null), 1800);
-        },
-      },
-    );
   };
 
   const handleRuntimeCheck = async () => {
@@ -313,7 +253,7 @@ export function SettingsWorkspace() {
               <p className="section-kicker">模型与检索基础设施</p>
               <h2 className="glow-text mt-2 text-4xl font-semibold text-white">运行时设置</h2>
               <p className="mt-4 max-w-xl text-sm leading-7 text-cyan-50/62">
-                配置 OpenAI-compatible 模型接口和可选 reranker。启用 reranker 前会检测 runtime、环境参数和基础设施状态。
+                配置 OpenAI-compatible 模型接口。检索使用 Dense + BM25 + WSF 轻量精排，零外部模型依赖。
               </p>
             </div>
 
@@ -323,12 +263,6 @@ export function SettingsWorkspace() {
                 <p className="mt-2 flex items-center gap-2 text-sm text-white/68">
                   {settings?.has_api_key ? <CheckCircle2 className="size-4 text-emerald-200" /> : <ShieldAlert className="size-4 text-amber-200" />}
                   {settings?.has_api_key ? "API Key 已配置" : "API Key 未配置"}
-                </p>
-              </div>
-              <div className="border-l border-white/10 px-4 py-3">
-                <p className="text-xs uppercase tracking-[0.26em] text-white/42">重排序运行时</p>
-                <p className="mt-2 text-sm text-white/68">
-                  <RuntimeStatusBadge check={runtimeQuery.data} />
                 </p>
               </div>
               <div className="border-l border-white/10 px-4 py-3">
@@ -347,61 +281,35 @@ export function SettingsWorkspace() {
               void handleSubmit();
             }}
           >
-            <div className="rounded-3xl border border-white/10 bg-white/[0.035] p-5">
-              <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="grid gap-5 md:grid-cols-2">
+              <div className="flex flex-wrap items-center justify-between gap-4 md:col-span-2 rounded-2xl border border-white/10 bg-white/[0.035] p-5">
                 <div>
                   <p className="flex items-center gap-2 text-sm font-semibold text-white">
-                    <SlidersHorizontal className="size-4 text-cyan-100/70" />
-                    Reranker
+                    <ServerCog className="size-4 text-cyan-100/70" />
+                    宿主机模型桥接 (Model Bridge)
                   </p>
                   <p className="mt-2 text-sm leading-6 text-white/58">
-                    关闭后检索直接使用 Dense + BM25 + WSF 排序，不启动重排序运行时；这不是降级链路。
+                    开启后容器将通过宿主机网络访问模型 (http://host.docker.internal)。更改此项后需重新执行 <code className="rounded bg-black/30 px-1.5 py-0.5 text-xs text-amber-100">.\start-app.ps1</code> 才能生效。
                   </p>
                 </div>
                 <button
                   type="button"
                   role="switch"
-                  aria-checked={form.reranker_enabled}
+                  aria-checked={form.model_bridge_enabled}
                   disabled={saveMutation.isPending}
-                  onClick={() => void handleRerankerToggle()}
+                  onClick={() => updateForm("model_bridge_enabled", !form.model_bridge_enabled)}
                   className={`relative h-8 w-16 rounded-full border transition ${
-                    form.reranker_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
+                    form.model_bridge_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
                   } disabled:cursor-not-allowed disabled:opacity-60`}
                 >
                   <span
                     className={`absolute top-1 size-6 rounded-full bg-white shadow transition ${
-                      form.reranker_enabled ? "left-9" : "left-1"
+                      form.model_bridge_enabled ? "left-9" : "left-1"
                     }`}
                   />
                 </button>
               </div>
 
-              <div className="mt-5 grid gap-4 md:grid-cols-2">
-                <label className="flex flex-col gap-2">
-                  <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">重排序模型</span>
-                  <Input
-                    value={form.reranker_model}
-                    disabled={!form.reranker_enabled}
-                    onChange={(event) => updateForm("reranker_model", event.target.value)}
-                    className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white"
-                  />
-                </label>
-                <label className="flex flex-col gap-2">
-                  <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">设备</span>
-                  <select
-                    value={form.reranker_device}
-                    disabled={!form.reranker_enabled}
-                    onChange={(event) => updateForm("reranker_device", event.target.value as "cpu" | "cuda")}
-                    className="h-12 rounded-2xl border border-white/10 bg-[#111927] px-4 text-sm text-white outline-none"
-                  >
-                    <option value="cpu">cpu</option>
-                    <option value="cuda">cuda</option>
-                  </select>
-                </label>
-              </div>
-            </div>
-
-            <div className="grid gap-5 md:grid-cols-2">
               <label className="flex flex-col gap-2 md:col-span-2">
                 <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Base URL</span>
                 <Input value={form.base_url} onChange={(event) => updateForm("base_url", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
@@ -480,7 +388,7 @@ export function SettingsWorkspace() {
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-5">
               <p className="text-xs leading-6 text-white/42">
-                保存前会检查运行时和环境参数；启用 reranker 时必须能访问对应 runtime。
+                保存前会检查运行时和环境参数；模型 fallback 与数据库 fallback 默认关闭。
               </p>
               <div className="flex items-center gap-2">
                 {savedMessage ? <span className="text-sm text-emerald-100">{savedMessage}</span> : null}

@@ -5,6 +5,7 @@ import type {
   CleanupStaleDataResponse,
   CleanupStaleGraphResponse,
   ConceptCard,
+  RebuildGraphResponse,
   CourseFileSummary,
   CourseCreateRequest,
   CourseSummary,
@@ -118,19 +119,11 @@ export async function fetchModelSettings(): Promise<ModelSettingsResponse> {
   return parseResponse<ModelSettingsResponse>(response);
 }
 
-export async function fetchRuntimeCheck(
-  requireReranker?: boolean,
-  options?: { reranker_model?: string | null; reranker_device?: string | null; reranker_url?: string | null },
-): Promise<RuntimeCheckResponse> {
-  const response = await fetch(
-    buildApiUrl("/settings/runtime-check", {
-      require_reranker: requireReranker === undefined ? null : String(requireReranker),
-      reranker_model: options?.reranker_model,
-      reranker_device: options?.reranker_device,
-      reranker_url: options?.reranker_url,
-    }),
-    { cache: "no-store", headers: authHeaders() },
-  );
+export async function fetchRuntimeCheck(): Promise<RuntimeCheckResponse> {
+  const response = await fetch(buildApiUrl("/settings/runtime-check"), {
+    cache: "no-store",
+    headers: authHeaders(),
+  });
   return parseResponse<RuntimeCheckResponse>(response);
 }
 
@@ -170,6 +163,14 @@ export async function cleanupStaleGraph(courseId?: string | null): Promise<Clean
     headers: authHeaders(),
   });
   return parseResponse<CleanupStaleGraphResponse>(response);
+}
+
+export async function rebuildGraph(courseId?: string | null): Promise<RebuildGraphResponse> {
+  const response = await fetch(buildApiUrl("/maintenance/rebuild-graph", { course_id: courseId }), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return parseResponse<RebuildGraphResponse>(response);
 }
 
 export async function fetchGraph(courseId?: string | null): Promise<GraphResponse> {

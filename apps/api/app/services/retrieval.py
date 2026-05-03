@@ -15,7 +15,6 @@ from app.schemas import Citation, SearchFilters
 from app.services.concept_graph import get_graph_payload
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode
 from app.services.parsers import derive_chapter, is_invalid_chapter_label
-from app.services.reranker import RerankerProvider
 from app.services.vector_store import VectorStore
 
 
@@ -46,7 +45,7 @@ QUERY_TYPE_CONFIG = {
     "procedure": {"alpha": 0.75, "recall_k": 60},
     "default": {"alpha": 0.72, "recall_k": 64},
 }
-PRIMARY_SCORE_KEYS = ("dense", "lexical", "fused", "rerank")
+PRIMARY_SCORE_KEYS = ("dense", "lexical", "fused", "rerank", "lightweight_rerank", "term_overlap_ratio")
 
 
 def should_include_storage_file(path: Path) -> bool:
@@ -146,7 +145,7 @@ def default_model_audit() -> dict:
         "embedding_model": settings.embedding_model,
         "embedding_external_called": False,
         "embedding_fallback_reason": None,
-        "reranker_enabled": settings.reranker_enabled,
+        "reranker_enabled": False,
         "reranker_called": False,
         "fallback_enabled": settings.enable_model_fallback,
         "degraded_mode": is_degraded_mode(),
@@ -175,7 +174,7 @@ def build_search_payload(chunk: Chunk, document: Document, query: str, score: fl
         page_number=chunk.page_number,
         snippet=chunk.snippet,
     )
-    metadata = chunk.metadata_json | {"chapter": chunk.chapter, "source_type": chunk.source_type}
+    metadata = (chunk.metadata_json or {}) | {"chapter": chunk.chapter, "source_type": chunk.source_type}
     if scores:
         metadata["scores"] = scores
     return {
@@ -272,7 +271,8 @@ async def hybrid_search_chunks_with_audit(db: Session, course_id: str, query: st
             dense_results = []
     lexical_results = lexical_search_chunks(db, course_id, query, filters, recall_k)
     if not dense_results:
-        return attach_model_audit(lexical_results[:top_k], model_audit), model_audit
+        results = lightweight_rerank(query, lexical_results, top_k) if lexical_results else []
+        return attach_model_audit(results, model_audit), model_audit
     if not lexical_results:
         results = rerank_or_return(query, dense_results, top_k)
         model_audit["reranker_called"] = any("rerank" in item.get("metadata", {}).get("scores", {}) for item in results)
@@ -291,13 +291,39 @@ async def hybrid_search_chunks_with_audit(db: Session, course_id: str, query: st
     return attach_model_audit(results, model_audit), model_audit
 
 
-def rerank_or_return(query: str, candidates: list[dict], top_k: int) -> list[dict]:
-    settings = get_settings()
-    if settings.reranker_enabled:
-        return RerankerProvider.get().rerank(query, candidates, top_k)
+def lightweight_rerank(query: str, candidates: list[dict], top_k: int) -> list[dict]:
+    """轻量精排：零外部模型，纯规则 + 统计信号。"""
+    if not candidates:
+        return []
+
+    query_terms = set(tokenize_for_retrieval(query))
+    query_len = len(query_terms) or 1
+
+    scored = []
     for item in candidates:
-        item.setdefault("metadata", {}).setdefault("scores", {})["rerank_enabled"] = False
-    return candidates[:top_k]
+        haystack = f"{item.get('document_title', '')} {item.get('snippet', '')} {item.get('content', '')}"
+        doc_terms = set(tokenize_for_retrieval(haystack))
+        overlap = query_terms.intersection(doc_terms)
+        overlap_ratio = len(overlap) / query_len
+
+        fused_score = float(item.get("metadata", {}).get("scores", {}).get("fused", item.get("score", 0.0)))
+
+        query_type = item.get("metadata", {}).get("scores", {}).get("query_type", "default")
+        alpha = 0.65 if query_type in ("definition", "formula") else 0.75
+
+        final_score = alpha * fused_score + (1.0 - alpha) * overlap_ratio
+
+        item.setdefault("metadata", {}).setdefault("scores", {})["lightweight_rerank"] = round(final_score, 4)
+        item.setdefault("metadata", {}).setdefault("scores", {})["term_overlap_ratio"] = round(overlap_ratio, 4)
+        item["score"] = final_score
+        scored.append(item)
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]
+
+
+def rerank_or_return(query: str, candidates: list[dict], top_k: int) -> list[dict]:
+    return lightweight_rerank(query, candidates, top_k)
 
 
 def weighted_score_fusion(dense_results: list[dict], lexical_results: list[dict], alpha: float, top_n: int) -> list[dict]:
