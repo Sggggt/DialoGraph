@@ -1,0 +1,50 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Python scripts should use LF for cross-platform consistency
+*.py text eol=lf
+
+# Shell scripts must use LF
+*.sh text eol=lf
+
+# Windows batch files should use CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell scripts: auto (Git will convert on checkout according to platform)
+*.ps1 text=auto
+
+# Web source files: LF is standard
+*.js text eol=lf
+*.jsx text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.json text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Docker files
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf
+docker-compose.yaml text eol=lf
+
+# Config files
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+
+# Treat binary files as binary (do not convert line endings)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.db binary
