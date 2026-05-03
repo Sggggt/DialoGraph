@@ -179,6 +179,81 @@ def test_document_chapter_label_prefers_canonical_filename_over_stale_tags(sampl
     assert document_chapter_label(visualizer_document, "Algorithmic GT") == "Reference"
 
 
+def test_merge_graph_candidates_ignores_non_text_model_fields():
+    from app.services.concept_graph import merge_graph_candidates
+
+    merged = merge_graph_candidates(
+        {
+            "concepts": [
+                {
+                    "name": 123,
+                    "aliases": ["Numeric Alias"],
+                    "summary": "invalid concept name should be ignored",
+                    "concept_type": "concept",
+                    "importance_score": 0.9,
+                },
+                {
+                    "name": "Posterior Distribution",
+                    "aliases": [456, "Posterior"],
+                    "summary": 789,
+                    "concept_type": 123,
+                    "importance_score": "bad",
+                },
+            ],
+            "relations": [
+                {"source": 123, "target": "Posterior Distribution", "relation_type": "relates_to", "confidence": 0.9},
+                {"source": "Posterior Distribution", "target": "Bayesian Inference", "relation_type": 5, "confidence": "bad"},
+                {"source": "Posterior Distribution", "target": "Bayesian Inference", "relation_type": "relates_to", "confidence": "bad"},
+            ],
+        },
+        {
+            "concepts": [
+                {"name": "Bayesian Inference", "aliases": [], "summary": "", "concept_type": "concept", "importance_score": 0.7}
+            ],
+            "relations": [],
+        },
+    )
+
+    assert [concept["name"] for concept in merged["concepts"]] == ["Bayesian Inference", "Posterior Distribution"]
+    posterior = next(concept for concept in merged["concepts"] if concept["name"] == "Posterior Distribution")
+    assert posterior["aliases"] == ["Posterior"]
+    assert posterior["concept_type"] == "concept"
+    assert posterior["importance_score"] == 0.0
+    assert merged["relations"] == [
+        {
+            "source": "Posterior Distribution",
+            "target": "Bayesian Inference",
+            "relation_type": "relates_to",
+            "confidence": 0.5,
+        }
+    ]
+
+
+def test_merge_graph_candidates_treats_non_mapping_payload_as_empty():
+    from app.services.concept_graph import merge_graph_candidates
+
+    merged = merge_graph_candidates(
+        ["not", "a", "mapping"],
+        {
+            "concepts": [
+                {"name": "Bayesian Inference", "aliases": [], "summary": "", "concept_type": "concept", "importance_score": 0.7}
+            ],
+            "relations": [],
+        },
+    )
+
+    assert merged["concepts"] == [
+        {
+            "name": "Bayesian Inference",
+            "aliases": ["Bayesian Inference"],
+            "summary": "",
+            "concept_type": "concept",
+            "importance_score": 0.7,
+        }
+    ]
+    assert merged["relations"] == []
+
+
 @pytest.mark.asyncio
 async def test_extract_llm_graph_payloads_isolates_chunk_failures(monkeypatch):
     from app.services import concept_graph

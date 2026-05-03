@@ -7,7 +7,7 @@ export function LoadingBlock({ rows = 3 }: { rows?: number }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Loading</CardTitle>
+        <CardTitle>正在加载</CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         {Array.from({ length: rows }).map((_, index) => (

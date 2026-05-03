@@ -13,4 +13,11 @@ describe("MarkdownRenderer", () => {
     expect(container.querySelector(".katex-display")).not.toBeNull();
     expect(container.textContent).toContain("E");
   });
+
+  it("renders TeX parenthesis and bracket delimiters from retrieved snippets", () => {
+    const { container } = render(<MarkdownRenderer content={"Inline \\(a^2+b^2=c^2\\).\n\n\\[\\sum_{i=1}^n i\\]"} />);
+
+    expect(container.querySelectorAll(".katex").length).toBeGreaterThanOrEqual(2);
+    expect(container.querySelector(".katex-display")).not.toBeNull();
+  });
 });

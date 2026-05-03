@@ -82,10 +82,31 @@ class SearchResult(BaseModel):
     source_type: str | None = None
 
 
+class ModelAudit(BaseModel):
+    embedding_provider: str = "none"
+    embedding_model: str | None = None
+    embedding_external_called: bool = False
+    embedding_fallback_reason: str | None = None
+    reranker_enabled: bool = False
+    reranker_called: bool = False
+    fallback_enabled: bool = False
+    degraded_mode: bool = False
+    vector_index_warning: str | None = None
+
+
+class AnswerModelAudit(BaseModel):
+    provider: str = "none"
+    model: str | None = None
+    external_called: bool = False
+    fallback_reason: str | None = None
+    skipped_reason: str | None = None
+
+
 class SearchResponse(BaseModel):
     query: str
     results: list[SearchResult]
     degraded_mode: bool = False
+    model_audit: ModelAudit = Field(default_factory=ModelAudit)
 
 
 class ChatMessage(BaseModel):
@@ -111,6 +132,7 @@ class QAResponse(BaseModel):
     route: AgentRoute | None = None
     trace: list["AgentTraceEventPayload"] = Field(default_factory=list)
     degraded_mode: bool = False
+    answer_model_audit: AnswerModelAudit = Field(default_factory=AnswerModelAudit)
 
 
 class AgentRequest(BaseModel):
@@ -146,6 +168,7 @@ class AgentResponse(BaseModel):
     route: AgentRoute
     trace: list[AgentTraceEventPayload]
     degraded_mode: bool = False
+    answer_model_audit: AnswerModelAudit = Field(default_factory=AnswerModelAudit)
 
 
 class TaskStatusResponse(BaseModel):
@@ -281,6 +304,7 @@ class InfrastructureStatus(BaseModel):
     postgres: bool
     qdrant: bool
     redis: bool
+    model_bridge: bool | None = None
 
 
 class RuntimeCheckResponse(BaseModel):

@@ -48,6 +48,38 @@ const fallbackSuggestions = [
   "基于课程引用给我一份复习路线",
 ];
 
+const traceNodeLabels: Record<string, string> = {
+  query_analyzer: "问题分析",
+  router: "路由判断",
+  query_rewriter: "查询改写",
+  retrievers: "检索召回",
+  document_grader: "证据筛选",
+  answer_generator: "答案生成",
+  citation_checker: "引用校验",
+  error: "错误",
+};
+
+function traceNodeLabel(node: string): string {
+  return traceNodeLabels[node] ?? node;
+}
+
+function answerModelLabel(latestRun: AgentResponse | null): string {
+  const audit = latestRun?.answer_model_audit;
+  if (!audit) {
+    return "模型：等待回答";
+  }
+  if (audit.external_called) {
+    return `模型：${audit.model ?? audit.provider}`;
+  }
+  if (audit.skipped_reason === "clarify_route") {
+    return "模型：澄清分支未调用";
+  }
+  if (audit.skipped_reason === "direct_answer_route") {
+    return "模型：直接回答分支未调用";
+  }
+  return "模型：未调用";
+}
+
 function buildCourseSuggestions(tree: Array<{ title: string; children?: Array<{ title: string }> }> | undefined): string[] {
   const chapters = tree?.map((node) => node.title).filter(Boolean) ?? [];
   const documents = tree?.flatMap((node) => node.children?.map((child) => child.title) ?? []).filter(Boolean) ?? [];
@@ -83,8 +115,8 @@ function ChatHeader({
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-3 px-1">
       <div className="min-w-0">
-        <p className="section-kicker">Agentic Course Chat</p>
-        <h2 className="mt-1 text-2xl font-semibold text-white lg:text-3xl">Ask the reasoning graph</h2>
+        <p className="section-kicker">课程智能问答</p>
+        <h2 className="mt-1 text-2xl font-semibold text-white lg:text-3xl">向推理链路提问</h2>
       </div>
       <div className="flex w-full flex-wrap gap-2">
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
@@ -98,6 +130,10 @@ function ChatHeader({
             {latestRun.route}
           </span>
         ) : null}
+        <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
+          <BrainCircuit data-icon="inline-start" />
+          {answerModelLabel(latestRun)}
+        </span>
       </div>
     </div>
   );
@@ -163,9 +199,9 @@ function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick
         <div className="mx-auto grid size-16 place-items-center rounded-3xl border border-cyan-200/14 bg-cyan-300/[0.045] text-cyan-100 shadow-[0_0_42px_rgba(86,217,255,0.08)]">
           <Sparkles />
         </div>
-        <h3 className="glow-text mt-6 text-3xl font-semibold text-white">Start a grounded course conversation</h3>
+        <h3 className="glow-text mt-6 text-3xl font-semibold text-white">开始一轮有证据支撑的课程问答</h3>
         <p className="mx-auto mt-3 max-w-2xl text-sm leading-7 text-white/56">
-          The agent will route your question, retrieve course fragments, grade evidence, generate an answer, and verify citations.
+          系统会路由问题、检索课程片段、评估证据、生成回答，并校验引用来源。
         </p>
         <div className="mt-7">
           <SuggestionChips suggestions={suggestions} onPick={onPick} />
@@ -194,7 +230,7 @@ function MessageBubble({ turn, index, onOpenCitations }: { turn: ChatTurn; index
       >
         <div className="mb-3 flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-white/38">
           {isUser ? <CircleDot /> : <BrainCircuit />}
-          {isUser ? "You" : turn.route ? `Agent / ${turn.route}` : "Agent"}
+          {isUser ? "你" : turn.route ? `智能体 / ${turn.route}` : "智能体"}
         </div>
         <MarkdownRenderer content={turn.content} className={cn(isUser ? "text-white/78" : "text-white/74")} />
         {!isUser && turn.citations?.length ? (
@@ -322,7 +358,7 @@ function ChatComposer({
                   }
                 }}
                 className="max-h-44 min-h-[72px] resize-none border-0 bg-transparent px-2 text-base text-white shadow-none placeholder:text-white/30 focus-visible:ring-0"
-                placeholder="Ask a question. The agent will retrieve, grade, answer, and cite..."
+                placeholder="输入问题，系统会检索、评估、回答并给出引用..."
               />
               <Button type="button" size="icon-lg" className="rounded-full" onClick={onSubmit} disabled={isPending || !value.trim()}>
                 {isPending ? <Loader2 className="animate-spin" /> : <Send />}
@@ -431,11 +467,11 @@ function TraceTimeline({ trace, isRunning }: { trace: AgentTraceEventPayload[]; 
             </div>
             <div className={cn("flex-1 rounded-2xl border p-4", active ? "kg-shimmer border-cyan-200/18 bg-cyan-300/[0.045]" : "border-white/8 bg-white/[0.025]")}>
               <div className="flex items-center justify-between gap-3">
-                <p className="text-sm font-medium text-white">{event.node}</p>
+                <p className="text-sm font-medium text-white">{traceNodeLabel(event.node)}</p>
                 <span className="font-mono text-xs text-white/38">{event.duration_ms}ms</span>
               </div>
               {event.output_summary ? <MarkdownRenderer content={event.output_summary} compact className="mt-2 line-clamp-3 text-white/55" /> : null}
-              {event.document_ids.length ? <p className="mt-2 text-xs text-cyan-100/48">{event.document_ids.length} chunks touched</p> : null}
+              {event.document_ids.length ? <p className="mt-2 text-xs text-cyan-100/48">触达 {event.document_ids.length} 个片段</p> : null}
             </div>
           </motion.div>
         );

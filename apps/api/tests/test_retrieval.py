@@ -102,7 +102,9 @@ async def test_hybrid_search_uses_weighted_fusion_and_rerank(db_session, sample_
         "source_type": "markdown",
     }
 
-    async def fake_dense_search(db, course_id, query, filters, top_k):
+    async def fake_dense_search(db, course_id, query, filters, top_k, model_audit=None):
+        if model_audit is not None:
+            model_audit.update({"embedding_provider": "openai_compatible", "embedding_external_called": True})
         return [dense_payload]
 
     class FakeReranker:
@@ -142,10 +144,13 @@ async def test_hybrid_search_can_skip_reranker(db_session, sample_course, indexe
         "source_type": "markdown",
     }
 
-    async def fake_dense_search(db, course_id, query, filters, top_k):
+    async def fake_dense_search(db, course_id, query, filters, top_k, model_audit=None):
+        if model_audit is not None:
+            model_audit.update({"embedding_provider": "openai_compatible", "embedding_external_called": True})
         return [dense_payload]
 
     class FakeSettings:
+        embedding_model = "unit-test-embedding"
         enable_model_fallback = False
         retrieval_recall_k_default = 64
         retrieval_recall_k_formula = 80
@@ -161,4 +166,112 @@ async def test_hybrid_search_can_skip_reranker(db_session, sample_course, indexe
     results = await hybrid_search_chunks(db_session, sample_course.id, "degree centrality", SearchFilters(), 2)
     assert results
     assert all(item["metadata"]["scores"]["rerank_enabled"] is False for item in results)
-    assert all("rerank" not in item["metadata"]["scores"] for item in results)
+    assert all(item["metadata"]["scores"]["rerank"] is None for item in results)
+
+
+@pytest.mark.asyncio
+async def test_search_chunks_with_audit_reports_real_query_embedding(db_session, sample_course, indexed_chunks, monkeypatch):
+    from app.services import retrieval
+    from app.services.embeddings import EmbeddingCallResult
+
+    _, chunks = indexed_chunks
+
+    async def fake_embed(self, texts, text_type="document"):
+        assert texts == ["degree centrality"]
+        assert text_type == "query"
+        return EmbeddingCallResult(vectors=[[0.1, 0.2, 0.3]], provider="openai_compatible", external_called=True)
+
+    class FakeVectorStore:
+        def __init__(self, course_name):
+            self.course_name = course_name
+
+        def search(self, *, vector, limit, filters):
+            assert vector == [0.1, 0.2, 0.3]
+            return [{"id": chunks[0].id, "score": 0.9}]
+
+    class FakeReranker:
+        def rerank(self, query, candidates, top_k):
+            return candidates[:top_k]
+
+    monkeypatch.setattr(retrieval.EmbeddingProvider, "embed_texts_with_meta", fake_embed)
+    monkeypatch.setattr(retrieval, "VectorStore", FakeVectorStore)
+    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: FakeReranker()))
+
+    results, audit = await retrieval.search_chunks_with_audit(db_session, sample_course.id, "degree centrality", SearchFilters(), 1)
+
+    assert results
+    assert audit["embedding_provider"] == "openai_compatible"
+    assert audit["embedding_external_called"] is True
+    assert audit["embedding_fallback_reason"] is None
+    assert results[0]["metadata"]["model_audit"]["embedding_external_called"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_ignores_zero_score_dense_index_and_uses_lexical(db_session, sample_course, indexed_chunks, monkeypatch):
+    from app.services import retrieval
+    from app.services.embeddings import EmbeddingCallResult
+
+    _, chunks = indexed_chunks
+
+    async def fake_embed(self, texts, text_type="document"):
+        return EmbeddingCallResult(vectors=[[0.1, 0.2, 0.3]], provider="openai_compatible", external_called=True)
+
+    class ZeroVectorStore:
+        def __init__(self, course_name):
+            self.course_name = course_name
+
+        def search(self, *, vector, limit, filters):
+            return [{"id": chunk.id, "score": 0.0} for chunk in chunks]
+
+    class PassThroughReranker:
+        def rerank(self, query, candidates, top_k):
+            return candidates[:top_k]
+
+    monkeypatch.setattr(retrieval.EmbeddingProvider, "embed_texts_with_meta", fake_embed)
+    monkeypatch.setattr(retrieval, "VectorStore", ZeroVectorStore)
+    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: PassThroughReranker()))
+
+    results, audit = await retrieval.search_chunks_with_audit(db_session, sample_course.id, "degree centrality", SearchFilters(), 2)
+
+    assert results
+    assert audit["vector_index_warning"] == "qdrant_returned_only_zero_scores"
+    assert all(item["metadata"]["scores"]["dense"] is None for item in results)
+    assert any("bm25" in item["metadata"]["scores"] for item in results)
+
+
+@pytest.mark.asyncio
+async def test_search_scores_include_primary_channels_for_dense_only_results(db_session, sample_course, indexed_chunks, monkeypatch):
+    from app.services import retrieval
+    from app.services.embeddings import EmbeddingCallResult
+
+    _, chunks = indexed_chunks
+
+    async def fake_embed(self, texts, text_type="document"):
+        return EmbeddingCallResult(vectors=[[0.1, 0.2, 0.3]], provider="openai_compatible", external_called=True)
+
+    class DenseOnlyStore:
+        def __init__(self, course_name):
+            self.course_name = course_name
+
+        def search(self, *, vector, limit, filters):
+            return [{"id": chunks[0].id, "score": 0.8}]
+
+    class FakeReranker:
+        def rerank(self, query, candidates, top_k):
+            for item in candidates:
+                item.setdefault("metadata", {}).setdefault("scores", {})["rerank"] = 0.5
+            return candidates[:top_k]
+
+    monkeypatch.setattr(retrieval.EmbeddingProvider, "embed_texts_with_meta", fake_embed)
+    monkeypatch.setattr(retrieval, "VectorStore", DenseOnlyStore)
+    monkeypatch.setattr(retrieval, "lexical_search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: FakeReranker()))
+
+    results, audit = await retrieval.search_chunks_with_audit(db_session, sample_course.id, "no lexical match", SearchFilters(), 1)
+
+    scores = results[0]["metadata"]["scores"]
+    assert audit["reranker_called"] is True
+    assert scores["dense"] == 0.8
+    assert scores["lexical"] is None
+    assert scores["fused"] is None
+    assert scores["rerank"] == 0.5

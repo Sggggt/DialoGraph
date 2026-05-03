@@ -207,9 +207,9 @@ export function SettingsWorkspace() {
       return [];
     }
     return [
-      { label: "Embedding", value: settings.embedding_model },
-      { label: "Chat / Graph", value: settings.chat_model },
-      { label: "Reranker", value: settings.reranker_enabled ? `${settings.reranker_model} (${settings.reranker_device})` : "Disabled" },
+      { label: "向量模型", value: settings.embedding_model },
+      { label: "对话 / 图谱模型", value: settings.chat_model },
+      { label: "重排序模型", value: settings.reranker_enabled ? `${settings.reranker_model} (${settings.reranker_device})` : "未启用" },
     ];
   }, [settings]);
 
@@ -326,7 +326,7 @@ export function SettingsWorkspace() {
                 </p>
               </div>
               <div className="border-l border-white/10 px-4 py-3">
-                <p className="text-xs uppercase tracking-[0.26em] text-white/42">Reranker Runtime</p>
+                <p className="text-xs uppercase tracking-[0.26em] text-white/42">重排序运行时</p>
                 <p className="mt-2 text-sm text-white/68">
                   <RuntimeStatusBadge check={runtimeQuery.data} />
                 </p>
@@ -355,7 +355,7 @@ export function SettingsWorkspace() {
                     Reranker
                   </p>
                   <p className="mt-2 text-sm leading-6 text-white/58">
-                    关闭后检索直接使用 Dense + BM25 + WSF 排序，不启动 reranker runtime；这不是 fallback。
+                    关闭后检索直接使用 Dense + BM25 + WSF 排序，不启动重排序运行时；这不是降级链路。
                   </p>
                 </div>
                 <button
@@ -378,7 +378,7 @@ export function SettingsWorkspace() {
 
               <div className="mt-5 grid gap-4 md:grid-cols-2">
                 <label className="flex flex-col gap-2">
-                  <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Reranker 模型</span>
+                  <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">重排序模型</span>
                   <Input
                     value={form.reranker_model}
                     disabled={!form.reranker_enabled}

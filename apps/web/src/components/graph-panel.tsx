@@ -11,18 +11,20 @@ import { fetchChapterGraph, fetchDashboard, fetchGraph, fetchGraphNode } from "@
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { NetworkCanvas, type NetworkCanvasHandle } from "@/components/network-canvas";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
+import { useLocalStorage } from "@/hooks/use-local-storage";
 
 type SelectedNode = { id: string; category: string } | null;
 
 function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | null }) {
+  const storageScope = selectedCourseId ?? "unassigned";
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedCourseId],
     queryFn: () => fetchDashboard(selectedCourseId),
     enabled: Boolean(selectedCourseId),
   });
-  const [selectedChapter, setSelectedChapter] = useState("");
-  const [selectedNode, setSelectedNode] = useState<SelectedNode>(null);
-  const [detailNodeId, setDetailNodeId] = useState<string | null>(null);
+  const [selectedChapter, setSelectedChapter] = useLocalStorage(`graph.selectedChapter.${storageScope}`, "");
+  const [selectedNode, setSelectedNode] = useLocalStorage<SelectedNode>(`graph.selectedNode.${storageScope}`, null);
+  const [detailNodeId, setDetailNodeId] = useLocalStorage<string | null>(`graph.detailNodeId.${storageScope}`, null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isLocked, setIsLocked] = useState(false);
   const [chapterMenuOpen, setChapterMenuOpen] = useState(false);
@@ -95,7 +97,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
         <motion.section initial={{ opacity: 0, x: -12 }} animate={{ opacity: 1, x: 0 }} className="glass-panel kg-scroll-panel rounded-[28px] p-5">
           <div className="flex items-center justify-between gap-4">
             <div className="min-w-0">
-              <p className="section-kicker">Chapter Tree</p>
+              <p className="section-kicker">章节树</p>
               <h2 className="mt-2 break-words text-2xl font-semibold text-white">章节与文档</h2>
             </div>
             <Boxes className="size-5 shrink-0 text-cyan-200" />
@@ -159,7 +161,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
       >
         <div className="mb-4 flex flex-wrap items-center justify-between gap-4 px-2">
           <div className="min-w-0">
-            <p className="section-kicker">Graph Stage</p>
+            <p className="section-kicker">图谱画布</p>
             <h2 className="mt-2 break-words text-3xl font-semibold text-white">{selectedChapter || "全课程图谱"}</h2>
             <p className="mt-2 max-w-3xl break-words text-sm leading-7 text-white/50">
               单击节点只做高亮，双击概念节点打开知识详解。支持拖拽平移与滚轮缩放。
@@ -265,7 +267,7 @@ function NodeDetail({
     <>
       <div className="flex items-center justify-between gap-4">
         <div className="min-w-0">
-          <p className="section-kicker">Node Detail</p>
+          <p className="section-kicker">节点详情</p>
           <h2 className="mt-2 break-words text-2xl font-semibold text-white">知识详解</h2>
         </div>
         <div className="flex shrink-0 items-center gap-2">

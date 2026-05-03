@@ -39,6 +39,7 @@ class RerankerProvider:
         if not candidates:
             return []
         settings = get_settings()
+        rerank_candidates = candidates[: max(top_k, settings.reranker_candidate_limit)]
         payload = {
             "model": self.model,
             "query": query,
@@ -48,7 +49,7 @@ class RerankerProvider:
                     "id": item["chunk_id"],
                     "text": (item.get("content") or item.get("snippet") or "")[: settings.reranker_text_chars],
                 }
-                for item in candidates
+                for item in rerank_candidates
             ],
         }
         try:
@@ -60,12 +61,12 @@ class RerankerProvider:
             raise RerankerUnavailableError(f"Reranker service unavailable at {self.url}: {exc}") from exc
 
         scores_by_id = {str(item["id"]): float(item["score"]) for item in data.get("results", [])}
-        if len(scores_by_id) != len(candidates):
+        if len(scores_by_id) != len(rerank_candidates):
             raise RerankerUnavailableError(
-                f"Reranker service returned {len(scores_by_id)} scores for {len(candidates)} candidates"
+                f"Reranker service returned {len(scores_by_id)} scores for {len(rerank_candidates)} candidates"
             )
-        for item in candidates:
+        for item in rerank_candidates:
             score_value = scores_by_id[str(item["chunk_id"])]
             item.setdefault("metadata", {}).setdefault("scores", {})["rerank"] = score_value
             item["score"] = score_value
-        return sorted(candidates, key=lambda item: item["score"], reverse=True)[:top_k]
+        return sorted(rerank_candidates, key=lambda item: item["score"], reverse=True)[:top_k]

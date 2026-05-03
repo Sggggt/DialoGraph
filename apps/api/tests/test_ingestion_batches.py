@@ -73,4 +73,4 @@ async def test_uploaded_parse_marks_graph_failure_terminal(db_session, sample_co
     assert result["state"] == "partial_failed"
     assert refreshed.status == "partial_failed"
     assert refreshed.completed_at is not None
-    assert "Graph generation failed" in refreshed.last_error
+    assert "图谱生成失败" in refreshed.last_error

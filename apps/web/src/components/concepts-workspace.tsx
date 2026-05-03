@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import { BookMarked, Radar } from "lucide-react";
@@ -8,20 +8,22 @@ import { BookMarked, Radar } from "lucide-react";
 import { useCourseContext } from "@/components/course-context";
 import { fetchConcepts } from "@/lib/api";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
+import { useLocalStorage } from "@/hooks/use-local-storage";
 
 export function ConceptsWorkspace() {
   const { selectedCourseId } = useCourseContext();
+  const storageScope = selectedCourseId ?? "unassigned";
   const { data, isLoading, error } = useQuery({
     queryKey: ["concepts", selectedCourseId],
     queryFn: () => fetchConcepts(selectedCourseId),
     enabled: Boolean(selectedCourseId),
   });
-  const [keyword, setKeyword] = useState("");
+  const [keyword, setKeyword] = useLocalStorage(`concepts.keyword.${storageScope}`, "");
   const filtered = useMemo(
     () => (data ?? []).filter((item) => item.name.toLowerCase().includes(keyword.toLowerCase())),
     [data, keyword],
   );
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useLocalStorage<string | null>(`concepts.selectedId.${storageScope}`, null);
   const selected = filtered.find((item) => item.concept_id === selectedId) ?? filtered[0] ?? null;
 
   if (isLoading) {
@@ -36,7 +38,7 @@ export function ConceptsWorkspace() {
       <section className="glass-panel kg-scroll-panel rounded-[30px] p-6">
         <div className="flex items-center justify-between">
           <div>
-            <p className="section-kicker">Concept Browser</p>
+            <p className="section-kicker">概念浏览</p>
             <h2 className="mt-2 text-3xl font-semibold text-white">知识点目录</h2>
           </div>
           <BookMarked className="size-5 text-cyan-200" />
@@ -46,7 +48,7 @@ export function ConceptsWorkspace() {
             value={keyword}
             onChange={(event) => setKeyword(event.target.value)}
             className="h-12 w-full rounded-full border border-white/10 bg-white/[0.05] px-5 text-white outline-none placeholder:text-white/28"
-            placeholder="Filter concepts..."
+            placeholder="筛选概念..."
           />
         </div>
         <div className="mt-6 space-y-3">
@@ -85,7 +87,7 @@ export function ConceptsWorkspace() {
           <>
             <div className="flex items-center justify-between">
               <div>
-                <p className="section-kicker">Concept Detail</p>
+                <p className="section-kicker">概念详情</p>
                 <h2 className="mt-2 text-4xl font-semibold text-white">{selected.name}</h2>
               </div>
               <Radar className="size-5 text-cyan-200" />
@@ -94,11 +96,11 @@ export function ConceptsWorkspace() {
             <div className="mt-6 grid gap-5 lg:grid-cols-[1.1fr_0.9fr]">
               <div className="space-y-5">
                 <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">Summary</p>
+                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">摘要</p>
                   <p className="mt-4 text-sm leading-8 text-white/72">{selected.summary || "当前概念还没有足够长的摘要，建议补充更多教学原件后重新抽取。"}</p>
                 </div>
                 <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">Aliases</p>
+                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">别名</p>
                   <div className="mt-4 flex flex-wrap gap-2">
                     {(selected.aliases.length > 0 ? selected.aliases : [selected.name]).map((alias) => (
                       <span key={alias} className="rounded-full border border-white/10 px-3 py-1 text-sm text-cyan-50/74">
@@ -111,7 +113,7 @@ export function ConceptsWorkspace() {
 
               <div className="space-y-5">
                 <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">Chapter Refs</p>
+                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">章节引用</p>
                   <div className="mt-4 flex flex-wrap gap-2">
                     {selected.chapter_refs.map((chapter) => (
                       <span key={chapter} className="rounded-full border border-white/10 px-3 py-1 text-sm text-cyan-50/74">
@@ -121,7 +123,7 @@ export function ConceptsWorkspace() {
                   </div>
                 </div>
                 <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">Relations</p>
+                  <p className="text-xs uppercase tracking-[0.28em] text-white/45">相关关系</p>
                   <div className="mt-4 space-y-3">
                     {selected.related_concepts.slice(0, 10).map((relation, index) => (
                       <div key={`${relation.concept_id}-${relation.target_name}-${relation.relation_type}-${index}`} className="rounded-[18px] border border-white/8 px-4 py-3">

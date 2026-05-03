@@ -46,6 +46,7 @@ QUERY_TYPE_CONFIG = {
     "procedure": {"alpha": 0.75, "recall_k": 60},
     "default": {"alpha": 0.72, "recall_k": 64},
 }
+PRIMARY_SCORE_KEYS = ("dense", "lexical", "fused", "rerank")
 
 
 def should_include_storage_file(path: Path) -> bool:
@@ -138,6 +139,31 @@ def clone_for_fusion(item: dict) -> dict:
     return clone
 
 
+def default_model_audit() -> dict:
+    settings = get_settings()
+    return {
+        "embedding_provider": "none",
+        "embedding_model": settings.embedding_model,
+        "embedding_external_called": False,
+        "embedding_fallback_reason": None,
+        "reranker_enabled": settings.reranker_enabled,
+        "reranker_called": False,
+        "fallback_enabled": settings.enable_model_fallback,
+        "degraded_mode": is_degraded_mode(),
+        "vector_index_warning": None,
+    }
+
+
+def attach_model_audit(results: list[dict], audit: dict) -> list[dict]:
+    for item in results:
+        metadata = item.setdefault("metadata", {})
+        scores = metadata.setdefault("scores", {})
+        for key in PRIMARY_SCORE_KEYS:
+            scores.setdefault(key, None)
+        metadata["model_audit"] = dict(audit)
+    return results
+
+
 def build_search_payload(chunk: Chunk, document: Document, query: str, score: float, scores: dict | None = None) -> dict:
     citation = Citation(
         chunk_id=chunk.id,
@@ -166,15 +192,23 @@ def build_search_payload(chunk: Chunk, document: Document, query: str, score: fl
     }
 
 
-async def dense_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
+async def dense_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int, model_audit: dict | None = None) -> list[dict]:
     course = db.get(Course, course_id)
     if course is None:
         return []
     embedder = EmbeddingProvider()
-    vectors = await embedder.embed_texts([query], text_type="query")
+    embedding_result = await embedder.embed_texts_with_meta([query], text_type="query")
+    if model_audit is not None:
+        model_audit.update(
+            {
+                "embedding_provider": embedding_result.provider,
+                "embedding_external_called": embedding_result.external_called,
+                "embedding_fallback_reason": embedding_result.fallback_reason,
+            }
+        )
     vector_store = VectorStore(course_name=course.name)
     results = vector_store.search(
-        vector=vectors[0],
+        vector=embedding_result.vectors[0],
         limit=max(top_k * 3, top_k),
         filters={
             "course_id": course_id,
@@ -184,6 +218,7 @@ async def dense_search_chunks(db: Session, course_id: str, query: str, filters: 
         },
     )
     payloads = []
+    dense_scores: list[float] = []
     for result in results:
         chunk = db.get(Chunk, result["id"])
         if chunk is None or chunk.course_id != course_id or not chunk.is_active:
@@ -194,35 +229,54 @@ async def dense_search_chunks(db: Session, course_id: str, query: str, filters: 
         if filters.tags and not set(filters.tags).intersection(set(document.tags or [])):
             continue
         dense_score = float(result["score"])
+        dense_scores.append(dense_score)
         score = dense_score + score_chunk_bonus(chunk, document, query)
         payloads.append(build_search_payload(chunk, document, query, score, {"dense": dense_score}))
+    if payloads and dense_scores and max(abs(score) for score in dense_scores) <= 1e-12:
+        if model_audit is not None:
+            model_audit["vector_index_warning"] = "qdrant_returned_only_zero_scores"
+        return []
     payloads.sort(key=lambda item: item["score"], reverse=True)
-    return payloads[:top_k]
+    return attach_model_audit(payloads[:top_k], model_audit) if model_audit is not None else payloads[:top_k]
 
 
 async def search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
-    return await hybrid_search_chunks(db, course_id, query, filters, top_k)
+    results, _audit = await hybrid_search_chunks_with_audit(db, course_id, query, filters, top_k)
+    return results
+
+
+async def search_chunks_with_audit(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> tuple[list[dict], dict]:
+    return await hybrid_search_chunks_with_audit(db, course_id, query, filters, top_k)
 
 
 async def hybrid_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
+    results, _audit = await hybrid_search_chunks_with_audit(db, course_id, query, filters, top_k)
+    return results
+
+
+async def hybrid_search_chunks_with_audit(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> tuple[list[dict], dict]:
     settings = get_settings()
     config = query_type_config(query)
     recall_k = max(int(config["recall_k"]), top_k)
     dense_results: list[dict] = []
+    model_audit = default_model_audit()
     if is_degraded_mode() and not settings.enable_model_fallback:
         raise RuntimeError("OPENAI_API_KEY is required for search because ENABLE_MODEL_FALLBACK is false")
     if not is_degraded_mode():
         try:
-            dense_results = await dense_search_chunks(db, course_id, query, filters, recall_k)
+            dense_results = await dense_search_chunks(db, course_id, query, filters, recall_k, model_audit)
         except Exception:
             if not settings.enable_model_fallback:
                 raise
+            model_audit["embedding_fallback_reason"] = "dense_embedding_failed"
             dense_results = []
     lexical_results = lexical_search_chunks(db, course_id, query, filters, recall_k)
     if not dense_results:
-        return lexical_results[:top_k]
+        return attach_model_audit(lexical_results[:top_k], model_audit), model_audit
     if not lexical_results:
-        return rerank_or_return(query, dense_results, top_k)
+        results = rerank_or_return(query, dense_results, top_k)
+        model_audit["reranker_called"] = any("rerank" in item.get("metadata", {}).get("scores", {}) for item in results)
+        return attach_model_audit(results, model_audit), model_audit
 
     candidates = weighted_score_fusion(
         dense_results,
@@ -232,7 +286,9 @@ async def hybrid_search_chunks(db: Session, course_id: str, query: str, filters:
     )
     for item in candidates:
         item.setdefault("metadata", {}).setdefault("scores", {})["query_type"] = config["query_type"]
-    return rerank_or_return(query, candidates, top_k)
+    results = rerank_or_return(query, candidates, top_k)
+    model_audit["reranker_called"] = any("rerank" in item.get("metadata", {}).get("scores", {}) for item in results)
+    return attach_model_audit(results, model_audit), model_audit
 
 
 def rerank_or_return(query: str, candidates: list[dict], top_k: int) -> list[dict]:

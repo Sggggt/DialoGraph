@@ -32,7 +32,7 @@ async def test_parse_search_and_qa_without_fallback(tmp_path, monkeypatch):
     from app.schemas import AgentRequest, SearchFilters
     from app.services.agent_graph import run_agent
     from app.services.ingestion import create_course_space, ingest_file
-    from app.services.retrieval import search_chunks
+    from app.services.retrieval import search_chunks_with_audit
     from app.services.vector_store import VectorStore
 
     Base.metadata.create_all(bind=engine)
@@ -68,9 +68,12 @@ async def test_parse_search_and_qa_without_fallback(tmp_path, monkeypatch):
         chunk_ids = [chunk.id for chunk in chunks]
         assert chunk_ids
 
-        search_results = await search_chunks(db, course.id, "degree centrality", SearchFilters(), 3)
+        search_results, search_audit = await search_chunks_with_audit(db, course.id, "degree centrality", SearchFilters(), 3)
         assert search_results
         assert search_results[0]["citations"]
+        assert search_audit["embedding_provider"] == "openai_compatible"
+        assert search_audit["embedding_external_called"] is True
+        assert search_audit["embedding_fallback_reason"] is None
 
         response = await run_agent(
             db,

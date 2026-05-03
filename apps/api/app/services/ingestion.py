@@ -27,6 +27,17 @@ ALLOWED_SUFFIXES = {".pdf", ".ipynb", ".md", ".markdown", ".txt", ".docx", ".ppt
 EXCLUDED_PARTS = {"output", "tmp", "scripts", ".ipynb_checkpoints", "__pycache__"}
 IGNORED_NAMES = {".ds_store"}
 TERMINAL_STATES = {"completed", "failed", "partial_failed", "skipped"}
+STATE_LABELS = {
+    "queued": "排队中",
+    "parsing": "解析中",
+    "chunking": "切块中",
+    "embedding": "向量化中",
+    "extracting_graph": "生成图谱中",
+    "completed": "已完成",
+    "failed": "失败",
+    "partial_failed": "部分失败",
+    "skipped": "已跳过",
+}
 _SOURCE_PATH_LOCKS: OrderedDict[str, asyncio.Lock] = OrderedDict()
 _SOURCE_PATH_LOCKS_GUARD = Lock()
 _MAX_SOURCE_PATH_LOCKS = 256
@@ -34,6 +45,10 @@ _MAX_SOURCE_PATH_LOCKS = 256
 
 def normalized_source_path(path: Path) -> str:
     return str(path.resolve()).lower()
+
+
+def state_label(state: str) -> str:
+    return STATE_LABELS.get(state, state)
 
 
 def source_path_lock(path: Path) -> asyncio.Lock:
@@ -146,14 +161,14 @@ def finalize_graph_generation_failure(session: Session, batch_id: str, exc: Exce
     }
     batch.stats = {**stats, **graph_stats}
     batch.status = "partial_failed" if batch.success_count > 0 else "failed"
-    batch.last_error = f"Graph generation failed: {exc}"
+    batch.last_error = f"图谱生成失败：{exc}"
     batch.completed_at = datetime.utcnow()
     session.commit()
     emit_ingestion_log(batch_id, "graph_failed", batch.last_error, **graph_stats)
     emit_ingestion_log(
         batch_id,
         "batch_partial_failed" if batch.status == "partial_failed" else "batch_failed",
-        f"Batch {batch.status}: graph generation failed after {batch.success_count} file(s) succeeded",
+        f"批次{batch.status}：已有 {batch.success_count} 个文件成功，但图谱生成失败",
         state=batch.status,
         processed_files=batch.processed_files,
         total_files=batch.total_files,
@@ -345,7 +360,7 @@ def set_job_state(db: Session, job: IngestionJob, state: str, *, error: str | No
         batch.started_at = batch.started_at or datetime.utcnow()
     db.commit()
     if batch_id:
-        emit_ingestion_log(batch_id, "job_state", f"{Path(job.source_path or '').name or job.id}: {state}", job_id=job.id, source_path=job.source_path, state=state)
+        emit_ingestion_log(batch_id, "job_state", f"{Path(job.source_path or '').name or job.id}：{state_label(state)}", job_id=job.id, source_path=job.source_path, state=state)
 
 
 def create_sync_batch(db: Session, course_id: str, root: Path, trigger_source: str = "sync") -> IngestionBatch:
@@ -496,7 +511,7 @@ def finalize_interrupted_batches() -> int:
         batches = session.scalars(select(IngestionBatch).where(IngestionBatch.status.notin_(TERMINAL_STATES))).all()
         for batch in batches:
             batch.status = "failed"
-            batch.last_error = "Interrupted because the API process restarted before this batch reached a terminal state"
+            batch.last_error = "API 进程重启，批次尚未到达终态，已中断"
             batch.completed_at = now
             jobs = session.scalars(
                 select(IngestionJob).where(
@@ -514,7 +529,7 @@ def finalize_interrupted_batches() -> int:
         emit_ingestion_log(
             batch_id,
             "batch_failed",
-            "Batch failed because the API process restarted before it reached a terminal state",
+            "API 进程重启，批次尚未到达终态，已标记失败",
             state="failed",
         )
     return len(finalized)
@@ -535,7 +550,7 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
     for job in jobs:
         if job.status not in TERMINAL_STATES:
             job.status = "skipped"
-            job.error_message = "Removed by user before parsing completed"
+            job.error_message = "用户在解析完成前移除了该文件"
         job.stats = {**(job.stats or {}), "removed": True}
         removed = True
 
@@ -546,7 +561,7 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
             source_path=source_path,
             trigger_source="remove",
             status="skipped",
-            error_message="Removed by user",
+            error_message="用户移除了该文件",
             stats={"removed": True},
         )
         db.add(tombstone)
@@ -634,6 +649,42 @@ def find_duplicate_document(db: Session, course_id: str, title: str, checksum: s
     return sorted(matches, key=lambda document: (len(document.source_path), document.source_path))[0] if matches else None
 
 
+def deactivate_duplicate_documents(
+    db: Session,
+    course_id: str,
+    canonical_document_id: str,
+    title: str,
+    checksum: str,
+    source_path: Path,
+) -> list[str]:
+    normalized_title, checksum_value = document_dedup_key(title, checksum)
+    source_path_string = str(source_path)
+    candidates = db.scalars(
+        select(Document).where(
+            Document.course_id == course_id,
+            Document.id != canonical_document_id,
+            Document.is_active.is_(True),
+        )
+    ).all()
+    stale_chunk_ids: list[str] = []
+    for document in candidates:
+        same_file = document.source_path == source_path_string
+        same_content = document.checksum == checksum_value and normalize_for_dedup(document.title) == normalized_title
+        if not same_file and not same_content:
+            continue
+        stale_chunk_ids.extend(
+            chunk_id
+            for (chunk_id,) in db.query(Chunk.id)
+            .filter(Chunk.document_id == document.id, Chunk.is_active.is_(True))
+            .all()
+        )
+        document.is_active = False
+        db.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).update({"is_active": False}, synchronize_session=False)
+        db.query(Chunk).filter(Chunk.document_id == document.id).update({"is_active": False}, synchronize_session=False)
+    db.flush()
+    return stale_chunk_ids
+
+
 def chunk_content_hash(content: str) -> str:
     return hashlib.sha256(normalize_for_dedup(content).encode("utf-8", errors="ignore")).hexdigest()
 
@@ -684,8 +735,13 @@ async def _ingest_file_locked(
     checksum = compute_checksum(source_path)
     source_title = source_path.stem
     duplicate_document = find_duplicate_document(db, course.id, source_title, checksum, source_path)
-
     existing_document = db.scalar(select(Document).where(Document.course_id == course.id, Document.source_path == str(source_path)))
+    if duplicate_document is not None and force and existing_document is None:
+        duplicate_document.source_path = str(source_path)
+        duplicate_document.title = source_title
+        db.flush()
+        duplicate_document = None
+
     active_version = None
     if existing_document is not None:
         active_version = db.scalar(
@@ -763,6 +819,16 @@ async def _ingest_file_locked(
         source_type=source_type,
         checksum=checksum,
         tags=[chapter],
+    )
+    stale_chunk_ids.extend(
+        deactivate_duplicate_documents(
+            db=db,
+            course_id=course.id,
+            canonical_document_id=document.id,
+            title=source_title,
+            checksum=checksum,
+            source_path=source_path,
+        )
     )
     job.document_id = document.id
     vector_store = VectorStore(course_name=course.name)
@@ -873,6 +939,7 @@ async def _ingest_file_locked(
                 "id": chunk.id,
                 "vector": vector,
                 "payload": {
+                    "chunk_id": chunk.id,
                     "course_id": course.id,
                     "document_id": document.id,
                     "document_title": document.title,
@@ -1010,7 +1077,7 @@ async def run_batch_ingestion(batch_id: str) -> dict:
         root = Path(batch.source_root)
         if not root.exists():
             batch.status = "failed"
-            batch.last_error = f"Storage root not found: {root}"
+            batch.last_error = "课程文件存储目录不存在"
             batch.completed_at = datetime.utcnow()
             session.commit()
             emit_ingestion_log(batch_id, "batch_failed", batch.last_error)
@@ -1018,7 +1085,7 @@ async def run_batch_ingestion(batch_id: str) -> dict:
 
         files = collect_source_documents(root)
         emit_model_audit_log(batch_id)
-        emit_ingestion_log(batch_id, "batch_started", f"Scanning course storage: {root}")
+        emit_ingestion_log(batch_id, "batch_started", "正在扫描课程文件存储")
         batch.total_files = len(files)
         batch.processed_files = 0
         batch.success_count = 0
@@ -1032,9 +1099,9 @@ async def run_batch_ingestion(batch_id: str) -> dict:
         session.commit()
 
         course = resolve_course(session, batch.course_id)
-        emit_ingestion_log(batch_id, "batch_files", f"Found {len(files)} files to parse", total_files=len(files))
+        emit_ingestion_log(batch_id, "batch_files", f"发现 {len(files)} 个待解析文件", total_files=len(files))
         for index, path in enumerate(files, start=1):
-            emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] Parsing {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
+            emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] 正在解析 {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
             job = create_job(
                 session,
                 course_id=course.id,
@@ -1055,10 +1122,10 @@ async def run_batch_ingestion(batch_id: str) -> dict:
                 coverage[result.get("source_type", "unknown")] += 1
                 if result["status"] == "skipped":
                     batch.skipped_count += 1
-                    emit_ingestion_log(batch_id, "file_skipped", f"Skipped {path.name}", source_path=str(path))
+                    emit_ingestion_log(batch_id, "file_skipped", f"已跳过 {path.name}", source_path=str(path))
                 else:
                     batch.success_count += 1
-                    emit_ingestion_log(batch_id, "file_completed", f"Completed {path.name}", source_path=str(path), stats=result.get("stats", {}))
+                    emit_ingestion_log(batch_id, "file_completed", f"{path.name} 解析完成", source_path=str(path), stats=result.get("stats", {}))
             except Exception as exc:
                 session.rollback()
                 failed_job = session.get(IngestionJob, job.id)
@@ -1070,7 +1137,7 @@ async def run_batch_ingestion(batch_id: str) -> dict:
                     batch.failure_count += 1
                     batch.last_error = str(exc)
                 errors.append({"source_path": str(path), "message": str(exc)})
-                emit_ingestion_log(batch_id, "file_failed", f"Failed {path.name}: {exc}", source_path=str(path), error=str(exc))
+                emit_ingestion_log(batch_id, "file_failed", f"{path.name} 解析失败：{exc}", source_path=str(path), error=str(exc))
                 session.commit()
             finally:
                 batch = session.get(IngestionBatch, batch_id)
@@ -1081,7 +1148,7 @@ async def run_batch_ingestion(batch_id: str) -> dict:
                 emit_ingestion_log(
                     batch_id,
                     "batch_progress",
-                    f"Progress {batch.processed_files}/{batch.total_files}",
+                    f"进度 {batch.processed_files}/{batch.total_files}",
                     processed_files=batch.processed_files,
                     total_files=batch.total_files,
                     success_count=batch.success_count,
@@ -1100,7 +1167,7 @@ async def run_batch_ingestion(batch_id: str) -> dict:
             emit_ingestion_log(
                 batch_id,
                 "batch_graph_started",
-                "Generating course graph",
+                "正在生成课程图谱",
                 processed_files=batch.processed_files,
                 total_files=batch.total_files,
                 success_count=batch.success_count,
@@ -1147,7 +1214,7 @@ async def run_batch_ingestion(batch_id: str) -> dict:
         elif graph_stats.get("graph_llm_failed_chunks", 0) > 0:
             batch.status = "partial_failed"
             terminal_event = "batch_partial_failed"
-            batch.last_error = f"Graph extraction failed for {graph_stats['graph_llm_failed_chunks']} chunk(s)"
+            batch.last_error = f"图谱抽取失败片段数：{graph_stats['graph_llm_failed_chunks']}"
         elif batch.failure_count > 0:
             batch.status = "partial_failed"
             terminal_event = "batch_partial_failed"
@@ -1156,8 +1223,8 @@ async def run_batch_ingestion(batch_id: str) -> dict:
             terminal_event = "batch_completed"
         batch.completed_at = datetime.utcnow()
         session.commit()
-        emit_ingestion_log(batch_id, "graph_rebuilt", f"Graph rebuilt: {graph_stats.get('graph_nodes', 0)} nodes, {graph_stats.get('graph_edges', 0)} edges", **graph_stats)
-        emit_ingestion_log(batch_id, terminal_event, f"Batch {batch.status}: {batch.success_count} succeeded, {batch.failure_count} failed, {batch.skipped_count} skipped")
+        emit_ingestion_log(batch_id, "graph_rebuilt", f"图谱已重建：{graph_stats.get('graph_nodes', 0)} 个节点，{graph_stats.get('graph_edges', 0)} 条边", **graph_stats)
+        emit_ingestion_log(batch_id, terminal_event, f"批次{batch.status}：成功 {batch.success_count}，失败 {batch.failure_count}，跳过 {batch.skipped_count}")
         return summarize_batch(batch)
     finally:
         session.close()
@@ -1186,9 +1253,9 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
 
         course = resolve_course(session, batch.course_id)
         emit_model_audit_log(batch_id)
-        emit_ingestion_log(batch_id, "batch_started", f"Parsing {len(files)} files" + (" with force reparse" if force else ""), total_files=len(files), force=force)
+        emit_ingestion_log(batch_id, "batch_started", f"正在解析 {len(files)} 个文件" + ("，并强制重建已有内容" if force else ""), total_files=len(files), force=force)
         for index, path in enumerate(files, start=1):
-            emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] Parsing {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
+            emit_ingestion_log(batch_id, "file_started", f"[{index}/{len(files)}] 正在解析 {path.name}", source_path=str(path), processed_files=batch.processed_files, total_files=batch.total_files)
             job = session.scalar(
                 select(IngestionJob)
                 .where(IngestionJob.course_id == course.id, IngestionJob.source_path == str(path))
@@ -1212,7 +1279,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                 session.commit()
             try:
                 if not path.exists():
-                    raise RuntimeError(f"File not found: {path}")
+                    raise RuntimeError(f"文件不存在：{path.name}")
                 result = await ingest_file(
                     session,
                     path,
@@ -1226,10 +1293,10 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                 coverage[result.get("source_type", "unknown")] += 1
                 if result["status"] == "skipped":
                     batch.skipped_count += 1
-                    emit_ingestion_log(batch_id, "file_skipped", f"Skipped {path.name}", source_path=str(path))
+                    emit_ingestion_log(batch_id, "file_skipped", f"已跳过 {path.name}", source_path=str(path))
                 else:
                     batch.success_count += 1
-                    emit_ingestion_log(batch_id, "file_completed", f"Completed {path.name}", source_path=str(path), stats=result.get("stats", {}))
+                    emit_ingestion_log(batch_id, "file_completed", f"{path.name} 解析完成", source_path=str(path), stats=result.get("stats", {}))
             except Exception as exc:
                 session.rollback()
                 failed_job = session.get(IngestionJob, job.id)
@@ -1241,7 +1308,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                     batch.failure_count += 1
                     batch.last_error = str(exc)
                 errors.append({"source_path": str(path), "message": str(exc)})
-                emit_ingestion_log(batch_id, "file_failed", f"Failed {path.name}: {exc}", source_path=str(path), error=str(exc))
+                emit_ingestion_log(batch_id, "file_failed", f"{path.name} 解析失败：{exc}", source_path=str(path), error=str(exc))
                 session.commit()
             finally:
                 batch = session.get(IngestionBatch, batch_id)
@@ -1252,7 +1319,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                 emit_ingestion_log(
                     batch_id,
                     "batch_progress",
-                    f"Progress {batch.processed_files}/{batch.total_files}",
+                    f"进度 {batch.processed_files}/{batch.total_files}",
                     processed_files=batch.processed_files,
                     total_files=batch.total_files,
                     success_count=batch.success_count,
@@ -1271,7 +1338,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
             emit_ingestion_log(
                 batch_id,
                 "batch_graph_started",
-                "Generating course graph",
+                "正在生成课程图谱",
                 processed_files=batch.processed_files,
                 total_files=batch.total_files,
                 success_count=batch.success_count,
@@ -1322,7 +1389,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
         elif graph_stats.get("graph_llm_failed_chunks", 0) > 0:
             batch.status = "partial_failed"
             terminal_event = "batch_partial_failed"
-            batch.last_error = f"Graph extraction failed for {graph_stats['graph_llm_failed_chunks']} chunk(s)"
+            batch.last_error = f"图谱抽取失败片段数：{graph_stats['graph_llm_failed_chunks']}"
         elif batch.failure_count > 0:
             batch.status = "partial_failed"
             terminal_event = "batch_partial_failed"
@@ -1331,8 +1398,8 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
             terminal_event = "batch_completed"
         batch.completed_at = datetime.utcnow()
         session.commit()
-        emit_ingestion_log(batch_id, "graph_rebuilt", f"Graph rebuilt: {graph_stats.get('graph_nodes', 0)} nodes, {graph_stats.get('graph_edges', 0)} edges", **graph_stats)
-        emit_ingestion_log(batch_id, terminal_event, f"Batch {batch.status}: {batch.success_count} succeeded, {batch.failure_count} failed, {batch.skipped_count} skipped")
+        emit_ingestion_log(batch_id, "graph_rebuilt", f"图谱已重建：{graph_stats.get('graph_nodes', 0)} 个节点，{graph_stats.get('graph_edges', 0)} 条边", **graph_stats)
+        emit_ingestion_log(batch_id, terminal_event, f"批次{batch.status}：成功 {batch.success_count}，失败 {batch.failure_count}，跳过 {batch.skipped_count}")
         return summarize_batch(batch)
     finally:
         session.close()

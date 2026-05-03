@@ -6,12 +6,14 @@ services:
     env_file:
       - ../.env
     environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/knowledge_base
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/course_kg
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       DATA_ROOT: /app/data
       STORAGE_ROOT: /app/data/storage
       INGESTION_ROOT: /app/data/ingestion
+      OPENAI_BASE_URL: ${API_OPENAI_BASE_URL-${OPENAI_BASE_URL}}
+      OPENAI_RESOLVE_IP: ${API_OPENAI_RESOLVE_IP-${OPENAI_RESOLVE_IP}}
       RERANKER_ENABLED: ${RERANKER_ENABLED:-true}
       RERANKER_URL: http://reranker:8080/rerank
       ENABLE_MODEL_FALLBACK: "false"
@@ -66,7 +68,7 @@ services:
     image: postgres:16
     container_name: course-kg-postgres
     environment:
-      POSTGRES_DB: knowledge_base
+      POSTGRES_DB: course_kg
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:

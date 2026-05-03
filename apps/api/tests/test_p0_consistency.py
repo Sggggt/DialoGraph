@@ -295,6 +295,54 @@ async def test_ingest_skips_duplicate_document_in_same_course(db_session, sample
 
 
 @pytest.mark.asyncio
+async def test_force_ingest_rebuilds_duplicate_document_in_same_course(db_session, sample_course, tmp_path, monkeypatch):
+    from app.core.config import get_settings
+    from app.models import Document, DocumentVersion
+    from app.services import ingestion
+    from app.services.storage import compute_checksum
+
+    storage_root = get_settings().course_paths_for_name(sample_course.name)["storage_root"]
+    original = storage_root / "force-source.md"
+    duplicate = storage_root / "copies" / "force-source.md"
+    original.parent.mkdir(parents=True, exist_ok=True)
+    duplicate.parent.mkdir(parents=True, exist_ok=True)
+    text = "# Force Source\n\nDegree centrality duplicate document with enough text to be indexed."
+    original.write_text(text, encoding="utf-8")
+    duplicate.write_text(text, encoding="utf-8")
+    checksum = compute_checksum(original)
+    existing = Document(
+        course_id=sample_course.id,
+        title="force-source",
+        source_path=str(original),
+        source_type="markdown",
+        checksum=checksum,
+        tags=["force-source"],
+        is_active=True,
+    )
+    db_session.add(existing)
+    db_session.flush()
+    db_session.add(DocumentVersion(document_id=existing.id, version=1, checksum=checksum, storage_path=str(original), is_active=True))
+    db_session.commit()
+
+    class CapturingVectorStore:
+        def __init__(self, course_name=None):
+            self.points = []
+
+        def upsert(self, points):
+            self.points.extend(points)
+
+    monkeypatch.setattr(ingestion, "EmbeddingProvider", _FakeEmbedder)
+    monkeypatch.setattr(ingestion, "VectorStore", CapturingVectorStore)
+
+    result = await ingestion.ingest_file(db_session, duplicate, course_id=sample_course.id, rebuild_graph=False, force=True)
+
+    assert result["status"] == "completed"
+    assert result["document_id"] == existing.id
+    assert result["stats"]["embedding_provider"] == "openai_compatible"
+    assert result["stats"]["embedding_fallback_reason"] is None
+
+
+@pytest.mark.asyncio
 async def test_ingest_deduplicates_chunks_and_skips_empty_effective_payload(db_session, sample_course, monkeypatch, tmp_path):
     from app.core.config import get_settings
     from app.models import Chunk, Document, DocumentVersion

@@ -11,6 +11,38 @@ import { NetworkCanvas } from "@/components/network-canvas";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { useCourseContext } from "@/components/course-context";
 
+const batchStateLabels: Record<string, string> = {
+  queued: "排队中",
+  parsing: "解析中",
+  chunking: "切块中",
+  embedding: "向量化中",
+  extracting_graph: "生成图谱中",
+  completed: "已完成",
+  partial_failed: "部分失败",
+  failed: "失败",
+  skipped: "已跳过",
+  idle: "未启动",
+};
+
+const sourceTypeLabels: Record<string, string> = {
+  pdf: "PDF",
+  notebook: "Notebook",
+  markdown: "Markdown",
+  text: "文本",
+  image: "图片",
+  docx: "Word",
+  pptx: "PowerPoint",
+  unknown: "未知",
+};
+
+function batchStateLabel(state?: string | null): string {
+  return state ? batchStateLabels[state] ?? state : "未启动";
+}
+
+function sourceTypeLabel(type: string): string {
+  return sourceTypeLabels[type] ?? type;
+}
+
 export function OverviewDashboard() {
   const { selectedCourseId } = useCourseContext();
   const { data, isLoading, error } = useQuery({
@@ -49,7 +81,7 @@ export function OverviewDashboard() {
         >
           <div className="space-y-5">
             <div className="max-w-4xl space-y-4">
-              <p className="section-kicker">Course Materials / Knowledge Intelligence</p>
+              <p className="section-kicker">课程材料 / 知识智能</p>
               <h2 className="glow-text text-3xl font-semibold leading-tight text-white lg:text-4xl">课程知识图谱、向量检索与 RAG 联动。</h2>
               <p className="max-w-3xl text-sm leading-7 text-cyan-50/72">围绕课程原件、章节脉络、概念关系和证据片段展开。新课件导入后自动解析、切块、向量化并更新图谱。</p>
             </div>
@@ -75,7 +107,7 @@ export function OverviewDashboard() {
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.08 }} className="glass-panel flex h-full min-w-0 flex-col rounded-[30px] p-3 lg:p-4">
           <div className="mb-2 flex items-center justify-between">
             <div>
-              <p className="section-kicker">Live Graph</p>
+              <p className="section-kicker">实时图谱</p>
               <h3 className="mt-1.5 text-xl font-semibold text-white">概念关系热区</h3>
             </div>
             <Orbit className="size-5 text-cyan-200" />
@@ -90,15 +122,15 @@ export function OverviewDashboard() {
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.14 }} className="glass-panel kg-scroll-panel rounded-[28px] p-6">
           <div className="flex items-center justify-between">
             <div>
-              <p className="section-kicker">Ingestion Status</p>
+              <p className="section-kicker">导入状态</p>
               <h3 className="mt-2 text-2xl font-semibold text-white">批次进度</h3>
             </div>
             <Zap className="size-5 text-cyan-200" />
           </div>
           <div className="mt-6 grid gap-4 sm:grid-cols-2">
             <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-              <p className="text-xs uppercase tracking-[0.28em] text-white/45">Latest Batch</p>
-              <p className="mt-3 text-2xl font-semibold text-white">{data.batch_status?.state ?? "idle"}</p>
+              <p className="text-xs uppercase tracking-[0.28em] text-white/45">最新批次</p>
+              <p className="mt-3 text-2xl font-semibold text-white">{batchStateLabel(data.batch_status?.state)}</p>
               <p className="mt-2 text-sm text-white/55">
                 {data.batch_status
                   ? `${data.batch_status.processed_files} / ${data.batch_status.total_files} 已处理`
@@ -106,16 +138,16 @@ export function OverviewDashboard() {
               </p>
             </div>
             <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
-              <p className="text-xs uppercase tracking-[0.28em] text-white/45">Embedding Mode</p>
-              <p className="mt-3 text-2xl font-semibold text-white">{data.degraded_mode ? "Fallback" : "OpenAI Compatible"}</p>
-              <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实 embedding 与外部图谱抽取已启用"}</p>
+              <p className="text-xs uppercase tracking-[0.28em] text-white/45">向量模型模式</p>
+              <p className="mt-3 text-2xl font-semibold text-white">{data.degraded_mode ? "降级不可用" : "真实模型链路"}</p>
+              <p className="mt-2 text-sm text-white/55">{data.degraded_mode ? "当前未检测到真实模型链路" : "真实向量模型与外部图谱抽取已启用"}</p>
             </div>
           </div>
           <div className="mt-6 space-y-3">
             {Object.entries(data.coverage_by_source_type).map(([type, count]) => (
               <div key={type} className="space-y-2">
                 <div className="flex items-center justify-between text-sm text-white/68">
-                  <span className="uppercase tracking-[0.2em]">{type}</span>
+                  <span className="uppercase tracking-[0.2em]">{sourceTypeLabel(type)}</span>
                   <span>{count}</span>
                 </div>
                 <div className="h-2 overflow-hidden rounded-full bg-white/6">
@@ -130,7 +162,7 @@ export function OverviewDashboard() {
           <div className="glass-panel kg-scroll-panel rounded-[28px] p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="section-kicker">Course Tree</p>
+                <p className="section-kicker">课程树</p>
                 <h3 className="mt-2 text-2xl font-semibold text-white">章节脉络</h3>
               </div>
               <Radar className="size-5 text-cyan-200" />
@@ -140,7 +172,7 @@ export function OverviewDashboard() {
                 <div key={chapter.id} className="rounded-[22px] border border-white/8 bg-white/[0.03] px-5 py-4">
                   <div className="flex items-center justify-between gap-4">
                     <p className="text-base font-medium text-white">{chapter.title}</p>
-                    <span className="text-xs uppercase tracking-[0.25em] text-white/45">{chapter.children?.length ?? 0} docs</span>
+                    <span className="text-xs uppercase tracking-[0.25em] text-white/45">{chapter.children?.length ?? 0} 个文档</span>
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2">
                     {(chapter.children ?? []).slice(0, 4).map((child) => (
@@ -157,7 +189,7 @@ export function OverviewDashboard() {
           <div className="glass-panel kg-scroll-panel rounded-[28px] p-6">
             <div className="flex items-center justify-between">
               <div>
-                <p className="section-kicker">Action Surface</p>
+                <p className="section-kicker">快捷入口</p>
                 <h3 className="mt-2 text-2xl font-semibold text-white">高频入口</h3>
               </div>
               <Sparkles className="size-5 text-cyan-200" />

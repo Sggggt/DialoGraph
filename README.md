@@ -17,8 +17,8 @@ flowchart TB
         WEB
         API --> ROUTES["API Routes<br/>courses / files / ingestion / search / qa / graph / settings"]
         ROUTES --> INGEST["Ingestion Pipeline<br/>parse -> chunk -> embed -> vector upsert -> graph extraction"]
-        ROUTES --> RETRIEVAL["Retrieval Pipeline<br/>Dense recall + BM25 recall + WSF fusion + rerank"]
-        ROUTES --> AGENT["Agent QA<br/>rewrite / route / retrieve / grade / answer / trace"]
+        ROUTES --> RETRIEVAL["Retrieval Pipeline<br/>Dense recall + BM25 recall<br/>WSF when both channels hit + rerank"]
+        ROUTES --> AGENT["Agent QA<br/>analyze / route / rewrite / retrieve / grade / answer / trace"]
         ROUTES --> GRAPH["Knowledge Graph<br/>concepts / relations / chapters / node detail"]
     end
 
@@ -33,6 +33,7 @@ flowchart TB
     subgraph HOST["宿主机挂载目录"]
         DATA["data/<br/>course files, ingestion artifacts, DB data"]
         MODELS["models/<br/>Hugging Face cache"]
+        BRIDGE["可选 Windows model bridge<br/>127.0.0.1:${MODEL_BRIDGE_PORT}<br/>curl.exe 转发"]
     end
 
     subgraph MODEL["外部模型 API"]
@@ -44,7 +45,9 @@ flowchart TB
     API --> QDRANT
     API -->|"HTTP rerank via RERANKER_URL"| RERANK_CPU
     API -. "RERANKER_DEVICE=cuda" .-> RERANK_CUDA
-    API -->|"real API, fallback disabled"| LLM
+    API -->|"MODEL_BRIDGE_ENABLED=false<br/>real API, fallback disabled"| LLM
+    API -. "MODEL_BRIDGE_ENABLED=true<br/>http://host.docker.internal:${MODEL_BRIDGE_PORT}" .-> BRIDGE
+    BRIDGE -. "Windows curl.exe<br/>forwards to OPENAI_BASE_URL" .-> LLM
 
     POSTGRES --- DATA
     REDIS --- DATA
@@ -54,7 +57,7 @@ flowchart TB
     RERANK_CUDA --- MODELS
 ```
 
-API 镜像保持轻量，不包含 PyTorch、CUDA 或 `sentence-transformers`。重排模型运行在独立的通用 `text-reranker-runtime:*` 容器中；`RERANKER_ENABLED=true` 时启用，CPU/CUDA 由 `.env` 的 `RERANKER_DEVICE` 控制。
+API 镜像保持轻量，不包含 PyTorch、CUDA 或 `sentence-transformers`。重排模型运行在独立的通用 `text-reranker-runtime:*` 容器中；`RERANKER_ENABLED=true` 时启用，CPU/CUDA 由 `.env` 的 `RERANKER_DEVICE` 控制。模型 API 有两种互斥访问路径：默认由 API 容器直连 `OPENAI_BASE_URL`；Windows Docker Desktop 下如果宿主机能访问供应商但 Linux 容器无法完成 TLS 握手，可以设置 `MODEL_BRIDGE_ENABLED=true`，启动宿主机 model bridge，并让 API 容器访问 `http://host.docker.internal:${MODEL_BRIDGE_PORT}`。bridge 只转发到真实 OpenAI-compatible provider，不替换模型，也不是 fallback。
 
 ## 目录结构
 
@@ -209,44 +212,45 @@ flowchart TB
         Q["User query"] --> QT["Query type classifier"]
         QT --> DENSE["Dense vector recall"]
         QT --> BM25["BM25 lexical recall"]
-        DENSE --> WSF["Weighted Score Fusion<br/>query-type alpha + min-max"]
+        DENSE --> WSF["Weighted Score Fusion<br/>when BM25 also hits"]
         BM25 --> WSF
+        DENSE --> DENSE_ONLY["Dense-only candidates<br/>when lexical channel has no hit"]
         WSF --> RERANK["Optional external bge-reranker<br/>HTTP runtime"]
+        DENSE_ONLY --> RERANK
         RERANK --> TOPK["Top-K chunks"]
         TOPK --> ANSWER["Chat model answer<br/>with citations"]
     end
 
     VEC --> DENSE
     DBW --> BM25
-    KG -. "pending controlled GraphRAG" .-> ONLINE
+    KG -. "multi-hop graph expansion" .-> ONLINE
 ```
 
 当前主检索路径：
 
 ```text
-Dense 向量召回 + BM25 词面召回 + WSF 融合 + 可选外部 bge-reranker 重排
+Dense 向量召回 + BM25 词面召回；两路同时命中时执行 WSF 融合；仅向量命中时跳过 WSF；最后按配置执行外部 bge-reranker 重排。
 ```
 
 ## GraphRAG 工作流
 
-图谱构建、图谱浏览和关系存储已经可用；GraphRAG 增强检索仍是待升级能力，进入主排序链路前需要完成语义门控和 evidence 支持性验证。
+图谱构建、图谱浏览和关系存储已经可用。当前 `multi_hop_research` 路由会使用 `graph_enhanced_search`：先运行混合检索，再根据命中 chunk 的 `evidence_chunk_id` 找到相关概念和 1-hop 关系，把关系证据 chunk 作为候选补充，并用 `graph_boost` 合并排序。语义门控和 relation-evidence 支持性验证仍是待升级能力。
 
 ```mermaid
 flowchart LR
-    BASE["Hybrid retrieval top chunks"] --> SEED["Find concepts and relations<br/>from evidence chunks"]
+    BASE["Hybrid retrieval top chunks"] --> SEED["Find seed relations<br/>by evidence_chunk_id"]
     SEED --> HOP["1-hop relation expansion"]
-    HOP --> EVIDENCE["Candidate evidence chunks"]
-    EVIDENCE --> GATE["Semantic gate<br/>query-relation-evidence support"]
-    GATE --> MERGE["Controlled merge"]
-    MERGE --> RERANK["Rerank with base candidates"]
-    RERANK --> FINAL["Final top-K context"]
+    HOP --> EVIDENCE["Related evidence chunks"]
+    EVIDENCE --> BOOST["graph_boost merge<br/>with base candidates"]
+    BOOST --> FINAL["Final top-K context"]
+    EVIDENCE -. "planned semantic gate<br/>query-relation-evidence support" .-> BOOST
 ```
 
 升级原则：
 
 - 图谱扩展只能补充候选 evidence，不能绕过文本证据直接提升答案。
-- 关系必须由 evidence chunk 支持，且 relation type 要通过语义校验。
-- comparison / relationship 类问题优先启用图谱门控；普通定义类问题默认走主检索路径。
+- 关系必须由 evidence chunk 支持；后续升级会增加 relation type 与查询意图的语义校验。
+- comparison / relationship 类问题会进入多跳检索路径；普通定义类问题默认走主检索路径。
 
 ## 智能体问答流程
 
@@ -254,22 +258,23 @@ flowchart LR
 flowchart TB
     Q["User question"] --> ANALYZE["query_analyzer"]
     ANALYZE --> ROUTER["router"]
-    ROUTER -->|"direct / clarify"| ANSWER["answer_generator"]
+    ROUTER -->|"direct / clarify"| TEMPLATE["template answer<br/>no chat model call"]
     ROUTER -->|"retrieve"| REWRITE["query_rewriter"]
-    ROUTER -->|"multi-hop / relation"| MULTIHOP["multi_hop_rewriter"]
-    REWRITE --> RETRIEVE["hybrid_retriever<br/>Dense + BM25 + WSF + optional rerank"]
-    MULTIHOP --> RETRIEVE
+    ROUTER -->|"multi-hop / relation"| REWRITE
+    REWRITE --> SPLIT["split_multi_hop_query<br/>only for multi_hop_research"]
+    SPLIT --> RETRIEVE["retrievers<br/>hybrid_search_chunks or graph_enhanced_search"]
     RETRIEVE --> GRADE["document_grader"]
     GRADE -->|"insufficient, retry available"| RETRY["retry_planner"]
     RETRY --> REWRITE
     GRADE -->|"has evidence"| CONTEXT["context_synthesizer"]
-    CONTEXT --> ANSWER
+    CONTEXT --> ANSWER["answer_generator<br/>ChatProvider answer"]
+    TEMPLATE --> CITE["citation_checker"]
     ANSWER --> CITE["citation_checker"]
     CITE --> SELF["self_check"]
     SELF --> FINAL["final response + trace"]
 ```
 
-Agent 运行信息写入 `agent_runs`，节点事件写入 `agent_trace_events`。`/api/tasks/{run_id}` 和 `/api/agent/runs/{run_id}` 用于查询运行状态。
+Agent 运行信息写入 `agent_runs`，节点事件写入 `agent_trace_events`。`/api/tasks/{run_id}` 和 `/api/agent/runs/{run_id}` 用于查询运行状态。回答响应包含 `answer_model_audit`：课程检索回答会记录 `provider`、`model` 和 `external_called=true`；`direct_answer` / `clarify` 模板分支会记录 `skipped_reason`，明确说明没有调用 chat model。
 
 ## 配置
 
@@ -287,38 +292,45 @@ WEB_IMAGE=course-kg-web:local
 RERANKER_CPU_IMAGE=text-reranker-runtime:cpu
 RERANKER_CUDA_IMAGE=text-reranker-runtime:cuda
 
-DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/knowledge_base
+DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/course_kg
 QDRANT_URL=http://localhost:6333
 REDIS_URL=redis://localhost:6379/0
 
-OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+OPENAI_RESOLVE_IP=
 OPENAI_API_KEY=
 EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
 
+MODEL_BRIDGE_ENABLED=false
+MODEL_BRIDGE_PORT=8765
+
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 RERANKER_ENABLED=true
 RERANKER_DEVICE=cpu
+RERANKER_CANDIDATE_LIMIT=12
 
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
-`RERANKER_ENABLED=false` 时，检索链路直接输出 WSF 融合结果，不启动 reranker runtime；这不是 fallback。`RERANKER_DEVICE` 只支持 `cpu` 和 `cuda`，仅在启用 reranker 时生效。
+上面的默认示例按 DashScope 的 OpenAI-compatible 接口配置，因此 `OPENAI_BASE_URL`、`EMBEDDING_MODEL`、`CHAT_MODEL` 和 `EMBEDDING_DIMENSIONS` 是一组。使用其他 OpenAI-compatible 供应商时，必须同时替换这几项，确保 embedding 模型输出维度与 `EMBEDDING_DIMENSIONS` 一致。`OPENAI_API_KEY` 留空时，Docker 服务可以启动，但上传解析、检索和问答里的真实模型调用会失败；完整链路验收前必须填入真实 key。不要开启 `ENABLE_MODEL_FALLBACK` 或 `ENABLE_DATABASE_FALLBACK`。
+
+`RERANKER_ENABLED=false` 时，检索链路直接输出 WSF 融合结果，不启动 reranker runtime；这不是 fallback。`RERANKER_DEVICE` 只支持 `cpu` 和 `cuda`，仅在启用 reranker 时生效。`RERANKER_CANDIDATE_LIMIT` 控制送入 cross-encoder reranker 的 WSF 候选数；CPU 模式建议保持较小，CUDA 可适当调高。
 
 前端设置页可以直接切换 reranker。启用前，Web 会调用 `/api/settings/runtime-check` 检查 `.env` / `.env.example` key 同步、reranker runtime、模型缓存、PostgreSQL、Qdrant 与 Redis 连通性；如果基础设施不完整，会弹出结构化错误窗口并给出修复命令，不会静默保存失败配置。
 
-## 验证已有基础设施
+`MODEL_BRIDGE_ENABLED=true` 只用于 Windows Docker Desktop 中“宿主机能访问 OpenAI-compatible 供应商，但 Linux 容器无法完成供应商 TLS 握手”的情况。启动脚本会在宿主机启动 `infra/model-bridge/model_bridge.py`，并把 API 容器指向 `http://host.docker.internal:${MODEL_BRIDGE_PORT}`。bridge 会继续转发到 `OPENAI_BASE_URL`，可配合 `OPENAI_RESOLVE_IP` 使用；它不替换模型，也不启用 fallback。
+
+## 验证基础镜像
 
 ```powershell
 docker run --rm postgres:16 postgres --version
 docker run --rm redis:7 redis-server --version
 docker image inspect qdrant/qdrant:v1.13.2
-docker run --rm text-reranker-runtime:cpu python -c "import torch; print(torch.__version__)"
-docker run --rm --gpus all text-reranker-runtime:cuda python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-CUDA 验证应输出 `True`。如果不是，先检查 NVIDIA Driver 和 NVIDIA Container Toolkit。
+这些命令只验证 Docker 能获取 PostgreSQL、Redis 和 Qdrant 基础镜像。`text-reranker-runtime:*` 是本项目本地构建镜像，按下一节构建后再验证。
 
 ## 构建镜像
 
@@ -331,7 +343,28 @@ docker build -f infra/reranker/Dockerfile.cpu -t text-reranker-runtime:cpu infra
 docker build -f infra/reranker/Dockerfile.cuda -t text-reranker-runtime:cuda infra/reranker
 ```
 
-`text-reranker-runtime:*` 是通用基础设施镜像，可被其他项目复用。已有等价镜像时可在 `.env` 中设置自己的镜像名。
+新机器至少需要构建 API、Web 和 CPU reranker 三个镜像；只有把 `RERANKER_DEVICE=cuda` 时才需要构建 CUDA reranker。`text-reranker-runtime:*` 是通用基础设施镜像，可被其他项目复用。已有等价镜像时可在 `.env` 中设置自己的镜像名。
+
+构建后验证 reranker 镜像：
+
+```powershell
+docker run --rm text-reranker-runtime:cpu python -c "import torch; print(torch.__version__)"
+docker run --rm --gpus all text-reranker-runtime:cuda python -c "import torch; print(torch.cuda.is_available())"
+```
+
+CUDA 验证应输出 `True`。如果不是，先检查 NVIDIA Driver 和 NVIDIA Container Toolkit。
+
+## 系统 Python 测试
+
+API 单测可以走系统 Python。首次运行前在 `apps/api` 下同步依赖：
+
+```powershell
+cd apps/api
+python -m pip install -e ".[dev]"
+python -m pytest
+```
+
+这条路径用于本机单测；Docker 运行态诊断仍以容器内环境为准。
 
 ## 模型缓存
 
@@ -361,6 +394,8 @@ docker run --rm -v "${PWD}\models:/models" -e HF_HOME=/models/huggingface text-r
 .\start-app.ps1
 ```
 
+启动脚本会读取仓库根目录的 `.env`，按 `RERANKER_ENABLED` 和 `RERANKER_DEVICE` 决定是否启动 CPU/CUDA reranker，并把 API 容器内的数据库、Qdrant、Redis 和 reranker 地址改写为 Docker 网络内地址。不要直接把 README 里的 `localhost` 数据库地址写进 compose；compose 已经负责在容器内使用 `postgres`、`qdrant`、`redis` 和 `reranker` 服务名。
+
 常用参数：
 
 ```powershell
@@ -375,7 +410,25 @@ docker compose -f infra/docker-compose.yml down
 docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down
 ```
 
+## Docker 全链路 Smoke Test
+
+启动后可以用一次性课程验证 API、Web 依赖服务、数据库、Qdrant、reranker 与真实模型调用：
+
+```powershell
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
+```
+
+脚本会创建临时课程、上传一份 Markdown、触发解析、检索、问答、读取会话并清理课程。`/api/search` 返回的 `model_audit.embedding_external_called=true` 且 `embedding_fallback_reason=null` 才表示模型调用链路没有走 fallback。
+
+只检查 Docker 基础设施连通性时：
+
+```powershell
+python scripts/docker_smoke.py --skip-model-calls
+```
+
 ## API 端点
+
+FastAPI 的 OpenAPI schema 暴露在 `/openapi.json`。下表按当前 schema 和前端调用链路整理。
 
 | Method | Path | 用途 |
 |---|---|---|
@@ -402,7 +455,7 @@ docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down
 | GET | `/api/ingestion/batches/{batch_id}` | 导入批次状态 |
 | GET | `/api/ingestion/batches/{batch_id}/logs` | 导入日志 SSE |
 | GET | `/api/jobs/{job_id}` | 单文件任务状态 |
-| POST | `/api/search` | 混合检索 |
+| POST | `/api/search` | 混合检索，返回 `model_audit` 说明查询 embedding 是否真实外呼 |
 | POST | `/api/qa` | Agent 问答 |
 | POST | `/api/qa/stream` | Agent 问答 SSE |
 | POST | `/api/agent` | Agent 调用 |

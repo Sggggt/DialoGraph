@@ -10,6 +10,7 @@ async def test_openai_compatible_embeddings_are_batched(no_fallback_env, monkeyp
     from app.services.embeddings import EmbeddingProvider
 
     monkeypatch.setenv("EMBEDDING_BATCH_SIZE", "10")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "2")
     get_settings.cache_clear()
     calls: list[list[str]] = []
 
@@ -17,7 +18,7 @@ async def test_openai_compatible_embeddings_are_batched(no_fallback_env, monkeyp
         batch = list(payload["input"])
         calls.append(batch)
         offset = sum(len(call) for call in calls[:-1])
-        return {"data": [{"embedding": [float(offset + index)]} for index, _text in enumerate(batch)]}
+        return {"data": [{"embedding": [float(offset + index + 1), 1.0]} for index, _text in enumerate(batch)]}
 
     monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
 
@@ -27,7 +28,25 @@ async def test_openai_compatible_embeddings_are_batched(no_fallback_env, monkeyp
     assert result.provider == "openai_compatible"
     assert result.external_called is True
     assert result.fallback_reason is None
-    assert result.vectors == [[float(index)] for index in range(25)]
+    assert result.vectors == [[float(index + 1), 1.0] for index in range(25)]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_embeddings_reject_zero_vectors(no_fallback_env, monkeypatch):
+    from app.core.config import get_settings
+    from app.services import embeddings
+    from app.services.embeddings import EmbeddingProvider
+
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "2")
+    get_settings.cache_clear()
+
+    async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
+        return {"data": [{"embedding": [0.0, 0.0]}]}
+
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
+
+    with pytest.raises(RuntimeError, match="all zeros"):
+        await EmbeddingProvider().embed_texts_with_meta(["bad vector"])
 
 
 @pytest.mark.asyncio

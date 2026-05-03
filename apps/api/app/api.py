@@ -65,7 +65,7 @@ from app.services.ingestion import (
 )
 from app.services.ingestion_logs import TERMINAL_LOG_EVENTS, list_ingestion_logs, subscribe_ingestion_logs, unsubscribe_ingestion_logs
 from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, cleanup_stale_graph, delete_course_data
-from app.services.retrieval import get_dashboard_snapshot, get_job_status, list_course_files, search_chunks
+from app.services.retrieval import get_dashboard_snapshot, get_job_status, list_course_files, search_chunks_with_audit
 from app.services.runtime_settings import model_settings_payload, normalize_env_file, runtime_check_payload, update_model_settings
 from app.services.storage import save_upload
 
@@ -419,8 +419,37 @@ def job_status(job_id: str, db: Session = Depends(get_db)) -> dict:
 @router.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
     course = get_requested_course(db, request.course_id)
-    results = await search_chunks(db, course.id, request.query, request.filters, request.top_k)
-    return {"query": request.query, "results": results, "degraded_mode": is_degraded_mode()}
+    try:
+        results, model_audit = await search_chunks_with_audit(db, course.id, request.query, request.filters, request.top_k)
+    except Exception as exc:
+        message = str(exc) or type(exc).__name__
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "search_embedding_failed",
+                "title": "Search embedding request failed",
+                "message": (
+                    "The search query could not be embedded by the configured model API. "
+                    "Retrieval did not fall back to fake or lexical-only results."
+                ),
+                "issues": [
+                    {
+                        "code": "embedding_api_unreachable",
+                        "title": "Embedding API is unreachable from the API container",
+                        "message": message,
+                        "fix_commands": [
+                            "Check OPENAI_BASE_URL and OPENAI_RESOLVE_IP in .env.",
+                            "Verify the API container can reach the embedding endpoint.",
+                        ],
+                    }
+                ],
+                "fix_commands": [
+                    "docker logs --tail 120 course-kg-api",
+                    "docker exec course-kg-api curl -I https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+                ],
+            },
+        ) from exc
+    return {"query": request.query, "results": results, "degraded_mode": is_degraded_mode(), "model_audit": model_audit}
 
 
 @router.post("/qa", response_model=QAResponse)

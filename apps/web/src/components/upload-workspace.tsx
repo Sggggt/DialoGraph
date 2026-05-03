@@ -11,6 +11,7 @@ import { useCourseContext } from "@/components/course-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { useLocalStorage } from "@/hooks/use-local-storage";
 
 type UploadedFile = {
   name: string;
@@ -45,6 +46,56 @@ type IngestionLogEvent = {
 
 const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_missing"]);
 const terminalBatchStates = new Set(["completed", "partial_failed", "failed", "skipped"]);
+
+const logEventLabels: Record<string, string> = {
+  batch_started: "批次开始",
+  batch_files: "文件扫描",
+  file_started: "开始解析",
+  job_state: "任务状态",
+  file_skipped: "跳过文件",
+  file_completed: "文件完成",
+  file_failed: "文件失败",
+  batch_graph_started: "图谱生成",
+  batch_graph_selected: "图谱片段选择",
+  batch_graph_progress: "图谱抽取进度",
+  graph_rebuilt: "图谱完成",
+  graph_failed: "图谱失败",
+  batch_completed: "批次完成",
+  batch_partial_failed: "部分失败",
+  batch_failed: "批次失败",
+  batch_skipped: "批次跳过",
+  batch_missing: "批次丢失",
+};
+
+function logEventLabel(event: string): string {
+  return logEventLabels[event] ?? event.replaceAll("_", " ");
+}
+
+const batchStateLabels: Record<string, string> = {
+  queued: "排队中",
+  parsing: "解析中",
+  chunking: "切块中",
+  embedding: "向量化中",
+  extracting_graph: "生成图谱中",
+  completed: "已完成",
+  partial_failed: "部分失败",
+  failed: "失败",
+  skipped: "已跳过",
+};
+
+function batchStateLabel(state?: string | null): string {
+  return state ? batchStateLabels[state] ?? state : "未启动";
+}
+
+function fallbackMethodLabel(value?: string | null): string {
+  if (!value) {
+    return "本地模拟";
+  }
+  if (value === "deterministic_local_hash_embedding") {
+    return "本地确定性哈希向量";
+  }
+  return value;
+}
 
 function isBatchNotFoundError(error: unknown): boolean {
   if (!(error instanceof Error)) {
@@ -102,14 +153,15 @@ function fileNameFromPath(path: string): string {
 
 function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string | null }) {
   const queryClient = useQueryClient();
-  const [batchId, setBatchId] = useState<string | null>(null);
-  const [dismissedBatchId, setDismissedBatchId] = useState<string | null>(null);
+  const storageScope = selectedCourseId ?? "unassigned";
+  const [batchId, setBatchId] = useLocalStorage<string | null>(`upload.batchId.${storageScope}`, null);
+  const [dismissedBatchId, setDismissedBatchId] = useLocalStorage<string | null>(`upload.dismissedBatchId.${storageScope}`, null);
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
-  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
-  const [activeLogBatchId, setActiveLogBatchId] = useState<string | null>(null);
+  const [uploadedFiles, setUploadedFiles] = useLocalStorage<UploadedFile[]>(`upload.uploadedFiles.${storageScope}`, []);
+  const [activeLogBatchId, setActiveLogBatchId] = useLocalStorage<string | null>(`upload.activeLogBatchId.${storageScope}`, null);
   const [logOpen, setLogOpen] = useState(false);
-  const [logs, setLogs] = useState<IngestionLogEvent[]>([]);
-  const [selectedFilePaths, setSelectedFilePaths] = useState<Set<string>>(() => new Set());
+  const [logs, setLogs] = useLocalStorage<IngestionLogEvent[]>(`upload.logs.${storageScope}`, []);
+  const [selectedFilePathValues, setSelectedFilePathValues] = useLocalStorage<string[]>(`upload.selectedFilePaths.${storageScope}`, []);
   const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
   const [cleanupDialog, setCleanupDialog] = useState<"data" | "graph" | null>(null);
 
@@ -145,6 +197,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const parseTargetPaths = useMemo(() => {
     return Array.from(new Set([...uploadedFiles.map((file) => file.path), ...remoteParseablePaths]));
   }, [remoteParseablePaths, uploadedFiles]);
+  const selectedFilePaths = useMemo(() => new Set(selectedFilePathValues), [selectedFilePathValues]);
   const selectedParseTargetPaths = useMemo(
     () => parseTargetPaths.filter((path) => selectedFilePaths.has(path)),
     [parseTargetPaths, selectedFilePaths],
@@ -187,7 +240,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       setLogs([]);
       setLogOpen(true);
       setUploadedFiles([]);
-      setSelectedFilePaths(new Set());
+      setSelectedFilePathValues([]);
       void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
     },
@@ -208,7 +261,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     mutationFn: () => cleanupStaleData(selectedCourseId),
     onSuccess: (stats) => {
       setCleanupMessage(
-        `旧数据清理完成：向量 ${stats.deleted_vectors}，chunks ${stats.deleted_chunks}，版本 ${stats.deleted_document_versions}，文档 ${stats.deleted_documents}，图谱关系 ${stats.removed_graph_relations}，图谱概念 ${stats.removed_graph_concepts}`,
+        `旧数据清理完成：向量 ${stats.deleted_vectors}，片段 ${stats.deleted_chunks}，版本 ${stats.deleted_document_versions}，文档 ${stats.deleted_documents}，图谱关系 ${stats.removed_graph_relations}，图谱概念 ${stats.removed_graph_concepts}`,
       );
       void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
@@ -234,7 +287,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     if (!audit) {
       return "模型：等待后端返回模型审计";
     }
-    const provider = audit.provider ?? audit.embedding_provider ?? "unknown";
+    const provider = audit.provider ?? audit.embedding_provider ?? "未知";
     const embeddingModel = audit.model ?? audit.embedding_model ?? provider;
     const externalCalled = audit.external_called ?? audit.embedding_external_called ?? false;
     const fallbackReason = audit.fallback_reason ?? audit.embedding_fallback_reason ?? null;
@@ -243,8 +296,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
     const graphModel = audit.graph_extraction_model ?? graphProvider;
     const embeddingText =
       provider === "fake"
-        ? `embedding ${embeddingModel}（${provider} fallback: ${fallbackMethod ?? fallbackReason ?? "local fake"}）`
-        : `embedding ${embeddingModel}（${provider}${externalCalled ? " 外部API" : ""}）`;
+        ? `向量模型 ${embeddingModel}（${provider} 降级：${fallbackMethodLabel(fallbackMethod ?? fallbackReason)}）`
+        : `向量模型 ${embeddingModel}（${provider}${externalCalled ? "，已调用外部 API" : ""}）`;
     const graphText = graphProvider ? `；图谱抽取 ${graphModel}（${graphProvider}）` : "";
     return `模型：${embeddingText}${graphText}`;
   }, [logs]);
@@ -258,7 +311,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         document_id: null,
         title: file.name,
         source_path: file.path,
-        source_type: "unknown",
+                source_type: "未知",
         chapter: null,
         status: "pending",
         job_state: null,
@@ -284,27 +337,15 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       return;
     }
     event.preventDefault();
-    setSelectedFilePaths((current) => {
-      const next = new Set(current);
-      if (next.has(file.source_path)) {
-        next.delete(file.source_path);
-      } else {
-        next.add(file.source_path);
-      }
-      return next;
-    });
+    setSelectedFilePathValues((current) => (current.includes(file.source_path) ? current.filter((path) => path !== file.source_path) : [...current, file.source_path]));
   };
 
   useEffect(() => {
-    queueMicrotask(() => setSelectedFilePaths(new Set()));
-  }, [selectedCourseId]);
-
-  useEffect(() => {
     queueMicrotask(() => {
-      setSelectedFilePaths((current) => {
+      setSelectedFilePathValues((current) => {
         const validPaths = new Set(parseTargetPaths);
-        const next = new Set(Array.from(current).filter((path) => validPaths.has(path)));
-        return next.size === current.size ? current : next;
+        const next = current.filter((path) => validPaths.has(path));
+        return next.length === current.length ? current : next;
       });
     });
   }, [parseTargetPaths]);
@@ -417,10 +458,10 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         <div className="relative border-b border-white/8 p-6 xl:border-b-0 xl:border-r xl:p-7">
         <div className="grid gap-6">
           <div className="space-y-5">
-            <p className="section-kicker">Ingestion Console</p>
+            <p className="section-kicker">导入控制台</p>
             <h2 className="glow-text text-4xl font-semibold text-white lg:text-5xl">全量导入控制台</h2>
             <p className="max-w-2xl text-base leading-8 text-cyan-50/72">
-              文件上传后会进入本课程 storage 文件夹。文件导览中的任意入库文件都可以直接解析、切块、向量化并更新图谱。
+              文件上传后会进入本课程存储文件夹。文件导览中的任意入库文件都可以直接解析、切块、向量化并更新图谱。
             </p>
 
             <div className="flex flex-wrap gap-3">
@@ -438,7 +479,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                 onClick={() => parseUploadsMutation.mutate({ paths: parseTargetPaths, force: true })}
                 disabled={parseUploadsMutation.isPending || parseTargetPaths.length === 0}
                 className="rounded-full border border-rose-300/30 bg-rose-300/8 px-4 py-3 text-xs uppercase tracking-[0.2em] text-rose-50/80 transition hover:text-white disabled:opacity-45"
-                title="强制重建当前课程所有文件的 chunks、embedding、Qdrant 向量和图谱"
+                  title="强制重建当前课程所有文件的片段、向量、Qdrant 向量记录和图谱"
               >
                 {parseUploadsMutation.isPending ? <LoaderCircle className="mr-2 inline size-3.5 animate-spin" /> : <RefreshCcw className="mr-2 inline size-3.5" />}
                 全量重新解析
@@ -556,9 +597,9 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         <div className="relative flex min-h-[540px] max-h-[72dvh] flex-col border-b border-white/8 p-6 xl:h-full xl:min-h-0 xl:max-h-none xl:border-b-0 xl:border-r xl:p-7">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
-            <p className="section-kicker">File Library</p>
+            <p className="section-kicker">文件库</p>
             <h3 className="mt-2 text-2xl font-semibold text-white">已入库文件导览</h3>
-            <p className="mt-2 text-sm text-white/50">本课程 storage 文件夹中的文件会统一显示在这里。</p>
+            <p className="mt-2 text-sm text-white/50">本课程存储文件夹中的文件会统一显示在这里。</p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             <button
@@ -571,7 +612,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               }}
               disabled={!selectedCourseId || Boolean(activeBatchId) || cleanupStaleDataMutation.isPending || cleanupStaleGraphMutation.isPending}
               className="inline-flex items-center gap-1.5 rounded-full border border-amber-200/18 bg-amber-300/[0.055] px-3 py-1.5 text-[11px] text-amber-50/72 transition hover:border-amber-200/36 hover:text-white disabled:pointer-events-none disabled:opacity-40"
-              title={activeBatchId ? "当前有导入批次运行，暂不能清理" : "清理 inactive 数据和 stale vectors"}
+                title={activeBatchId ? "当前有导入批次运行，暂不能清理" : "清理非活跃数据和失效向量"}
             >
               {cleanupStaleDataMutation.isPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Database className="size-3.5" />}
               清理数据库
@@ -586,7 +627,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               }}
               disabled={!selectedCourseId || Boolean(activeBatchId) || cleanupStaleDataMutation.isPending || cleanupStaleGraphMutation.isPending}
               className="inline-flex items-center gap-1.5 rounded-full border border-cyan-200/18 bg-cyan-300/[0.055] px-3 py-1.5 text-[11px] text-cyan-50/72 transition hover:border-cyan-200/36 hover:text-white disabled:pointer-events-none disabled:opacity-40"
-              title={activeBatchId ? "当前有导入批次运行，暂不能清理" : "清理 stale graph relations"}
+                title={activeBatchId ? "当前有导入批次运行，暂不能清理" : "清理失效图谱关系"}
             >
               {cleanupStaleGraphMutation.isPending ? <LoaderCircle className="size-3.5 animate-spin" /> : <Network className="size-3.5" />}
               清理图谱
@@ -639,9 +680,9 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                   </button>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-white/42">
-                  <span className="rounded-full border border-white/8 px-2.5 py-1">{file.source_type || "unknown"}</span>
+                  <span className="rounded-full border border-white/8 px-2.5 py-1">{file.source_type || "未知"}</span>
                   {file.chapter ? <span className="rounded-full border border-white/8 px-2.5 py-1">{file.chapter}</span> : null}
-                  <span className="rounded-full border border-white/8 px-2.5 py-1">{file.chunk_count} chunks</span>
+                  <span className="rounded-full border border-white/8 px-2.5 py-1">{file.chunk_count} 个片段</span>
                   {isSelected ? <span className="rounded-full border border-cyan-200/30 bg-cyan-300/10 px-2.5 py-1 text-cyan-50">已选择</span> : null}
                 </div>
               </div>
@@ -655,7 +696,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="border-b border-white/8 p-6 xl:p-7">
           <div className="flex items-center justify-between">
             <div>
-              <p className="section-kicker">Rules</p>
+              <p className="section-kicker">规则</p>
               <h3 className="mt-2 text-2xl font-semibold text-white">纳入与排除策略</h3>
             </div>
             <Files className="size-5 text-cyan-200" />
@@ -672,7 +713,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.08 }} className="p-6 xl:p-7">
           <div className="flex items-center justify-between">
             <div>
-              <p className="section-kicker">Batch Status</p>
+              <p className="section-kicker">批次状态</p>
               <h3 className="mt-2 text-2xl font-semibold text-white">当前后台批次</h3>
             </div>
             <button
@@ -712,8 +753,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
 
             <div className="border border-white/8 bg-black/10 p-5">
               <div className="flex items-center justify-between gap-4">
-                <p className="text-lg font-medium text-white">{visibleBatch?.state ?? "未启动"}</p>
-                <p className="text-xs uppercase tracking-[0.26em] text-white/45">{visibleBatch ? visibleBatch.batch_id.slice(0, 8) : "no-batch"}</p>
+                <p className="text-lg font-medium text-white">{batchStateLabel(visibleBatch?.state)}</p>
+                <p className="text-xs uppercase tracking-[0.26em] text-white/45">{visibleBatch ? visibleBatch.batch_id.slice(0, 8) : "无批次"}</p>
               </div>
               <div className="mt-4 h-2 overflow-hidden rounded-full bg-white/6">
                 <div
@@ -739,7 +780,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
 
             {(visibleBatch?.errors ?? []).length > 0 ? (
               <div className="rounded-[22px] border border-rose-300/20 bg-rose-400/[0.05] p-5">
-                <p className="text-xs uppercase tracking-[0.26em] text-rose-100/70">Failures</p>
+                <p className="text-xs uppercase tracking-[0.26em] text-rose-100/70">失败项</p>
                 <div className="custom-scrollbar kg-rounded-scrollbar mt-4 max-h-64 space-y-3 overflow-y-auto pr-1">
                   {visibleBatch?.errors.map((error) => (
                     <div key={`${error.source_path}-${error.message}`} className="rounded-[18px] border border-white/8 px-4 py-3 text-sm text-white/72">
@@ -825,7 +866,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
               <div>
                 <p className="section-kicker">解析日志</p>
                 <h3 className="mt-2 text-xl font-semibold">导入日志流</h3>
-                <p className="mt-1 text-xs text-white/45">{(activeLogBatchId ?? activeBatchId) ? (activeLogBatchId ?? activeBatchId)?.slice(0, 8) : "no batch"}</p>
+                <p className="mt-1 text-xs text-white/45">{(activeLogBatchId ?? activeBatchId) ? (activeLogBatchId ?? activeBatchId)?.slice(0, 8) : "无批次"}</p>
               </div>
               <button type="button" onClick={() => setLogOpen(false)} className="rounded-full border border-white/10 p-2 text-white/62 transition hover:text-white">
                 <X className="size-4" />
@@ -841,7 +882,7 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
                   {logs.map((item, index) => (
                     <div key={`${item.timestamp}-${index}`} className="rounded-[18px] border border-white/8 bg-white/[0.03] px-4 py-3">
                       <div className="flex items-center justify-between gap-3">
-                        <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/54">{item.event.replaceAll("_", " ")}</span>
+                        <span className="text-xs uppercase tracking-[0.2em] text-cyan-100/54">{logEventLabel(item.event)}</span>
                         <span className="text-[11px] text-white/36">{new Date(item.timestamp).toLocaleTimeString()}</span>
                       </div>
                       <p className="mt-2 break-words text-sm leading-6 text-white/72">{item.message}</p>

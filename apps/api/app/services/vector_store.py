@@ -187,6 +187,7 @@ class VectorStore:
                     rest.PointStruct(id=point["id"], vector=point["vector"], payload=point["payload"])
                     for point in points
                 ],
+                wait=True,
             )
         else:
             if not self.settings.enable_model_fallback:
@@ -200,6 +201,7 @@ class VectorStore:
             self.client.delete(
                 collection_name=self.collection,
                 points_selector=rest.PointIdsList(points=ids),
+                wait=True,
             )
         if self.settings.enable_model_fallback:
             self.fallback.delete(ids)

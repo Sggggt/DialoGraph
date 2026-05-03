@@ -57,7 +57,7 @@ function buildApiUrl(path: string, params?: Record<string, string | null | undef
 async function parseResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const text = await response.text();
-    const error = new Error(text || `Request failed with ${response.status}`) as Error & {
+    const error = new Error(text || `请求失败，HTTP ${response.status}`) as Error & {
       status?: number;
       structured?: StructuredApiErrorBody;
     };
@@ -291,7 +291,7 @@ export async function streamAnswer(
     body: JSON.stringify(payload),
   });
   if (!response.ok || !response.body) {
-    throw new Error("Streaming response unavailable");
+    throw new Error("浏览器不支持流式响应");
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();

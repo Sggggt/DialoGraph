@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -19,6 +20,22 @@ from app.core.config import get_settings
 
 class FallbackDisabledError(RuntimeError):
     pass
+
+
+def vector_norm(vector: list[float]) -> float:
+    return math.sqrt(sum(float(value) * float(value) for value in vector))
+
+
+def validate_embedding_vectors(vectors: list[list[float]], *, expected_count: int, expected_dimensions: int) -> None:
+    if len(vectors) != expected_count:
+        raise RuntimeError(f"Embedding response returned {len(vectors)} vector(s), expected {expected_count}")
+    for index, vector in enumerate(vectors):
+        if len(vector) != expected_dimensions:
+            raise RuntimeError(f"Embedding vector {index} has dimension {len(vector)}, expected {expected_dimensions}")
+        if not all(math.isfinite(float(value)) for value in vector):
+            raise RuntimeError(f"Embedding vector {index} contains non-finite values")
+        if vector_norm(vector) <= 1e-12:
+            raise RuntimeError(f"Embedding vector {index} is all zeros")
 
 
 def is_degraded_mode() -> bool:
@@ -47,6 +64,7 @@ class EmbeddingProvider:
             )
         try:
             vectors = await self._openai_compatible_embeddings(texts, text_type=text_type)
+            validate_embedding_vectors(vectors, expected_count=len(texts), expected_dimensions=self.settings.embedding_dimensions)
             return EmbeddingCallResult(vectors=vectors, provider="openai_compatible", external_called=True, fallback_reason=None)
         except Exception as exc:
             if not self.settings.enable_model_fallback:
@@ -327,11 +345,14 @@ async def post_openai_compatible_json(
     timeout: float,
     resolve_ip: str | None = None,
 ) -> dict[str, Any]:
+    normalized_resolve_ip = (resolve_ip or "").strip()
+    if normalized_resolve_ip.lower() in {"", "none", "null", "__none__"}:
+        normalized_resolve_ip = ""
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
-            if resolve_ip:
-                return await asyncio.to_thread(_post_json_with_curl_resolve, url, payload, headers, timeout, resolve_ip)
+            if normalized_resolve_ip:
+                return await asyncio.to_thread(_post_json_with_curl_resolve, url, payload, headers, timeout, normalized_resolve_ip)
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 response = await client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
@@ -366,6 +387,8 @@ def _is_retryable_openai_error(exc: Exception) -> bool:
         "curl: (28)",
         "curl: (7)",
         "curl: (35)",
+        "curl: (52)",
+        "empty reply",
     )
     return any(marker in message for marker in retryable_markers)
 
@@ -398,8 +421,11 @@ def _post_json_with_curl_resolve(
             config_file.write('header = "Content-Type: application/json"\n')
             config_file.write(f'data-binary = "@{payload_ref}"\n')
             config_path = config_file.name
+        curl_binary = shutil.which("curl.exe") or shutil.which("curl")
+        if not curl_binary:
+            raise RuntimeError("curl is required for OPENAI_RESOLVE_IP requests but was not found")
         result = subprocess.run(
-            ["curl.exe", "-sS", "-K", config_path],
+            [curl_binary, "-sS", "-K", config_path],
             capture_output=True,
             text=True,
             encoding="utf-8",

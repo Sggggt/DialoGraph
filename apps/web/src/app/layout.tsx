@@ -5,8 +5,8 @@ import { AppShell } from "@/components/app-shell";
 import { Providers } from "@/components/providers";
 
 export const metadata: Metadata = {
-  title: "Course Knowledge Base",
-  description: "Turn course materials into a searchable knowledge base with retrieval, graph, and agent workflows",
+  title: "课程知识库",
+  description: "将课程材料转为可检索、可溯源、可问答的本地知识库",
 };
 
 export default function RootLayout({

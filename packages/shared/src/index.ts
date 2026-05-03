@@ -91,10 +91,31 @@ export interface SearchResult {
   source_type?: string | null;
 }
 
+export interface ModelAudit {
+  embedding_provider: string;
+  embedding_model?: string | null;
+  embedding_external_called: boolean;
+  embedding_fallback_reason?: string | null;
+  reranker_enabled: boolean;
+  reranker_called: boolean;
+  fallback_enabled: boolean;
+  degraded_mode: boolean;
+  vector_index_warning?: string | null;
+}
+
+export interface AnswerModelAudit {
+  provider: string;
+  model?: string | null;
+  external_called: boolean;
+  fallback_reason?: string | null;
+  skipped_reason?: string | null;
+}
+
 export interface SearchResponse {
   query: string;
   results: SearchResult[];
   degraded_mode: boolean;
+  model_audit: ModelAudit;
 }
 
 export interface ChatMessage {
@@ -120,6 +141,7 @@ export interface QAResponse {
   route?: AgentRoute | null;
   trace?: AgentTraceEventPayload[];
   degraded_mode: boolean;
+  answer_model_audit: AnswerModelAudit;
 }
 
 export interface AgentRequest {
@@ -155,6 +177,7 @@ export interface AgentResponse {
   route: AgentRoute;
   trace: AgentTraceEventPayload[];
   degraded_mode: boolean;
+  answer_model_audit: AnswerModelAudit;
 }
 
 export interface TaskStatusResponse {
@@ -290,6 +313,7 @@ export interface InfrastructureStatus {
   postgres: boolean;
   qdrant: boolean;
   redis: boolean;
+  model_bridge?: boolean | null;
 }
 
 export interface RuntimeCheckResponse {

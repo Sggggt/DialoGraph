@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     reranker_device: str = "cpu"
     reranker_max_length: int = Field(default=512, ge=64, le=2048)
     reranker_text_chars: int = Field(default=1800, ge=128, le=8000)
+    reranker_candidate_limit: int = Field(default=12, ge=1, le=200)
 
     @property
     def cors_origin_list(self) -> list[str]:

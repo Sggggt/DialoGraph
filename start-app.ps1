@@ -89,7 +89,16 @@ function Invoke-Compose {
     [string[]]$Arguments
   )
 
-  & docker @Arguments
+  $effectiveArguments = $Arguments
+  if ($Arguments.Length -gt 0 -and $Arguments[0] -eq "compose" -and (Test-Path $EnvFile)) {
+    $remainingArguments = @()
+    if ($Arguments.Length -gt 1) {
+      $remainingArguments = $Arguments[1..($Arguments.Length - 1)]
+    }
+    $effectiveArguments = @("compose", "--env-file", $EnvFile) + $remainingArguments
+  }
+
+  & docker @effectiveArguments
   if ($LASTEXITCODE -ne 0) {
     throw "Docker Compose failed. If an application image is missing, build it first using the README commands."
   }
@@ -117,23 +126,76 @@ if (-not (Test-Path $InfraComposeFile)) {
 
 $rerankerEnabled = Get-DotEnvBool -Key "RERANKER_ENABLED" -DefaultValue $true
 $rerankerDevice = (Get-DotEnvValue -Key "RERANKER_DEVICE" -DefaultValue "cpu").ToLowerInvariant()
+$modelBridgeEnabled = Get-DotEnvBool -Key "MODEL_BRIDGE_ENABLED" -DefaultValue $false
+$modelBridgePortRaw = Get-DotEnvValue -Key "MODEL_BRIDGE_PORT" -DefaultValue "8765"
+$openAiBaseUrl = Get-DotEnvValue -Key "OPENAI_BASE_URL" -DefaultValue "https://api.openai.com/v1"
+$openAiResolveIp = Get-DotEnvValue -Key "OPENAI_RESOLVE_IP" -DefaultValue ""
+try {
+  $modelBridgePort = [int]$modelBridgePortRaw
+} catch {
+  throw "Unsupported MODEL_BRIDGE_PORT='$modelBridgePortRaw'. Use an integer port."
+}
 if ($rerankerEnabled -and $rerankerDevice -notin @("cpu", "cuda")) {
   throw "Unsupported RERANKER_DEVICE='$rerankerDevice'. Only 'cpu' and 'cuda' are supported."
 }
 if ($rerankerEnabled -and $rerankerDevice -eq "cuda" -and -not (Test-Path $CudaComposeFile)) {
   throw "CUDA Compose file not found: $CudaComposeFile"
 }
+if ($modelBridgeEnabled -and ($modelBridgePort -lt 1 -or $modelBridgePort -gt 65535)) {
+  throw "Unsupported MODEL_BRIDGE_PORT='$modelBridgePort'. Use a port between 1 and 65535."
+}
 
 $BackendUrl = "http://127.0.0.1:$BackendPort/api/health"
 $FrontendUrl = "http://127.0.0.1:$FrontendPort$OpenPath"
 $env:API_HOST_PORT = [string]$BackendPort
 $env:WEB_HOST_PORT = [string]$FrontendPort
+$env:OPENAI_BASE_URL = $openAiBaseUrl
+$env:OPENAI_RESOLVE_IP = $openAiResolveIp
+
+if ($modelBridgeEnabled) {
+  $BridgeScript = Join-Path $Root "infra\model-bridge\model_bridge.py"
+  if (-not (Test-Path $BridgeScript)) {
+    throw "Model bridge script not found: $BridgeScript"
+  }
+  $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+  if (-not $pythonCommand) {
+    throw "MODEL_BRIDGE_ENABLED=true requires Python on the Windows host PATH."
+  }
+  if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+    throw "MODEL_BRIDGE_ENABLED=true requires Windows curl.exe on PATH."
+  }
+
+  $BridgeHealthUrl = "http://127.0.0.1:$modelBridgePort/health"
+  if (-not (Test-Url $BridgeHealthUrl)) {
+    $bridgeArgs = @(
+      $BridgeScript,
+      "--host", "127.0.0.1",
+      "--port", [string]$modelBridgePort,
+      "--target-base-url", $openAiBaseUrl
+    )
+    if ($openAiResolveIp) {
+      $bridgeArgs += @("--resolve-ip", $openAiResolveIp)
+    }
+    Start-Process -WindowStyle Hidden -FilePath $pythonCommand.Source -ArgumentList $bridgeArgs
+    Wait-Url -Url $BridgeHealthUrl -Name "Model bridge" -TimeoutSeconds 20
+  }
+
+  $env:API_OPENAI_BASE_URL = "http://host.docker.internal:$modelBridgePort"
+  $env:API_OPENAI_RESOLVE_IP = "__none__"
+} else {
+  $env:API_OPENAI_BASE_URL = $openAiBaseUrl
+  $env:API_OPENAI_RESOLVE_IP = $openAiResolveIp
+}
 
 Write-Host "Course Knowledge Base Docker launcher" -ForegroundColor Cyan
 Write-Host "Root: $Root"
 Write-Host "Reranker enabled: $rerankerEnabled"
 if ($rerankerEnabled) {
   Write-Host "Reranker device: $rerankerDevice"
+}
+Write-Host "Model bridge enabled: $modelBridgeEnabled"
+if ($modelBridgeEnabled) {
+  Write-Host "Model bridge: http://127.0.0.1:$modelBridgePort"
 }
 Write-Host "API: http://127.0.0.1:$BackendPort/api"
 Write-Host "Web: http://127.0.0.1:$FrontendPort"

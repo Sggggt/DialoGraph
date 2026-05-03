@@ -126,7 +126,41 @@ def graph_extraction_provider() -> str:
     return "heuristic" if settings.enable_model_fallback else "unavailable"
 
 
-def normalize_concept_name(name: str) -> str:
+def _text_value(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _text_items(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    return []
+
+
+def _safe_float(value: object, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _graph_payload(value: object) -> dict:
+    return value if isinstance(value, dict) else {"concepts": [], "relations": []}
+
+
+def _has_graph_concepts(value: object) -> bool:
+    payload = _graph_payload(value)
+    concepts = payload.get("concepts", [])
+    return isinstance(concepts, list) and bool(concepts)
+
+
+def normalize_concept_name(name: object) -> str:
+    name = _text_value(name)
+    if not name:
+        return ""
     value = re.sub(r"\$[^$]*\$", " ", name)
     value = re.sub(r"[_*#`~\[\]\(\)]", " ", value)
     value = re.sub(r"[^0-9A-Za-z+\-/\s]", " ", value)
@@ -138,14 +172,20 @@ def normalize_concept_name(name: str) -> str:
     return value
 
 
-def clean_display_name(name: str) -> str:
+def clean_display_name(name: object) -> str:
+    name = _text_value(name)
+    if not name:
+        return ""
     raw = re.sub(r"\s+", " ", name).strip()
     if raw.isupper():
         return raw
     return raw[:1].upper() + raw[1:]
 
 
-def is_valid_concept(name: str) -> bool:
+def is_valid_concept(name: object) -> bool:
+    raw_name = _text_value(name)
+    if not raw_name:
+        return False
     normalized = normalize_concept_name(name)
     if not normalized or len(normalized) < 3:
         return False
@@ -153,7 +193,7 @@ def is_valid_concept(name: str) -> bool:
         return False
     if any(token in normalized for token in {"networkx", "analysis", "analysi", "homework", "solution", "notebook"}):
         return False
-    if any(char in name for char in "()[]{}_=<>"):
+    if any(char in raw_name for char in "()[]{}_=<>"):
         return False
     if normalized.startswith("figure ") or normalized.startswith("table "):
         return False
@@ -203,35 +243,44 @@ def heuristic_extract_graph(text: str) -> dict:
 
 def merge_graph_candidates(primary: dict, fallback: dict) -> dict:
     merged_concepts: dict[str, dict] = {}
-    for source in (fallback, primary):
+    for source in (_graph_payload(fallback), _graph_payload(primary)):
         for concept in source.get("concepts", []):
-            name = concept.get("name", "")
+            if not isinstance(concept, dict):
+                continue
+            name = _text_value(concept.get("name", ""))
             if not is_valid_concept(name):
                 continue
             normalized = normalize_concept_name(name)
             current = merged_concepts.get(normalized, {})
-            aliases = {alias for alias in current.get("aliases", []) if alias} | {
-                alias for alias in concept.get("aliases", []) if alias
-            }
+            aliases = set(_text_items(current.get("aliases", []))) | set(_text_items(concept.get("aliases", [])))
             if not aliases:
                 aliases = {clean_display_name(name)}
+            concept_type = _text_value(concept.get("concept_type", "")) or current.get("concept_type", "concept")
             merged_concepts[normalized] = {
                 "name": current.get("name") or clean_display_name(name),
                 "aliases": sorted(aliases),
-                "summary": concept.get("summary") or current.get("summary", ""),
-                "concept_type": concept.get("concept_type") or current.get("concept_type", "concept"),
-                "importance_score": max(float(current.get("importance_score", 0.0)), float(concept.get("importance_score", 0.0))),
+                "summary": _text_value(concept.get("summary", "")) or current.get("summary", ""),
+                "concept_type": concept_type,
+                "importance_score": max(
+                    _safe_float(current.get("importance_score", 0.0), 0.0),
+                    _safe_float(concept.get("importance_score", 0.0), 0.0),
+                ),
             }
 
     relations = []
     seen_relations: set[tuple[str, str, str]] = set()
-    for source in (fallback, primary):
+    for source in (_graph_payload(fallback), _graph_payload(primary)):
         for relation in source.get("relations", []):
-            relation_type = relation.get("relation_type", "mentions")
+            if not isinstance(relation, dict):
+                continue
+            relation_type_value = relation.get("relation_type", "mentions")
+            if relation_type_value is not None and not isinstance(relation_type_value, str):
+                continue
+            relation_type = _text_value(relation_type_value) or "mentions"
             if relation_type not in ALLOWED_RELATIONS:
                 continue
-            source_name = relation.get("source", "")
-            target_name = relation.get("target", "")
+            source_name = _text_value(relation.get("source", ""))
+            target_name = _text_value(relation.get("target", ""))
             if not is_valid_concept(source_name) or not is_valid_concept(target_name):
                 continue
             key = (
@@ -247,7 +296,7 @@ def merge_graph_candidates(primary: dict, fallback: dict) -> dict:
                     "source": clean_display_name(source_name),
                     "target": clean_display_name(target_name),
                     "relation_type": relation_type,
-                    "confidence": float(relation.get("confidence", 0.5)),
+                    "confidence": _safe_float(relation.get("confidence", 0.5), 0.5),
                 }
             )
     return {"concepts": list(merged_concepts.values()), "relations": relations}
@@ -323,7 +372,8 @@ async def upsert_concepts_from_chunk(
     else:
         llm_payload = {"concepts": [], "relations": []}
     extracted = merge_graph_candidates(llm_payload, fallback)
-    extraction_method = "llm+rules" if settings.enable_model_fallback and llm_payload.get("concepts") else "llm" if llm_payload.get("concepts") else "heuristic"
+    has_llm_concepts = _has_graph_concepts(llm_payload)
+    extraction_method = "llm+rules" if settings.enable_model_fallback and has_llm_concepts else "llm" if has_llm_concepts else "heuristic"
 
     concept_map: dict[str, Concept] = {}
     created_count = 0
@@ -336,7 +386,7 @@ async def upsert_concepts_from_chunk(
             summary=concept_data.get("summary") or chunk.snippet,
             aliases=concept_data.get("aliases", []),
             concept_type=concept_data.get("concept_type") or "concept",
-            importance_score=float(concept_data.get("importance_score", 0.5)),
+            importance_score=_safe_float(concept_data.get("importance_score", 0.5), 0.5),
         )
         concept_map[normalize_concept_name(concept_data["name"])] = concept
         if created:
@@ -353,7 +403,7 @@ async def upsert_concepts_from_chunk(
         if relation_key in relation_keys:
             continue
         relation_keys.add(relation_key)
-        confidence = float(relation_data.get("confidence", 0.55))
+        confidence = _safe_float(relation_data.get("confidence", 0.55), 0.55)
         existing = db.scalar(
             select(ConceptRelation).where(
                 ConceptRelation.course_id == course_id,
@@ -466,7 +516,7 @@ async def extract_llm_graph_payloads(
                     emit_ingestion_log(
                         batch_id,
                         "batch_graph_progress",
-                        f"Graph extraction {completed}/{total} chunks",
+                        f"图谱抽取进度 {completed}/{total} 个片段",
                         completed_graph_chunks=completed,
                         total_graph_chunks=total,
                         successful_extractions=len(payloads),
@@ -498,7 +548,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         emit_ingestion_log(
             batch_id,
             "batch_graph_selected",
-            f"Selected {len(selected_llm_chunks)} chunks from {len(graph_document_ids)} documents for LLM graph extraction",
+            f"已从 {len(graph_document_ids)} 个文档中选择 {len(selected_llm_chunks)} 个片段用于模型图谱抽取",
             selected_llm_chunks=len(selected_llm_chunks),
             graph_source_documents=len(graph_document_ids),
             total_active_chunks=len(chunks),
@@ -514,8 +564,8 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
     else:
         llm_payloads, llm_errors = extraction_result, {}
     if llm_chunk_ids and not llm_payloads:
-        sample_error = next(iter(llm_errors.values()), "no LLM graph payloads were returned")
-        raise RuntimeError(f"Graph extraction failed for all selected chunks: {sample_error}")
+        sample_error = next(iter(llm_errors.values()), "模型没有返回图谱抽取结果")
+        raise RuntimeError(f"所有已选片段的图谱抽取均失败：{sample_error}")
     llm_document_ids = {chunk.document_id for chunk in chunks if chunk.id in llm_chunk_ids}
 
     db.query(ConceptRelation).filter(ConceptRelation.course_id == course_id).delete(synchronize_session=False)

@@ -55,7 +55,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     mutationFn: (courseId: string) => deleteCourse(courseId),
     onSuccess: async (data, deletedCourseId) => {
       setDeleteCourseResult(
-        `Deleted course data: vectors ${data.deleted_vectors}, documents ${data.deleted_documents}, chunks ${data.deleted_chunks}, graph relations ${data.deleted_relations}.`,
+        `课程数据已删除：向量 ${data.deleted_vectors} 条，文档 ${data.deleted_documents} 份，片段 ${data.deleted_chunks} 个，图谱关系 ${data.deleted_relations} 条。`,
       );
       const nextCourse = courses.find((course) => course.id !== deletedCourseId) ?? null;
       setSelectedCourseId(nextCourse?.id ?? null);
@@ -115,8 +115,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <header className="fixed inset-x-0 top-0 z-30 border-b border-white/6 bg-[rgba(3,7,20,0.78)] backdrop-blur-2xl lg:left-[76px]">
           <div className="flex flex-wrap items-center justify-between gap-4 px-5 py-3 lg:px-7">
             <div className="min-w-0">
-              <p className="text-[10px] uppercase tracking-[0.34em] text-cyan-100/42">Course Knowledge Base</p>
-              <h1 className="mt-1 break-words text-lg font-semibold text-white lg:text-xl">General Course Intelligence Surface</h1>
+              <p className="text-[10px] uppercase tracking-[0.34em] text-cyan-100/42">课程知识库</p>
+              <h1 className="mt-1 break-words text-lg font-semibold text-white lg:text-xl">本地课程智能检索台</h1>
               <p className="mt-1 text-xs text-white/45">{selectedCourse?.name ?? "选择课程空间"}</p>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
@@ -181,11 +181,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               </Button>
               <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
                 <Sparkles data-icon="inline-start" />
-                Agentic RAG
+                智能检索问答
               </div>
               <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
                 <TerminalSquare data-icon="inline-start" />
-                Hybrid Graph Runtime
+                混合图谱链路
               </div>
             </div>
           </div>
@@ -200,7 +200,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.88)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
           <DialogHeader className="border-b border-white/8 px-6 py-5">
             <DialogTitle>新建课程空间</DialogTitle>
-            <DialogDescription>创建课程看板、图谱、搜索和问答上下文。课程文件会统一进入本课程 storage 文件夹。</DialogDescription>
+            <DialogDescription>创建课程看板、图谱、搜索和问答上下文。课程文件会统一进入本课程存储文件夹。</DialogDescription>
           </DialogHeader>
           <form
             className="space-y-4 px-6 py-5"
@@ -248,15 +248,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       >
         <DialogContent className="max-w-md border border-white/10 bg-[rgba(3,7,20,0.92)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl" showCloseButton={!deleteCourseMutation.isPending}>
           <DialogHeader className="border-b border-white/8 px-6 py-5">
-            <DialogTitle>Delete Course</DialogTitle>
+            <DialogTitle>删除课程</DialogTitle>
             <DialogDescription>
-              {courseToDelete ? `This will delete "${courseToDelete.name}" from data storage, PostgreSQL, Qdrant, and graph tables.` : ""}
+              {courseToDelete ? `将从文件存储、PostgreSQL、Qdrant 和图谱表中删除“${courseToDelete.name}”。` : ""}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 px-6 py-5">
             {deleteCourseMutation.isPending ? (
               <div>
-                <p className="text-sm text-white/72">Deleting course data...</p>
+                <p className="text-sm text-white/72">正在删除课程数据...</p>
                 <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8">
                   <div className="h-full w-2/3 animate-pulse rounded-full bg-[linear-gradient(90deg,#fb7185,#fbbf24,#fb7185)]" />
                 </div>
@@ -265,7 +265,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <p className="rounded-2xl border border-emerald-200/16 bg-emerald-300/[0.055] px-4 py-3 text-sm leading-6 text-emerald-50/78">{deleteCourseResult}</p>
             ) : (
               <p className="rounded-2xl border border-rose-200/16 bg-rose-300/[0.055] px-4 py-3 text-sm leading-6 text-rose-50/78">
-                This is a destructive operation and cannot be undone from the UI.
+                这是不可逆操作，界面内无法撤销。
               </p>
             )}
             {deleteCourseMutation.error ? <p className="text-sm text-rose-100/78">{(deleteCourseMutation.error as Error).message}</p> : null}
@@ -280,7 +280,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   setDeleteCourseResult(null);
                 }}
               >
-                {deleteCourseResult ? "Close" : "Cancel"}
+                {deleteCourseResult ? "关闭" : "取消"}
               </Button>
               {!deleteCourseResult ? (
                 <Button
@@ -293,7 +293,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                     }
                   }}
                 >
-                  {deleteCourseMutation.isPending ? "Deleting..." : "Delete"}
+                  {deleteCourseMutation.isPending ? "删除中..." : "删除"}
                 </Button>
               ) : null}
             </div>

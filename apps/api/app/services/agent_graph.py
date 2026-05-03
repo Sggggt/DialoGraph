@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.models import AgentRun, AgentTraceEvent, QASession
 from app.schemas import AgentRequest, SearchFilters
+from app.core.config import get_settings
 from app.services.embeddings import ChatProvider, is_degraded_mode
 from app.services.ingestion import resolve_course
 from app.services.retrieval import graph_enhanced_search, hybrid_search_chunks
@@ -41,6 +42,7 @@ class AgentState(TypedDict, total=False):
     graded_documents: list[dict]
     context: str
     answer: str
+    answer_model_audit: dict
     citations: list[dict]
     retry_count: int
     degraded_mode: bool
@@ -195,13 +197,16 @@ class Router:
         question = state["question"]
         lower = question.lower()
         terms = _terms(question)
-        if any(greeting in lower for greeting in ("hello", "hi", "who are you", "help", "what can you do")):
+        is_greeting = lower in {"hello", "hi", "hey", "who are you", "help", "what can you do"} or bool(
+            terms.intersection({"hello", "hey"}) or (terms == {"hi"})
+        )
+        if is_greeting:
             route: AgentRoute = "direct_answer"
         elif len(terms) < 2 or lower in {"it", "this", "that", "explain it", "why"}:
             route = "clarify"
         elif any(marker in lower for marker in EXERCISE_MARKERS):
             route = "retrieve_exercises"
-        elif any(term in lower for term in ("compare", "relationship", "difference between", "connect", "derive", "prove")):
+        elif any(term in lower for term in ("compare", "relationship", "related to", "relation between", "difference between", "connect", "derive", "prove")):
             route = "multi_hop_research"
         elif any(term in lower for term in ("note", "slide", "definition", "concept", "chapter")):
             route = "retrieve_notes"
@@ -346,10 +351,24 @@ class AnswerGenerator:
             answer = "I can answer questions about the indexed course materials, show citations, and explain how the retrieval agent reached its answer."
             citations: list[dict] = []
             used_chunks: list[dict] = []
+            state["answer_model_audit"] = {
+                "provider": "none",
+                "model": get_settings().chat_model,
+                "external_called": False,
+                "fallback_reason": None,
+                "skipped_reason": "direct_answer_route",
+            }
         elif route == "clarify":
             answer = "Please clarify the course concept, chapter, exercise, or comparison you want me to retrieve."
             citations = []
             used_chunks = []
+            state["answer_model_audit"] = {
+                "provider": "none",
+                "model": get_settings().chat_model,
+                "external_called": False,
+                "fallback_reason": None,
+                "skipped_reason": "clarify_route",
+            }
         else:
             used_chunks = state.get("graded_documents", [])
             chat_result = await ChatProvider().answer_question_with_meta(state["question"], used_chunks, state.get("history", []))
@@ -359,6 +378,7 @@ class AnswerGenerator:
                 "model": chat_result.model,
                 "external_called": chat_result.external_called,
                 "fallback_reason": chat_result.fallback_reason,
+                "skipped_reason": None,
             }
             citations = [citation for item in used_chunks for citation in item["citations"]]
         audit = state.get("answer_model_audit", {})
@@ -376,7 +396,7 @@ class AnswerGenerator:
             document_ids=[item["chunk_id"] for item in state.get("graded_documents", [])],
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
-        return {"answer": answer, "citations": citations, "graded_documents": used_chunks}
+        return {"answer": answer, "citations": citations, "graded_documents": used_chunks, "answer_model_audit": state.get("answer_model_audit") or {}}
 
 
 class CitationChecker:
@@ -576,6 +596,7 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "route": final_state.get("route") or "retrieve_both",
             "trace": [trace_event_to_payload(event) for event in trace_events],
             "degraded_mode": is_degraded_mode(),
+            "answer_model_audit": final_state.get("answer_model_audit") or {},
         }
     except Exception as exc:
         _set_run_state(db, run.id, "failed", current_node=None, error=str(exc))

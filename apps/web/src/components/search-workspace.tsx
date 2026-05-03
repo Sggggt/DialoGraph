@@ -41,9 +41,23 @@ type HoverPreviewState = {
 type HoverPreviewTimer = ReturnType<typeof setTimeout> | null;
 
 function scoreValue(result: SearchResult, key: string) {
-  const scores = result.metadata.scores as Record<string, number> | undefined;
+  const scores = result.metadata.scores as Record<string, number | string | boolean | null> | undefined;
   const value = scores?.[key];
-  return typeof value === "number" ? value.toFixed(3) : "-";
+  return typeof value === "number" ? value.toFixed(3) : "未参与";
+}
+
+function scoreKeys(result: SearchResult) {
+  return result.metadata.scores ? ["dense", "lexical", "fused", "rerank"] : [];
+}
+
+function scoreLabel(key: string) {
+  const labels: Record<string, string> = {
+    dense: "向量",
+    lexical: "词面",
+    fused: "融合",
+    rerank: "重排",
+  };
+  return labels[key] ?? key;
 }
 
 function resultChapter(result: SearchResult) {
@@ -51,7 +65,11 @@ function resultChapter(result: SearchResult) {
 }
 
 function resultSourceType(result: SearchResult) {
-  return result.source_type ?? (result.metadata.source_type as string | undefined) ?? "unknown";
+  return result.source_type ?? (result.metadata.source_type as string | undefined) ?? "未知";
+}
+
+function resultEvidenceSnippet(result: SearchResult) {
+  return result.citations[0]?.snippet || result.snippet || result.content || "";
 }
 
 function SearchHero({
@@ -78,12 +96,12 @@ function SearchHero({
       <div className="mx-auto flex max-w-5xl flex-col items-center gap-5 text-center">
         <div className="kg-micro-chip rounded-full px-3 py-2 text-xs uppercase tracking-[0.22em]">
           <Radar data-icon="inline-start" />
-          Hybrid Retrieval Surface
+          混合检索链路
         </div>
         <div className="space-y-3">
-          <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">Search the knowledge signal</h2>
+          <h2 className="glow-text text-4xl font-semibold text-white lg:text-6xl">检索课程知识信号</h2>
           <p className="mx-auto max-w-2xl text-sm leading-7 text-cyan-50/58 lg:text-base">
-            Dense vectors, lexical recall, fused ranking, and graph context converge into one exploratory search canvas.
+            Dense 向量召回、BM25 词面召回、WSF 融合排序与图谱上下文会在这里汇总。
           </p>
         </div>
 
@@ -104,14 +122,14 @@ function SearchHero({
                 }
               }}
               className="h-12 min-w-0 flex-1 bg-transparent text-lg text-white outline-none placeholder:text-white/28"
-              placeholder="Ask for a concept, theorem, exercise, or relationship..."
+              placeholder="输入概念、定理、练习或关系问题..."
             />
             <div className="hidden items-center gap-2 md:flex">
-              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{hitCount} hits</span>
+              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{hitCount} 条结果</span>
               {isSearching ? (
                 <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">
                   <span className="tech-dot" />
-                  scanning
+                  检索中
                 </span>
               ) : null}
             </div>
@@ -175,7 +193,7 @@ function SearchFilterBar({
       </div>
       <div className="kg-micro-chip rounded-full px-3 py-2 text-xs">
         <Activity data-icon="inline-start" />
-        {degradedMode ? "Lexical fallback" : "Dense + lexical + RRF"}
+        {degradedMode ? "仅词面检索" : "Dense + BM25 + WSF"}
       </div>
     </div>
   );
@@ -242,9 +260,9 @@ function ResultRow({
         </div>
       </div>
       <div className="mt-4 flex flex-wrap gap-2">
-        {["dense", "lexical", "fused", "grader_overlap"].map((key) => (
+        {scoreKeys(result).map((key) => (
           <span key={key} className="kg-micro-chip rounded-full px-2.5 py-1 text-[11px]">
-            {key.replace("_overlap", "")} {scoreValue(result, key)}
+            {scoreLabel(key)} {scoreValue(result, key)}
           </span>
         ))}
       </div>
@@ -269,10 +287,10 @@ function ResultStream({
     <section className="kg-glass-line kg-scroll-shell flex min-h-0 min-w-0 flex-col overflow-hidden rounded-[2rem] p-2">
       <div className="flex shrink-0 items-center justify-between gap-3 px-3 pb-4 pt-3">
         <div>
-          <p className="section-kicker">Result Stream</p>
-          <h3 className="mt-1 text-xl font-semibold text-white">Ranked Knowledge Fragments</h3>
+          <p className="section-kicker">结果流</p>
+          <h3 className="mt-1 text-xl font-semibold text-white">已排序知识片段</h3>
         </div>
-        <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">{results.length} active</span>
+        <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">{results.length} 条结果</span>
       </div>
       <div className="kg-scroll-body min-h-0 flex-1 px-3 pb-3">
         {isLoading ? (
@@ -282,9 +300,9 @@ function ResultStream({
             <div className="mx-auto grid size-14 place-items-center rounded-2xl border border-cyan-200/15 bg-cyan-300/[0.06] text-cyan-100">
               <Search />
             </div>
-            <h4 className="mt-5 text-lg font-medium text-white">No retrieval signal yet</h4>
+            <h4 className="mt-5 text-lg font-medium text-white">尚未发起检索</h4>
             <p className="mx-auto mt-2 max-w-md text-sm leading-7 text-white/52">
-              Run a hybrid search to reveal ranked chunks, score channels, and linked graph context.
+              发起一次混合检索后，这里会展示排序片段、分数通道和关联图谱上下文。
             </p>
           </div>
         ) : (
@@ -325,7 +343,7 @@ function HoverPreviewOverlay({ preview }: { preview: HoverPreviewState | null })
             style={{ top: preview.top, left: preview.left, width: preview.width }}
           >
             <div className="flex items-center justify-between gap-3">
-              <p className="text-xs uppercase tracking-[0.22em] text-cyan-100/55">Hover Preview</p>
+              <p className="text-xs uppercase tracking-[0.22em] text-cyan-100/55">悬停预览</p>
               <div className="flex flex-wrap gap-2">
                 <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultChapter(preview.result)}</span>
                 <span className="kg-micro-chip rounded-full px-2 py-1 text-[11px]">{resultSourceType(preview.result)}</span>
@@ -363,19 +381,19 @@ function GraphCanvasPanel({
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_20%,rgba(86,217,255,0.11),transparent_38%),linear-gradient(rgba(120,180,255,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(120,180,255,0.035)_1px,transparent_1px)] bg-[size:auto,42px_42px,42px_42px]" />
       <div className="relative z-10 flex items-center justify-between gap-3 px-5 py-4">
         <div>
-          <p className="section-kicker">Knowledge Canvas</p>
+          <p className="section-kicker">知识画布</p>
           <h3 className="mt-1 text-xl font-semibold text-white">{selectedLabel ?? selectedChapter ?? "探索图谱"}</h3>
           {selectedLabel && selectedChapter ? <p className="mt-1 text-sm text-white/42">{selectedChapter}</p> : null}
         </div>
         <span className="kg-micro-chip rounded-full px-3 py-2 text-xs">
           <GitBranch data-icon="inline-start" />
-          Live graph
+          实时图谱
         </span>
       </div>
       <div className="relative z-10 flex min-h-0 flex-1 px-2 pb-2">
         {isLoading ? (
           <div className="kg-shimmer mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] text-sm text-white/54">
-            Generating graph signal...
+            正在生成图谱信号...
           </div>
         ) : error ? (
           <div className="mx-3 flex min-h-0 w-full flex-1 items-stretch">
@@ -387,7 +405,7 @@ function GraphCanvasPanel({
           </div>
         ) : (
           <div className="mx-3 grid h-full min-h-0 w-full flex-1 place-items-center rounded-[1.5rem] border border-white/7 bg-white/[0.025] text-sm text-white/54">
-            Search results will focus the graph canvas.
+            检索结果会自动聚焦到图谱画布。
           </div>
         )}
       </div>
@@ -408,7 +426,7 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
             <div className="flex flex-wrap gap-2">
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultChapter(result)}</span>
               <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">{resultSourceType(result)}</span>
-              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">score {result.score.toFixed(3)}</span>
+              <span className="kg-micro-chip rounded-full px-3 py-1.5 text-xs">分数 {result.score.toFixed(3)}</span>
             </div>
             <h3 className="mt-5 text-2xl font-semibold text-white">{result.document_title ?? result.citations[0]?.document_title ?? "课程来源"}</h3>
             <p className="mt-3 flex items-center gap-2 truncate text-sm text-white/42">
@@ -417,13 +435,19 @@ function DetailDrawer({ result, open, onOpenChange }: { result: SearchResult | n
             </p>
             <div className="kg-flow-line my-6" />
             <div className="rounded-2xl border border-white/8 bg-white/[0.03] p-5">
-              <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Chunk Text</p>
-              <MarkdownRenderer content={result.content || result.snippet} className="mt-4 text-white/70" />
+              <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">命中证据</p>
+              <MarkdownRenderer content={resultEvidenceSnippet(result)} className="mt-4 text-white/70" />
             </div>
+            {result.content && result.content !== resultEvidenceSnippet(result) ? (
+              <div className="mt-5 rounded-2xl border border-white/8 bg-white/[0.03] p-5">
+                <p className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">完整片段</p>
+                <MarkdownRenderer content={result.content} className="mt-4 text-white/70" />
+              </div>
+            ) : null}
             <div className="mt-5 grid grid-cols-2 gap-3">
-              {["dense", "lexical", "fused", "grader_overlap"].map((key) => (
+              {scoreKeys(result).map((key) => (
                 <div key={key} className="rounded-2xl border border-white/8 bg-white/[0.025] p-4">
-                  <p className="text-xs uppercase tracking-[0.2em] text-white/38">{key.replace("_overlap", "")}</p>
+                  <p className="text-xs uppercase tracking-[0.2em] text-white/38">{scoreLabel(key)}</p>
                   <p className="mt-2 font-mono text-lg text-cyan-100">{scoreValue(result, key)}</p>
                 </div>
               ))}
@@ -528,6 +552,10 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       const nextChapter = chapter || resultChapter(data.results[0]) || (dashboardQuery.data?.tree[0]?.title ?? "");
       setSelectedChapter(nextChapter);
       setActiveChunkId(data.results[0]?.chunk_id ?? null);
+    },
+    onError: () => {
+      setSearchResults({ results: [], degraded_mode: false });
+      setActiveChunkId(null);
     },
   });
 
@@ -634,6 +662,10 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         onClearSource={() => setSourceType("")}
         degradedMode={Boolean(searchResults?.degraded_mode)}
       />
+
+      {searchMutation.error ? (
+        <ErrorBlock message={(searchMutation.error as Error).message || "检索请求失败，请检查模型 API、Qdrant 和后端日志。"} />
+      ) : null}
 
       <section className="grid min-h-0 items-stretch gap-6 xl:grid-cols-[minmax(360px,0.78fr)_minmax(520px,1.22fr)]">
         <ResultStream

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlparse
@@ -75,6 +76,17 @@ def _update_env_file(updates: dict[str, str | int | bool | None]) -> None:
                 next_lines.append(f"{key}={_serialize_env_value(value)}")
 
     ENV_PATH.write_text("\n".join(next_lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _apply_runtime_env(updates: dict[str, str | int | bool | None]) -> None:
+    for key, value in updates.items():
+        env_key = key.upper()
+        if value is None:
+            os.environ.pop(env_key, None)
+        elif isinstance(value, bool):
+            os.environ[env_key] = "true" if value else "false"
+        else:
+            os.environ[env_key] = str(value)
 
 
 def _env_keys(path: Path) -> tuple[set[str], list[str]]:
@@ -169,6 +181,17 @@ def _check_redis() -> bool:
     return False
 
 
+def _check_model_bridge() -> bool | None:
+    settings = get_settings()
+    parsed = urlparse(settings.openai_base_url)
+    if (parsed.hostname or "").lower() != "host.docker.internal":
+        return None
+    with suppress(Exception):
+        response = httpx.get(f"{settings.openai_base_url.rstrip('/')}/health", timeout=3.0)
+        return response.status_code == 200
+    return False
+
+
 def runtime_check_payload(
     require_reranker: bool | None = None,
     expected_model: str | None = None,
@@ -260,8 +283,11 @@ def runtime_check_payload(
         "postgres": _check_postgres(),
         "qdrant": _check_qdrant(),
         "redis": _check_redis(),
+        "model_bridge": _check_model_bridge(),
     }
     for key, ok in infrastructure.items():
+        if ok is None:
+            continue
         if not ok:
             warnings.append(
                 _runtime_issue(
@@ -311,6 +337,7 @@ def update_model_settings(payload: dict) -> dict:
 
     if updates:
         _update_env_file(updates)
+        _apply_runtime_env(updates)
         get_settings.cache_clear()
         get_settings()
     return model_settings_payload()

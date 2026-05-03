@@ -17,8 +17,8 @@ flowchart TB
         WEB
         API --> ROUTES["API Routes<br/>courses / files / ingestion / search / qa / graph / settings"]
         ROUTES --> INGEST["Ingestion Pipeline<br/>parse -> chunk -> embed -> vector upsert -> graph extraction"]
-        ROUTES --> RETRIEVAL["Retrieval Pipeline<br/>Dense recall + BM25 recall + WSF fusion + rerank"]
-        ROUTES --> AGENT["Agent QA<br/>rewrite / route / retrieve / grade / answer / trace"]
+        ROUTES --> RETRIEVAL["Retrieval Pipeline<br/>Dense recall + BM25 recall<br/>WSF when both channels hit + rerank"]
+        ROUTES --> AGENT["Agent QA<br/>analyze / route / rewrite / retrieve / grade / answer / trace"]
         ROUTES --> GRAPH["Knowledge Graph<br/>concepts / relations / chapters / node detail"]
     end
 
@@ -33,6 +33,7 @@ flowchart TB
     subgraph HOST["Host-Mounted Directories"]
         DATA["data/<br/>course files, ingestion artifacts, DB data"]
         MODELS["models/<br/>Hugging Face cache"]
+        BRIDGE["Optional Windows model bridge<br/>127.0.0.1:${MODEL_BRIDGE_PORT}<br/>curl.exe forwarding"]
     end
 
     subgraph MODEL["External Model API"]
@@ -44,7 +45,9 @@ flowchart TB
     API --> QDRANT
     API -->|"HTTP rerank via RERANKER_URL"| RERANK_CPU
     API -. "RERANKER_DEVICE=cuda" .-> RERANK_CUDA
-    API -->|"real API, fallback disabled"| LLM
+    API -->|"MODEL_BRIDGE_ENABLED=false<br/>real API, fallback disabled"| LLM
+    API -. "MODEL_BRIDGE_ENABLED=true<br/>http://host.docker.internal:${MODEL_BRIDGE_PORT}" .-> BRIDGE
+    BRIDGE -. "Windows curl.exe<br/>forwards to OPENAI_BASE_URL" .-> LLM
 
     POSTGRES --- DATA
     REDIS --- DATA
@@ -54,7 +57,7 @@ flowchart TB
     RERANK_CUDA --- MODELS
 ```
 
-The API image stays lightweight and does not include PyTorch, CUDA or `sentence-transformers`. Reranking runs in the reusable `text-reranker-runtime:*` container when `RERANKER_ENABLED=true`; CPU/CUDA selection is controlled by `RERANKER_DEVICE`.
+The API image stays lightweight and does not include PyTorch, CUDA or `sentence-transformers`. Reranking runs in the reusable `text-reranker-runtime:*` container when `RERANKER_ENABLED=true`; CPU/CUDA selection is controlled by `RERANKER_DEVICE`. Model API traffic has two mutually exclusive paths: by default the API container calls `OPENAI_BASE_URL` directly; on Windows Docker Desktop, when the host can reach the provider but Linux containers cannot complete the provider TLS handshake, `MODEL_BRIDGE_ENABLED=true` starts a host-side model bridge and points the API container to `http://host.docker.internal:${MODEL_BRIDGE_PORT}`. The bridge only forwards to the real OpenAI-compatible provider; it does not replace the model and is not fallback.
 
 ## Repository Layout
 
@@ -209,44 +212,45 @@ flowchart TB
         Q["User query"] --> QT["Query type classifier"]
         QT --> DENSE["Dense vector recall"]
         QT --> BM25["BM25 lexical recall"]
-        DENSE --> WSF["Weighted Score Fusion<br/>query-type alpha + min-max"]
+        DENSE --> WSF["Weighted Score Fusion<br/>when BM25 also hits"]
         BM25 --> WSF
+        DENSE --> DENSE_ONLY["Dense-only candidates<br/>when lexical channel has no hit"]
         WSF --> RERANK["Optional external bge-reranker<br/>HTTP runtime"]
+        DENSE_ONLY --> RERANK
         RERANK --> TOPK["Top-K chunks"]
         TOPK --> ANSWER["Chat model answer<br/>with citations"]
     end
 
     VEC --> DENSE
     DBW --> BM25
-    KG -. "pending controlled GraphRAG" .-> ONLINE
+    KG -. "multi-hop graph expansion" .-> ONLINE
 ```
 
 The primary retrieval path is:
 
 ```text
-Dense vector recall + BM25 lexical recall + WSF fusion + optional external bge-reranker rerank
+Dense vector recall + BM25 lexical recall; WSF runs when both channels hit; dense-only results skip WSF; the external bge-reranker runs when enabled.
 ```
 
 ## GraphRAG Workflow
 
-Graph construction, graph browsing and relation storage are available. GraphRAG-enhanced retrieval remains a pending upgrade and should join the primary ranking path only after semantic gating and evidence-support verification.
+Graph construction, graph browsing and relation storage are available. The current `multi_hop_research` route uses `graph_enhanced_search`: it first runs hybrid retrieval, finds seed relations from the hit chunks' `evidence_chunk_id`, expands 1-hop relations, adds related evidence chunks as candidates, and merges them back with `graph_boost`. Semantic gating and relation-evidence support verification are still planned upgrades.
 
 ```mermaid
 flowchart LR
-    BASE["Hybrid retrieval top chunks"] --> SEED["Find concepts and relations<br/>from evidence chunks"]
+    BASE["Hybrid retrieval top chunks"] --> SEED["Find seed relations<br/>by evidence_chunk_id"]
     SEED --> HOP["1-hop relation expansion"]
-    HOP --> EVIDENCE["Candidate evidence chunks"]
-    EVIDENCE --> GATE["Semantic gate<br/>query-relation-evidence support"]
-    GATE --> MERGE["Controlled merge"]
-    MERGE --> RERANK["Rerank with base candidates"]
-    RERANK --> FINAL["Final top-K context"]
+    HOP --> EVIDENCE["Related evidence chunks"]
+    EVIDENCE --> BOOST["graph_boost merge<br/>with base candidates"]
+    BOOST --> FINAL["Final top-K context"]
+    EVIDENCE -. "planned semantic gate<br/>query-relation-evidence support" .-> BOOST
 ```
 
 Upgrade principles:
 
 - Graph expansion may add candidate evidence, but it must not bypass textual evidence.
-- Relations must be supported by evidence chunks, and relation types require semantic validation.
-- Comparison and relationship questions are the first target for graph gating; definition questions use the primary retrieval path by default.
+- Relations must be supported by evidence chunks; a later upgrade will validate relation type against query intent.
+- Comparison and relationship questions enter the multi-hop retrieval path; definition questions use the primary retrieval path by default.
 
 ## Agent QA Flow
 
@@ -254,22 +258,23 @@ Upgrade principles:
 flowchart TB
     Q["User question"] --> ANALYZE["query_analyzer"]
     ANALYZE --> ROUTER["router"]
-    ROUTER -->|"direct / clarify"| ANSWER["answer_generator"]
+    ROUTER -->|"direct / clarify"| TEMPLATE["template answer<br/>no chat model call"]
     ROUTER -->|"retrieve"| REWRITE["query_rewriter"]
-    ROUTER -->|"multi-hop / relation"| MULTIHOP["multi_hop_rewriter"]
-    REWRITE --> RETRIEVE["hybrid_retriever<br/>Dense + BM25 + WSF + optional rerank"]
-    MULTIHOP --> RETRIEVE
+    ROUTER -->|"multi-hop / relation"| REWRITE
+    REWRITE --> SPLIT["split_multi_hop_query<br/>only for multi_hop_research"]
+    SPLIT --> RETRIEVE["retrievers<br/>hybrid_search_chunks or graph_enhanced_search"]
     RETRIEVE --> GRADE["document_grader"]
     GRADE -->|"insufficient, retry available"| RETRY["retry_planner"]
     RETRY --> REWRITE
     GRADE -->|"has evidence"| CONTEXT["context_synthesizer"]
-    CONTEXT --> ANSWER
+    CONTEXT --> ANSWER["answer_generator<br/>ChatProvider answer"]
+    TEMPLATE --> CITE["citation_checker"]
     ANSWER --> CITE["citation_checker"]
     CITE --> SELF["self_check"]
     SELF --> FINAL["final response + trace"]
 ```
 
-Agent runs are stored in `agent_runs`, and node events are stored in `agent_trace_events`. `/api/tasks/{run_id}` and `/api/agent/runs/{run_id}` expose run status.
+Agent runs are stored in `agent_runs`, and node events are stored in `agent_trace_events`. `/api/tasks/{run_id}` and `/api/agent/runs/{run_id}` expose run status. QA responses include `answer_model_audit`: retrieval-backed answers record `provider`, `model` and `external_called=true`; the `direct_answer` / `clarify` template branches record `skipped_reason` to make clear that the chat model was not called.
 
 ## Configuration
 
@@ -287,38 +292,45 @@ WEB_IMAGE=course-kg-web:local
 RERANKER_CPU_IMAGE=text-reranker-runtime:cpu
 RERANKER_CUDA_IMAGE=text-reranker-runtime:cuda
 
-DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/knowledge_base
+DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/course_kg
 QDRANT_URL=http://localhost:6333
 REDIS_URL=redis://localhost:6379/0
 
-OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+OPENAI_RESOLVE_IP=
 OPENAI_API_KEY=
 EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
 
+MODEL_BRIDGE_ENABLED=false
+MODEL_BRIDGE_PORT=8765
+
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 RERANKER_ENABLED=true
 RERANKER_DEVICE=cpu
+RERANKER_CANDIDATE_LIMIT=12
 
 ENABLE_MODEL_FALLBACK=false
 ENABLE_DATABASE_FALLBACK=false
 ```
 
-When `RERANKER_ENABLED=false`, retrieval returns the WSF-fused ranking directly and the reranker runtime is not started. This is not fallback. `RERANKER_DEVICE` only supports `cpu` and `cuda`, and only matters when reranking is enabled.
+The default example above targets DashScope's OpenAI-compatible endpoint, so `OPENAI_BASE_URL`, `EMBEDDING_MODEL`, `CHAT_MODEL` and `EMBEDDING_DIMENSIONS` must be treated as one matched set. When using another OpenAI-compatible provider, change all of them together and keep the embedding output dimension aligned with `EMBEDDING_DIMENSIONS`. With an empty `OPENAI_API_KEY`, Docker services can start, but upload parsing, search and QA model calls will fail; a real key is required before full-chain validation. Do not enable `ENABLE_MODEL_FALLBACK` or `ENABLE_DATABASE_FALLBACK`.
+
+When `RERANKER_ENABLED=false`, retrieval returns the WSF-fused ranking directly and the reranker runtime is not started. This is not fallback. `RERANKER_DEVICE` only supports `cpu` and `cuda`, and only matters when reranking is enabled. `RERANKER_CANDIDATE_LIMIT` caps how many WSF candidates are sent to the cross-encoder reranker; keep it lower on CPU and raise it when CUDA is available.
 
 The frontend Settings page can toggle reranking directly. Before enabling it, Web calls `/api/settings/runtime-check` to verify `.env` / `.env.example` key sync, the reranker runtime, model cache, PostgreSQL, Qdrant and Redis connectivity. If infrastructure is incomplete, the UI opens a structured error dialog with repair commands instead of silently saving a broken configuration.
 
-## Validate Existing Infrastructure
+`MODEL_BRIDGE_ENABLED=true` is only for Windows Docker Desktop environments where the host can reach the OpenAI-compatible provider but Linux containers cannot complete the provider TLS handshake. The launcher starts `infra/model-bridge/model_bridge.py` on the host and points the API container at `http://host.docker.internal:${MODEL_BRIDGE_PORT}`. The bridge forwards the original request to `OPENAI_BASE_URL` with optional `OPENAI_RESOLVE_IP`; it does not replace the model or enable fallback.
+
+## Validate Base Images
 
 ```powershell
 docker run --rm postgres:16 postgres --version
 docker run --rm redis:7 redis-server --version
 docker image inspect qdrant/qdrant:v1.13.2
-docker run --rm text-reranker-runtime:cpu python -c "import torch; print(torch.__version__)"
-docker run --rm --gpus all text-reranker-runtime:cuda python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-The CUDA check should print `True`. If it does not, verify the NVIDIA Driver and NVIDIA Container Toolkit first.
+These commands only verify that Docker can fetch PostgreSQL, Redis and Qdrant base images. `text-reranker-runtime:*` is built locally by this project; validate it after the build step below.
 
 ## Build Images
 
@@ -331,7 +343,28 @@ docker build -f infra/reranker/Dockerfile.cpu -t text-reranker-runtime:cpu infra
 docker build -f infra/reranker/Dockerfile.cuda -t text-reranker-runtime:cuda infra/reranker
 ```
 
-`text-reranker-runtime:*` is reusable infrastructure and can be shared across projects. If an equivalent image already exists, set its image name in `.env`.
+On a new machine, build at least the API, Web and CPU reranker images. Build the CUDA reranker only when `RERANKER_DEVICE=cuda`. `text-reranker-runtime:*` is reusable infrastructure and can be shared across projects. If an equivalent image already exists, set its image name in `.env`.
+
+Validate the reranker images after building them:
+
+```powershell
+docker run --rm text-reranker-runtime:cpu python -c "import torch; print(torch.__version__)"
+docker run --rm --gpus all text-reranker-runtime:cuda python -c "import torch; print(torch.cuda.is_available())"
+```
+
+The CUDA check should print `True`. If it does not, verify the NVIDIA Driver and NVIDIA Container Toolkit first.
+
+## System Python Tests
+
+The API test suite can run with system Python. Install the API dependencies first from `apps/api`:
+
+```powershell
+cd apps/api
+python -m pip install -e ".[dev]"
+python -m pytest
+```
+
+This path is for local unit tests; Docker runtime diagnostics should still use the container environment.
 
 ## Model Cache
 
@@ -361,6 +394,8 @@ Start the full application:
 .\start-app.ps1
 ```
 
+The launcher reads the repository-root `.env`, chooses the CPU/CUDA reranker path from `RERANKER_ENABLED` and `RERANKER_DEVICE`, and rewrites the API container's PostgreSQL, Qdrant, Redis and reranker URLs to Docker-network service names. Do not copy the README's host-side `localhost` database URLs into compose; compose already uses `postgres`, `qdrant`, `redis` and `reranker` inside the Docker network.
+
 Common options:
 
 ```powershell
@@ -375,7 +410,25 @@ docker compose -f infra/docker-compose.yml down
 docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down
 ```
 
+## Docker End-to-End Smoke Test
+
+After startup, run a disposable-course smoke test for the API, dependent services, database, Qdrant, reranker and real model calls:
+
+```powershell
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
+```
+
+The script creates a temporary course, uploads Markdown, parses it, runs search, runs QA, reads the session, and deletes the course. The `/api/search` response must report `model_audit.embedding_external_called=true` and `embedding_fallback_reason=null` to prove that retrieval did not use fallback.
+
+To check only Docker infrastructure connectivity:
+
+```powershell
+python scripts/docker_smoke.py --skip-model-calls
+```
+
 ## API Endpoints
+
+The FastAPI OpenAPI schema is exposed at `/openapi.json`. The table below follows the current schema and frontend call chain.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -402,7 +455,7 @@ docker compose -f infra/docker-compose.yml -f infra/docker-compose.cuda.yml down
 | GET | `/api/ingestion/batches/{batch_id}` | Ingestion batch status |
 | GET | `/api/ingestion/batches/{batch_id}/logs` | Ingestion logs over SSE |
 | GET | `/api/jobs/{job_id}` | Per-file job status |
-| POST | `/api/search` | Hybrid search |
+| POST | `/api/search` | Hybrid search with `model_audit` for query embedding calls |
 | POST | `/api/qa` | Agent QA |
 | POST | `/api/qa/stream` | Agent QA over SSE |
 | POST | `/api/agent` | Agent call |
