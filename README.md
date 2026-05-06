@@ -4,7 +4,7 @@
   <img src="./assets/diagraph-logo.svg" alt="DialoGraph 标志" width="132" height="132">
 </p>
 
-# DialoGraph
+<h1 align="center">DialoGraph</h1>
 
 面向本地课程资料的 Docker 化知识库系统。DialoGraph 将 PDF、课件、文档、网页、笔记本和图片资料解析为可检索文本块、向量索引、概念图谱和带引用的问答结果。
 

@@ -4,7 +4,7 @@
   <img src="./assets/diagraph-logo.svg" alt="DialoGraph logo" width="132" height="132">
 </p>
 
-# DialoGraph
+<h1 align="center">DialoGraph</h1>
 
 A Dockerized knowledge-base system for local course materials. DialoGraph parses PDFs, slides, documents, web pages, notebooks, and images into searchable chunks, vector indexes, concept graphs, and citation-backed answers.
 
