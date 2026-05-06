@@ -1,4 +1,5 @@
 .git/
+.playwright-cli/
 .venv/
 venv/
 node_modules/
@@ -9,11 +10,13 @@ apps/worker/.venv/
 data/
 models/
 output/
+comparative_experiment/data/
 test-results/
 playwright-report/
 blob-report/
 .env
 .env.*
+!.env.example
 *.log
 *.tmp
 *.db

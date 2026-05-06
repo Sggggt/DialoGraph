@@ -51,8 +51,8 @@ describe("api client", () => {
     await fetchRuntimeCheck();
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://api.test/api/settings/runtime-check?require_reranker=true",
-      expect.objectContaining({ headers: { "X-API-Key": "test-key" } }),
+      "http://api.test/api/settings/runtime-check",
+      expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
     );
   });
 

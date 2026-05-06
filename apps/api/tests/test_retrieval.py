@@ -107,14 +107,13 @@ async def test_hybrid_search_uses_weighted_fusion_and_rerank(db_session, sample_
             model_audit.update({"embedding_provider": "openai_compatible", "embedding_external_called": True})
         return [dense_payload]
 
-    class FakeReranker:
-        def rerank(self, query, candidates, top_k):
-            for item in candidates:
-                item.setdefault("metadata", {}).setdefault("scores", {})["rerank"] = item["score"]
-            return sorted(candidates, key=lambda item: item["score"], reverse=True)[:top_k]
+    def fake_rerank_or_return(query, candidates, top_k):
+        for item in candidates:
+            item.setdefault("metadata", {}).setdefault("scores", {})["rerank"] = item["score"]
+        return sorted(candidates, key=lambda item: item["score"], reverse=True)[:top_k]
 
     monkeypatch.setattr(retrieval, "dense_search_chunks", fake_dense_search)
-    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: FakeReranker()))
+    monkeypatch.setattr(retrieval, "rerank_or_return", fake_rerank_or_return)
 
     results = await hybrid_search_chunks(db_session, sample_course.id, "degree centrality", SearchFilters(), 2)
     result_ids = {item["chunk_id"] for item in results}
@@ -156,17 +155,12 @@ async def test_hybrid_search_can_skip_reranker(db_session, sample_course, indexe
         retrieval_recall_k_formula = 80
         reranker_enabled = False
 
-    def fail_if_called():
-        raise AssertionError("reranker should not be called when disabled")
-
     monkeypatch.setattr(retrieval, "dense_search_chunks", fake_dense_search)
     monkeypatch.setattr(retrieval, "get_settings", lambda: FakeSettings())
-    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: fail_if_called()))
 
     results = await hybrid_search_chunks(db_session, sample_course.id, "degree centrality", SearchFilters(), 2)
     assert results
-    assert all(item["metadata"]["scores"]["rerank_enabled"] is False for item in results)
-    assert all(item["metadata"]["scores"]["rerank"] is None for item in results)
+    assert all("lightweight_rerank" in item["metadata"]["scores"] for item in results)
 
 
 @pytest.mark.asyncio
@@ -189,13 +183,12 @@ async def test_search_chunks_with_audit_reports_real_query_embedding(db_session,
             assert vector == [0.1, 0.2, 0.3]
             return [{"id": chunks[0].id, "score": 0.9}]
 
-    class FakeReranker:
-        def rerank(self, query, candidates, top_k):
-            return candidates[:top_k]
+    def fake_rerank_or_return(query, candidates, top_k):
+        return candidates[:top_k]
 
     monkeypatch.setattr(retrieval.EmbeddingProvider, "embed_texts_with_meta", fake_embed)
     monkeypatch.setattr(retrieval, "VectorStore", FakeVectorStore)
-    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: FakeReranker()))
+    monkeypatch.setattr(retrieval, "rerank_or_return", fake_rerank_or_return)
 
     results, audit = await retrieval.search_chunks_with_audit(db_session, sample_course.id, "degree centrality", SearchFilters(), 1)
 
@@ -223,13 +216,12 @@ async def test_search_ignores_zero_score_dense_index_and_uses_lexical(db_session
         def search(self, *, vector, limit, filters):
             return [{"id": chunk.id, "score": 0.0} for chunk in chunks]
 
-    class PassThroughReranker:
-        def rerank(self, query, candidates, top_k):
-            return candidates[:top_k]
+    def fake_rerank_or_return(query, candidates, top_k):
+        return candidates[:top_k]
 
     monkeypatch.setattr(retrieval.EmbeddingProvider, "embed_texts_with_meta", fake_embed)
     monkeypatch.setattr(retrieval, "VectorStore", ZeroVectorStore)
-    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: PassThroughReranker()))
+    monkeypatch.setattr(retrieval, "rerank_or_return", fake_rerank_or_return)
 
     results, audit = await retrieval.search_chunks_with_audit(db_session, sample_course.id, "degree centrality", SearchFilters(), 2)
 
@@ -256,16 +248,15 @@ async def test_search_scores_include_primary_channels_for_dense_only_results(db_
         def search(self, *, vector, limit, filters):
             return [{"id": chunks[0].id, "score": 0.8}]
 
-    class FakeReranker:
-        def rerank(self, query, candidates, top_k):
-            for item in candidates:
-                item.setdefault("metadata", {}).setdefault("scores", {})["rerank"] = 0.5
-            return candidates[:top_k]
+    def fake_rerank_or_return(query, candidates, top_k):
+        for item in candidates:
+            item.setdefault("metadata", {}).setdefault("scores", {})["rerank"] = 0.5
+        return candidates[:top_k]
 
     monkeypatch.setattr(retrieval.EmbeddingProvider, "embed_texts_with_meta", fake_embed)
     monkeypatch.setattr(retrieval, "VectorStore", DenseOnlyStore)
     monkeypatch.setattr(retrieval, "lexical_search_chunks", lambda *args, **kwargs: [])
-    monkeypatch.setattr(retrieval.RerankerProvider, "get", classmethod(lambda cls: FakeReranker()))
+    monkeypatch.setattr(retrieval, "rerank_or_return", fake_rerank_or_return)
 
     results, audit = await retrieval.search_chunks_with_audit(db_session, sample_course.id, "no lexical match", SearchFilters(), 1)
 
@@ -275,3 +266,86 @@ async def test_search_scores_include_primary_channels_for_dense_only_results(db_
     assert scores["lexical"] is None
     assert scores["fused"] is None
     assert scores["rerank"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_search_expands_child_result_to_parent_context(db_session, sample_course, monkeypatch):
+    from app.models import Chunk, Document, DocumentVersion
+    from app.services import retrieval
+    from app.services.embeddings import EmbeddingCallResult
+
+    document = Document(
+        course_id=sample_course.id,
+        title="Hierarchy Notes",
+        source_path="hierarchy.md",
+        source_type="markdown",
+        tags=["L4"],
+        checksum="hierarchy",
+    )
+    db_session.add(document)
+    db_session.flush()
+    version = DocumentVersion(
+        document_id=document.id,
+        version=1,
+        checksum="hierarchy",
+        storage_path="hierarchy.md",
+        extracted_path=None,
+        is_active=True,
+    )
+    db_session.add(version)
+    db_session.flush()
+    parent = Chunk(
+        course_id=sample_course.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        content="Full parent section about graph cuts and max flow. It contains the broader explanation.",
+        snippet="Full parent section about graph cuts and max flow.",
+        chapter="L4",
+        section="Cuts",
+        source_type="markdown",
+        metadata_json={"content_kind": "markdown", "is_parent": True},
+        embedding_status="ready",
+    )
+    db_session.add(parent)
+    db_session.flush()
+    child = Chunk(
+        course_id=sample_course.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        content="A cut separates source and sink.",
+        snippet="A cut separates source and sink.",
+        chapter="L4",
+        section="Cuts",
+        source_type="markdown",
+        metadata_json={"content_kind": "markdown", "is_parent": False},
+        parent_chunk_id=parent.id,
+        embedding_status="ready",
+    )
+    db_session.add(child)
+    db_session.commit()
+
+    async def fake_embed(self, texts, text_type="document"):
+        return EmbeddingCallResult(vectors=[[0.1, 0.2, 0.3]], provider="openai_compatible", external_called=True)
+
+    class ChildOnlyStore:
+        def __init__(self, course_name):
+            self.course_name = course_name
+
+        def search(self, *, vector, limit, filters):
+            assert "is_parent" not in filters
+            return [{"id": child.id, "score": 0.9}]
+
+    monkeypatch.setattr(retrieval.EmbeddingProvider, "embed_texts_with_meta", fake_embed)
+    monkeypatch.setattr(retrieval, "VectorStore", ChildOnlyStore)
+    monkeypatch.setattr(retrieval, "lexical_search_chunks", lambda *args, **kwargs: [])
+    monkeypatch.setattr(retrieval, "rerank_or_return", lambda query, candidates, top_k: candidates[:top_k])
+
+    results, audit = await retrieval.search_chunks_with_audit(db_session, sample_course.id, "source sink cut", SearchFilters(), 1)
+
+    assert audit["embedding_external_called"] is True
+    assert results[0]["chunk_id"] == child.id
+    assert results[0]["child_content"] == "A cut separates source and sink."
+    assert results[0]["content"] == parent.content
+    assert results[0]["metadata"]["parent_chunk_id"] == parent.id
+    assert results[0]["metadata"]["parent_content"] == parent.content
+    assert results[0]["metadata"]["retrieval_granularity"] == "child_with_parent_context"

@@ -13,6 +13,21 @@ async def test_graph_enhanced_search_adds_one_hop_evidence_chunk(db_session, sam
 
     document, chunks = indexed_chunks
     version = db_session.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).first()
+    related_parent = Chunk(
+        course_id=sample_course.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        content="Full parent section comparing degree, closeness, and shortest-path centralities.",
+        snippet="Full parent section comparing centralities.",
+        chapter="L3",
+        section="Centrality",
+        source_type="markdown",
+        metadata_json={"content_kind": "markdown", "is_parent": True},
+        embedding_status="ready",
+        is_active=True,
+    )
+    db_session.add(related_parent)
+    db_session.flush()
     related_chunk = Chunk(
         course_id=sample_course.id,
         document_id=document.id,
@@ -22,7 +37,8 @@ async def test_graph_enhanced_search_adds_one_hop_evidence_chunk(db_session, sam
         chapter="L3",
         section="Centrality",
         source_type="markdown",
-        metadata_json={"content_kind": "markdown"},
+        metadata_json={"content_kind": "markdown", "is_parent": False},
+        parent_chunk_id=related_parent.id,
         embedding_status="ready",
         is_active=True,
     )
@@ -92,6 +108,11 @@ async def test_graph_enhanced_search_adds_one_hop_evidence_chunk(db_session, sam
     assert related_chunk.id in result_ids
     expanded = next(item for item in results if item["chunk_id"] == related_chunk.id)
     assert expanded["metadata"]["graph_expanded"] is True
+    assert expanded["metadata"]["parent_chunk_id"] == related_parent.id
+    assert expanded["metadata"]["parent_content"] == related_parent.content
+    assert expanded["metadata"]["retrieval_granularity"] == "child_with_parent_context"
+    assert expanded["child_content"] == related_chunk.content
+    assert expanded["content"] == related_parent.content
 
 
 @pytest.mark.asyncio

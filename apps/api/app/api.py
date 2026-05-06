@@ -66,7 +66,13 @@ from app.services.ingestion import (
 )
 from app.services.ingestion_logs import TERMINAL_LOG_EVENTS, list_ingestion_logs, subscribe_ingestion_logs, unsubscribe_ingestion_logs
 from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, cleanup_stale_graph, delete_course_data
-from app.services.retrieval import get_dashboard_snapshot, get_job_status, list_course_files, search_chunks_with_audit
+from app.services.retrieval import (
+    get_dashboard_snapshot,
+    get_job_status,
+    graph_enhanced_search,
+    list_course_files,
+    search_chunks_with_audit,
+)
 from app.services.runtime_settings import model_settings_payload, normalize_env_file, runtime_check_payload, update_model_settings
 from app.services.storage import save_upload
 
@@ -425,6 +431,21 @@ async def search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
                 ],
             },
         ) from exc
+    return {"query": request.query, "results": results, "degraded_mode": is_degraded_mode(), "model_audit": model_audit}
+
+
+@router.post("/search/graph-enhanced", response_model=SearchResponse)
+async def graph_search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
+    course = get_requested_course(db, request.course_id)
+    try:
+        results = await graph_enhanced_search(db, course.id, request.query, request.filters, request.top_k)
+    except Exception as exc:
+        message = str(exc) or type(exc).__name__
+        raise HTTPException(status_code=502, detail={"code": "graph_search_failed", "message": message}) from exc
+    model_audit = next(
+        (item.get("metadata", {}).get("model_audit") for item in results if item.get("metadata", {}).get("model_audit")),
+        {},
+    )
     return {"query": request.query, "results": results, "degraded_mode": is_degraded_mode(), "model_audit": model_audit}
 
 

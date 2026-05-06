@@ -12,10 +12,8 @@ services:
       DATA_ROOT: /app/data
       STORAGE_ROOT: /app/data/storage
       INGESTION_ROOT: /app/data/ingestion
-      OPENAI_BASE_URL: ${API_OPENAI_BASE_URL-${OPENAI_BASE_URL}}
-      OPENAI_RESOLVE_IP: ${API_OPENAI_RESOLVE_IP-${OPENAI_RESOLVE_IP}}
-      RERANKER_ENABLED: ${RERANKER_ENABLED:-false}
-      RERANKER_URL: http://reranker:8080/rerank
+      OPENAI_BASE_URL: ${API_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-https://api.openai.com/v1}}
+      OPENAI_RESOLVE_IP: ${API_OPENAI_RESOLVE_IP:-${OPENAI_RESOLVE_IP:-}}
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
     ports:
@@ -23,15 +21,24 @@ services:
     volumes:
       - ../data:/app/data
       - ../.env:/app/.env
+      - ../.env.example:/app/.env.example:ro
+      - ../data/models/huggingface:/app/models/huggingface
+      - ../apps/api/app:/app/apps/api/app
+      - ../apps/api/tests:/app/apps/api/tests
+      - ../scripts:/app/scripts
     depends_on:
-      - postgres
-      - redis
-      - qdrant
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      qdrant:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/api/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 20
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
 
   web:
     image: ${WEB_IMAGE:-course-kg-web:local}
@@ -53,6 +60,11 @@ services:
       - "5432:5432"
     volumes:
       - ../data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d course_kg"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7
@@ -63,10 +75,52 @@ services:
       - ../data/redis:/data
 
   qdrant:
-    image: qdrant/qdrant:v1.13.2
+    image: qdrant/qdrant:v1.17.1
     container_name: course-kg-qdrant
     ports:
       - "6333:6333"
       - "6334:6334"
     volumes:
-      - ../data/qdrant:/qdrant/storage
+      - qdrant-data:/qdrant/storage
+
+  experiment:
+    profiles: ["experiment"]
+    image: ${EXPERIMENT_IMAGE:-course-kg-experiment:local}
+    build:
+      context: ..
+      dockerfile: comparative_experiment/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      PROJECT_ROOT: /workspace
+      DATA_ROOT: /workspace/data
+      REPORT_OUTPUT_DIR: /workspace/comparative_experiment/data/reports
+      RAW_RESULTS_DIR: /workspace/comparative_experiment/data/raw_results
+      PREPARED_CORPUS_DIR: /workspace/comparative_experiment/data/prepared_corpus
+      API_BASE_URL: http://api:8000/api
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/course_kg
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      ENABLE_MODEL_FALLBACK: "false"
+      ENABLE_DATABASE_FALLBACK: "false"
+      EXPERIMENT_MODE: small
+      EXPERIMENT_SYSTEMS: S1,S2,S3,S4
+      JUDGE_MODEL: qwen3.6-plus
+      JUDGE_REPETITIONS: "1"
+    volumes:
+      - ../:/workspace
+      - ../.env:/workspace/.env:ro
+      - ../.env.example:/workspace/.env.example:ro
+      - ../data:/workspace/data
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      qdrant:
+        condition: service_started
+
+volumes:
+  qdrant-data:

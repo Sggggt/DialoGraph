@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+import os
 import re
 
 from pydantic import Field
@@ -46,6 +47,11 @@ class Settings(BaseSettings):
     enable_model_fallback: bool = False
     retrieval_recall_k_default: int = Field(default=64, ge=1, le=200)
     retrieval_recall_k_formula: int = Field(default=80, ge=1, le=200)
+    reranker_enabled: bool = False
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    reranker_max_length: int = Field(default=512, ge=64, le=2048)
+    semantic_chunking_enabled: bool = True
+    semantic_chunking_min_length: int = Field(default=2000, ge=500, le=5000)
     model_cache_root: Path = Field(default=WORKSPACE_ROOT / "models" / "huggingface")
 
     @property
@@ -85,6 +91,27 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
+    env_entries: dict[str, str] = {}
+    env_path = WORKSPACE_ROOT / ".env"
+    if env_path.exists():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in raw_line:
+                continue
+            key, value = raw_line.split("=", 1)
+            env_entries[key.strip().lstrip("\ufeff").upper()] = value
+
+    api_base_url = os.getenv("API_OPENAI_BASE_URL")
+    api_resolve_ip = os.getenv("API_OPENAI_RESOLVE_IP")
+    if api_base_url:
+        settings.openai_base_url = api_base_url
+    elif settings.openai_base_url == "https://api.openai.com/v1" and env_entries.get("OPENAI_BASE_URL"):
+        settings.openai_base_url = env_entries["OPENAI_BASE_URL"]
+    if api_resolve_ip is not None:
+        settings.openai_resolve_ip = api_resolve_ip
+    elif env_entries.get("OPENAI_RESOLVE_IP") is not None:
+        settings.openai_resolve_ip = env_entries.get("OPENAI_RESOLVE_IP")
+
     settings.data_root.mkdir(parents=True, exist_ok=True)
     settings.course_data_root_path.mkdir(parents=True, exist_ok=True)
     settings.storage_root_path.mkdir(parents=True, exist_ok=True)

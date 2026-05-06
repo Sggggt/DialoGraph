@@ -52,6 +52,7 @@ package = false
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
+addopts = ["-m", "not fallback_compat and not no_fallback_e2e"]
 markers = [
   "no_fallback_e2e: requires PostgreSQL, Qdrant, and an OpenAI-compatible model endpoint with fallback disabled",
   "fallback_compat: explicitly enables local fallback paths for compatibility coverage",

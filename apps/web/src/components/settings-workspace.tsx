@@ -1,10 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import type { ModelSettingsUpdate, RuntimeCheckResponse, RuntimeIssue, StructuredApiErrorBody } from "@course-kg/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  AlertTriangle,
   CheckCircle2,
   EyeOff,
   KeyRound,
@@ -12,7 +11,6 @@ import {
   PencilLine,
   RotateCcw,
   Save,
-  ServerCog,
   ShieldAlert,
   SlidersHorizontal,
   XCircle,
@@ -42,6 +40,10 @@ type SettingsForm = {
   api_key: string;
   clear_api_key: boolean;
   model_bridge_enabled: boolean;
+  reranker_enabled: boolean;
+  reranker_max_length: string;
+  semantic_chunking_enabled: boolean;
+  semantic_chunking_min_length: string;
 };
 
 type ErrorDialogState = {
@@ -82,13 +84,6 @@ function runtimeIssueDialog(check: RuntimeCheckResponse): ErrorDialogState | nul
     issues: check.blocking_issues,
     fixCommands: Array.from(new Set(check.blocking_issues.flatMap((issue) => issue.fix_commands))),
   };
-}
-
-function RuntimeStatusBadge({ check }: { check?: RuntimeCheckResponse }) {
-  if (!check) {
-    return <span className="text-white/42">未检测</span>;
-  }
-  return <span className="text-white/58">已移除</span>;
 }
 
 function ErrorDialog({ state, onClose }: { state: ErrorDialogState | null; onClose: () => void }) {
@@ -149,6 +144,7 @@ export function SettingsWorkspace() {
     if (!settingsQuery.data) {
       return;
     }
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setForm({
       base_url: settingsQuery.data.base_url,
       resolve_ip: settingsQuery.data.resolve_ip ?? "",
@@ -160,6 +156,10 @@ export function SettingsWorkspace() {
       api_key: "",
       clear_api_key: false,
       model_bridge_enabled: settingsQuery.data.model_bridge_enabled ?? false,
+      reranker_enabled: settingsQuery.data.reranker_enabled ?? false,
+      reranker_max_length: String(settingsQuery.data.reranker_max_length ?? 512),
+      semantic_chunking_enabled: settingsQuery.data.semantic_chunking_enabled ?? true,
+      semantic_chunking_min_length: String(settingsQuery.data.semantic_chunking_min_length ?? 2000),
     });
     setApiKeyEditing(false);
   }, [settingsQuery.data]);
@@ -182,16 +182,7 @@ export function SettingsWorkspace() {
   const settings = settingsQuery.data;
   const showApiKeyMask = Boolean(settings?.has_api_key && !apiKeyEditing && !form?.clear_api_key);
 
-  const statusCards = useMemo(() => {
-    if (!settings) {
-      return [];
-    }
-    return [
-      { label: "向量模型", value: settings.embedding_model },
-      { label: "对话 / 图谱模型", value: settings.chat_model },
-      { label: "精排策略", value: "LightweightRerank (零模型)" },
-    ];
-  }, [settings]);
+
 
   if (settingsQuery.isLoading || !form) {
     return <LoadingBlock rows={4} />;
@@ -208,6 +199,8 @@ export function SettingsWorkspace() {
     const dimensions = Number.parseInt(form.embedding_dimensions, 10);
     const graphChunkLimit = Number.parseInt(form.graph_extraction_chunk_limit, 10);
     const graphChunksPerDocument = Number.parseInt(form.graph_extraction_chunks_per_document, 10);
+    const rerankerMaxLength = Number.parseInt(form.reranker_max_length, 10);
+    const semanticMinLength = Number.parseInt(form.semantic_chunking_min_length, 10);
     return {
       base_url: form.base_url.trim(),
       resolve_ip: form.resolve_ip.trim() || null,
@@ -219,6 +212,10 @@ export function SettingsWorkspace() {
       api_key: form.api_key.trim() || null,
       clear_api_key: form.clear_api_key,
       model_bridge_enabled: form.model_bridge_enabled,
+      reranker_enabled: form.reranker_enabled,
+      reranker_max_length: Number.isFinite(rerankerMaxLength) ? rerankerMaxLength : undefined,
+      semantic_chunking_enabled: form.semantic_chunking_enabled,
+      semantic_chunking_min_length: Number.isFinite(semanticMinLength) ? semanticMinLength : undefined,
     };
   };
 
@@ -285,7 +282,70 @@ export function SettingsWorkspace() {
               <div className="flex flex-wrap items-center justify-between gap-4 md:col-span-2 rounded-2xl border border-white/10 bg-white/[0.035] p-5">
                 <div>
                   <p className="flex items-center gap-2 text-sm font-semibold text-white">
-                    <ServerCog className="size-4 text-cyan-100/70" />
+                    <SlidersHorizontal className="size-4 text-cyan-100/70" />
+                    Cross-Encoder 重排序
+                  </p>
+                  <p className="mt-2 text-sm leading-6 text-white/58">
+                    开启后检索阶段使用 cross-encoder 对候选结果精排（模型：{settings?.reranker_model || "cross-encoder/ms-marco-MiniLM-L-6-v2"}）。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={form.reranker_enabled}
+                  disabled={saveMutation.isPending}
+                  onClick={() => updateForm("reranker_enabled", !form.reranker_enabled)}
+                  className={`relative h-8 w-16 rounded-full border transition ${
+                    form.reranker_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
+                  } disabled:cursor-not-allowed disabled:opacity-60`}
+                >
+                  <span
+                    className={`absolute top-1 size-6 rounded-full bg-white shadow transition ${
+                      form.reranker_enabled ? "left-9" : "left-1"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <label className="flex flex-col gap-2">
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Reranker Max Length</span>
+                <Input type="number" min={64} max={2048} value={form.reranker_max_length} onChange={(event) => updateForm("reranker_max_length", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
+              </label>
+
+              <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-white/10 bg-white/[0.035] p-5">
+                <div>
+                  <p className="flex items-center gap-2 text-sm font-semibold text-white">
+                    <SlidersHorizontal className="size-4 text-cyan-100/70" />
+                    语义切块
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={form.semantic_chunking_enabled}
+                  disabled={saveMutation.isPending}
+                  onClick={() => updateForm("semantic_chunking_enabled", !form.semantic_chunking_enabled)}
+                  className={`relative h-8 w-16 rounded-full border transition ${
+                    form.semantic_chunking_enabled ? "border-cyan-100/40 bg-cyan-300/70" : "border-white/14 bg-white/10"
+                  } disabled:cursor-not-allowed disabled:opacity-60`}
+                >
+                  <span
+                    className={`absolute top-1 size-6 rounded-full bg-white shadow transition ${
+                      form.semantic_chunking_enabled ? "left-9" : "left-1"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <label className="flex flex-col gap-2">
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">语义切块最小长度</span>
+                <Input type="number" min={500} max={5000} value={form.semantic_chunking_min_length} onChange={(event) => updateForm("semantic_chunking_min_length", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
+              </label>
+
+              <div className="flex flex-wrap items-center justify-between gap-4 md:col-span-2 rounded-2xl border border-white/10 bg-white/[0.035] p-5">
+                <div>
+                  <p className="flex items-center gap-2 text-sm font-semibold text-white">
+                    <SlidersHorizontal className="size-4 text-cyan-100/70" />
                     宿主机模型桥接 (Model Bridge)
                   </p>
                   <p className="mt-2 text-sm leading-6 text-white/58">
@@ -404,18 +464,6 @@ export function SettingsWorkspace() {
             </div>
           </form>
         </div>
-      </section>
-
-      <section className="grid gap-4 lg:grid-cols-3">
-        {statusCards.map(({ label, value }) => (
-          <div key={label} className="glass-panel rounded-[24px] p-5">
-            <div className="flex items-center gap-3">
-              <ServerCog className="size-4 text-cyan-100/70" />
-              <p className="text-xs uppercase tracking-[0.24em] text-white/42">{label}</p>
-            </div>
-            <p className="mt-3 break-all text-sm text-white/72">{value}</p>
-          </div>
-        ))}
       </section>
 
       {runtimeQuery.data?.warnings.length ? (

@@ -161,7 +161,7 @@ def test_document_chapter_label_prefers_canonical_filename_over_stale_tags(sampl
     lab_document = Document(
         course_id=sample_course.id,
         title="Labs solutions",
-        source_path="data/Algorithmic GT/storage/20260425/Labs solutions.pdf",
+        source_path="fixtures/course-a/storage/20260425/Labs solutions.pdf",
         source_type="pdf",
         tags=["Labs solutions"],
         checksum="checksum",
@@ -169,14 +169,14 @@ def test_document_chapter_label_prefers_canonical_filename_over_stale_tags(sampl
     visualizer_document = Document(
         course_id=sample_course.id,
         title="graph_algorithms_visualizer",
-        source_path="data/Algorithmic GT/storage/20260425/graph_algorithms_visualizer.html",
+        source_path="fixtures/course-a/storage/20260425/graph_algorithms_visualizer.html",
         source_type="html",
         tags=["graph algorithms visualizer"],
         checksum="checksum",
     )
 
-    assert document_chapter_label(lab_document, "Algorithmic GT") == "Lab Solutions"
-    assert document_chapter_label(visualizer_document, "Algorithmic GT") == "Reference"
+    assert document_chapter_label(lab_document, "Course A") == "Lab Solutions"
+    assert document_chapter_label(visualizer_document, "Course A") == "Reference"
 
 
 def test_merge_graph_candidates_ignores_non_text_model_fields():

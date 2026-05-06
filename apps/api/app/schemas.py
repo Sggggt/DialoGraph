@@ -270,8 +270,11 @@ class ModelSettingsResponse(BaseModel):
     graph_extraction_chunks_per_document: int
     reranker_enabled: bool = False
     reranker_model: str = ""
+    reranker_max_length: int = 512
     reranker_device: str = "cpu"
     reranker_url: str = ""
+    semantic_chunking_enabled: bool = True
+    semantic_chunking_min_length: int = 2000
     has_api_key: bool
     degraded_mode: bool
 
@@ -287,6 +290,12 @@ class ModelSettingsUpdate(BaseModel):
     embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
     graph_extraction_chunk_limit: int | None = Field(default=None, ge=1, le=200)
     graph_extraction_chunks_per_document: int | None = Field(default=None, ge=1, le=10)
+    reranker_enabled: bool | None = None
+    reranker_model: str | None = None
+    reranker_max_length: int | None = Field(default=None, ge=64, le=2048)
+    reranker_device: str | None = None
+    semantic_chunking_enabled: bool | None = None
+    semantic_chunking_min_length: int | None = Field(default=None, ge=500, le=5000)
 
 
 class RuntimeIssue(BaseModel):

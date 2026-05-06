@@ -1,30 +1,49 @@
 from __future__ import annotations
 
 
-def test_env_sync_detects_and_normalizes_bom_key(tmp_path, monkeypatch):
+def test_env_sync_detects_bom_key(tmp_path, monkeypatch):
     from app.services import runtime_settings
 
     env_path = tmp_path / ".env"
     example_path = tmp_path / ".env.example"
     env_path.write_text("\ufeffDATABASE_URL=sqlite:///test.db\nRERANKER_ENABLED=true\n", encoding="utf-8")
-    example_path.write_text("DATABASE_URL=\nRERANKER_ENABLED=true\nAPI_KEYS=\n", encoding="utf-8")
+    example_path.write_text("DATABASE_URL=\nRERANKER_ENABLED=false\n", encoding="utf-8")
     monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
     monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
 
     before = runtime_settings.env_sync_status()
     assert before["bom_keys"] == ["DATABASE_URL"]
-    assert before["missing_keys"] == ["API_KEYS"]
+    assert before["missing_keys"] == []
 
     runtime_settings.normalize_env_file()
     after = runtime_settings.env_sync_status()
     assert after["bom_keys"] == []
-    assert after["missing_keys"] == []
     assert "\ufeffDATABASE_URL" not in env_path.read_text(encoding="utf-8")
-    assert "API_KEYS=" in env_path.read_text(encoding="utf-8")
 
 
-def test_runtime_check_skips_reranker_when_disabled(monkeypatch):
+def test_env_sync_detects_key_mismatch(tmp_path, monkeypatch):
     from app.services import runtime_settings
+
+    env_path = tmp_path / ".env"
+    example_path = tmp_path / ".env.example"
+    env_path.write_text("DATABASE_URL=sqlite:///test.db\nEXTRA_ONLY=true\n", encoding="utf-8")
+    example_path.write_text("DATABASE_URL=\nOPENAI_API_KEY=\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
+    monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
+
+    status = runtime_settings.env_sync_status()
+
+    assert status["synced"] is False
+    assert status["missing_keys"] == ["OPENAI_API_KEY"]
+    assert status["extra_keys"] == ["EXTRA_ONLY"]
+
+
+def test_runtime_check_skips_reranker_when_disabled(tmp_path, monkeypatch):
+    from app.services import runtime_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("RERANKER_ENABLED=false\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
 
     class Settings:
         reranker_enabled = False
@@ -51,14 +70,20 @@ def test_runtime_check_skips_reranker_when_disabled(monkeypatch):
     assert payload["blocking_issues"] == []
 
 
-def test_runtime_check_blocks_unreachable_reranker(monkeypatch):
+def test_runtime_check_reports_reranker_status(tmp_path, monkeypatch):
     from app.services import runtime_settings
+    from app.services import reranker
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("RERANKER_ENABLED=true\nRERANKER_MODEL=unit-test-reranker\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
+    monkeypatch.setattr(reranker, "_reranker_instance", None)
+    monkeypatch.setattr(reranker, "_reranker_error", None)
 
     class Settings:
         reranker_enabled = True
-        reranker_device = "cpu"
         reranker_model = "BAAI/bge-reranker-v2-m3"
-        reranker_url = "http://reranker:8080/rerank"
+        reranker_max_length = 512
         qdrant_url = "http://qdrant:6333"
         redis_url = "redis://redis:6379/0"
         openai_base_url = "https://api.openai.com/v1"
@@ -69,14 +94,17 @@ def test_runtime_check_blocks_unreachable_reranker(monkeypatch):
     monkeypatch.setattr(runtime_settings, "_check_qdrant", lambda: True)
     monkeypatch.setattr(runtime_settings, "_check_redis", lambda: True)
 
-    def raise_http(*args, **kwargs):
-        raise RuntimeError("not available")
+    def mock_load_reranker():
+        raise RuntimeError("model not available")
 
-    monkeypatch.setattr(runtime_settings.httpx, "get", raise_http)
+    monkeypatch.setattr(reranker, "_load_reranker", mock_load_reranker)
 
-    payload = runtime_settings.runtime_check_payload(require_reranker=True)
-    assert payload["blocking_issues"]
-    assert payload["blocking_issues"][0]["code"] == "reranker_unreachable"
+    payload = runtime_settings.runtime_check_payload()
+    # When reranker_enabled=True but model fails to load, enabled stays True
+    # (config says enable it, but runtime cannot load it)
+    assert payload["reranker"]["enabled"] is True
+    assert payload["reranker"]["reachable"] is False
+    assert payload["reranker"]["healthy"] is False
 
 
 def test_runtime_check_reports_model_bridge_when_configured(monkeypatch):
@@ -112,16 +140,13 @@ def test_update_model_settings_updates_current_process_env(tmp_path, monkeypatch
     from app.services import runtime_settings
 
     env_path = tmp_path / ".env"
-    example_path = tmp_path / ".env.example"
-    env_path.write_text("RERANKER_ENABLED=true\n", encoding="utf-8")
-    example_path.write_text("RERANKER_ENABLED=true\n", encoding="utf-8")
+    env_path.write_text("EMBEDDING_MODEL=text-embedding-v4\n", encoding="utf-8")
     monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
-    monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
-    monkeypatch.setenv("RERANKER_ENABLED", "true")
+    monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-v4")
     get_settings.cache_clear()
 
-    payload = runtime_settings.update_model_settings({"reranker_enabled": False})
+    payload = runtime_settings.update_model_settings({"embedding_model": "text-embedding-v3"})
 
-    assert payload["reranker_enabled"] is False
-    assert env_path.read_text(encoding="utf-8").strip() == "RERANKER_ENABLED=false"
-    assert get_settings().reranker_enabled is False
+    assert payload["embedding_model"] == "text-embedding-v3"
+    assert env_path.read_text(encoding="utf-8").strip() == "EMBEDDING_MODEL=text-embedding-v3"
+    assert get_settings().embedding_model == "text-embedding-v3"

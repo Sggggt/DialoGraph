@@ -85,6 +85,10 @@ class Chunk(Base):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     embedding_status: Mapped[str] = mapped_column(String(32), default="pending")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    parent_chunk_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("chunks.id"), nullable=True, index=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    keywords: Mapped[list[str]] = mapped_column(JSON, default=list)
+    embedding_text_version: Mapped[str] = mapped_column(String(32), default="metadata_enriched_v1")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     document: Mapped["Document"] = relationship(back_populates="chunks")

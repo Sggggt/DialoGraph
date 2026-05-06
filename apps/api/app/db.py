@@ -81,6 +81,12 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 
 
 SCHEMA_PATCHES: dict[str, dict[str, str]] = {
+    "chunks": {
+        "parent_chunk_id": "VARCHAR(36)",
+        "summary": "TEXT",
+        "keywords": "JSON DEFAULT '[]'",
+        "embedding_text_version": "VARCHAR(32) DEFAULT 'metadata_enriched_v1'",
+    },
     "concepts": {
         "normalized_name": "TEXT",
         "concept_type": "VARCHAR(64) DEFAULT 'concept'",

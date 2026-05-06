@@ -1,4 +1,5 @@
 import asyncio
+import argparse
 import json
 import os
 import time
@@ -7,15 +8,14 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-from dotenv import load_dotenv
-
-load_dotenv()
 
 API_BASE = "http://127.0.0.1:8000/api"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+if os.getenv("ENABLE_MODEL_FALLBACK", "false").lower() != "false" or os.getenv("ENABLE_DATABASE_FALLBACK", "false").lower() != "false":
+    raise RuntimeError("Quality evaluation must run with model and database fallback disabled")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not set in .env")
+    raise RuntimeError("OPENAI_API_KEY not set in the container environment")
 
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../apps/api")))
@@ -226,9 +226,18 @@ async def cleanup_sessions(sessions: list):
                 print(f"Failed to delete session {sid}: {e}")
 
 async def main():
+    parser = argparse.ArgumentParser(description="Evaluate existing course search/QA quality with a real judge model.")
+    parser.add_argument("--course-name", action="append", default=[], help="Course name to evaluate. May be passed multiple times.")
+    parser.add_argument("--max-courses", type=int, default=2, help="Maximum courses to evaluate when --course-name is omitted.")
+    args = parser.parse_args()
+
     print("Starting evaluation...")
     courses, model_settings = await check_endpoints()
-    target_courses = [c for c in courses if c["name"] in ["Complex Network", "Bayesian Statistics"]]
+    if args.course_name:
+        target_names = set(args.course_name)
+        target_courses = [c for c in courses if c["name"] in target_names]
+    else:
+        target_courses = courses[: args.max_courses]
     
     if not target_courses:
         print("Target courses not found!")

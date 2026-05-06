@@ -15,6 +15,30 @@ ENV_PATH = WORKSPACE_ROOT / ".env"
 ENV_EXAMPLE_PATH = WORKSPACE_ROOT / ".env.example"
 
 
+def read_env_str(key: str, default: str = "") -> str:
+    """直接从 .env 文件读取字符串值（热加载，绕过 os.environ 缓存）。"""
+    return _env_entries(ENV_PATH).get(key.upper(), default)
+
+
+def read_env_bool(key: str, default: bool = False) -> bool:
+    """直接从 .env 文件读取布尔值（热加载，绕过 os.environ 缓存）。"""
+    value = _env_entries(ENV_PATH).get(key.upper())
+    if value is None:
+        return default
+    return value.lower() in ("true", "1", "yes", "on")
+
+
+def read_env_int(key: str, default: int = 0) -> int:
+    """直接从 .env 文件读取整数值（热加载，绕过 os.environ 缓存）。"""
+    value = _env_entries(ENV_PATH).get(key.upper())
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 def model_settings_payload() -> dict:
     settings = get_settings()
     env_entries = _env_entries(ENV_PATH)
@@ -30,10 +54,13 @@ def model_settings_payload() -> dict:
         "embedding_dimensions": settings.embedding_dimensions,
         "graph_extraction_chunk_limit": settings.graph_extraction_chunk_limit,
         "graph_extraction_chunks_per_document": settings.graph_extraction_chunks_per_document,
-        "reranker_enabled": False,
-        "reranker_model": "",
+        "reranker_enabled": read_env_bool("RERANKER_ENABLED", settings.reranker_enabled),
+        "reranker_model": read_env_str("RERANKER_MODEL", settings.reranker_model),
+        "reranker_max_length": read_env_int("RERANKER_MAX_LENGTH", settings.reranker_max_length),
         "reranker_device": "cpu",
         "reranker_url": "",
+        "semantic_chunking_enabled": settings.semantic_chunking_enabled,
+        "semantic_chunking_min_length": settings.semantic_chunking_min_length,
         "has_api_key": bool(settings.openai_api_key),
         "degraded_mode": not settings.openai_api_key,
     }
@@ -125,26 +152,38 @@ def _env_entries(path: Path) -> dict[str, str]:
 
 
 def normalize_env_file() -> None:
-    actual = _env_entries(ENV_PATH)
-    example = _env_entries(ENV_EXAMPLE_PATH)
-    merged = dict(actual)
-    for key, value in example.items():
-        merged.setdefault(key, value)
-    if not merged:
+    """清理 .env 文件中的 BOM 前缀，不再与 .env.example 合并。
+
+    之前的实现会重写 .env 文件并依赖 .env.example，这会丢失用户注释、
+    空行和原有顺序，且 .env.example 是示例文件不应被运行时依赖。
+    现在只移除 BOM 前缀，保留文件原貌。
+    """
+    if not ENV_PATH.exists():
         return
-    lines = [f"{key}={value}" for key, value in merged.items()]
-    ENV_PATH.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    content = ENV_PATH.read_text(encoding="utf-8")
+    # 移除行首的 BOM 前缀
+    cleaned_lines = []
+    changed = False
+    for line in content.splitlines():
+        if line.startswith("\ufeff"):
+            cleaned_lines.append(line.lstrip("\ufeff"))
+            changed = True
+        else:
+            cleaned_lines.append(line)
+    if changed:
+        ENV_PATH.write_text("\n".join(cleaned_lines).rstrip() + "\n", encoding="utf-8")
 
 
 def env_sync_status() -> dict:
-    example_keys, _ = _env_keys(ENV_EXAMPLE_PATH)
+    """检查 .env 与 .env.example 的参数列表是否一致，并检测 BOM 前缀。"""
     actual_keys, bom_keys = _env_keys(ENV_PATH)
-    missing = sorted(example_keys - actual_keys)
-    extra = sorted(actual_keys - example_keys)
+    example_keys, _ = _env_keys(ENV_EXAMPLE_PATH)
+    missing_keys = sorted(example_keys - actual_keys)
+    extra_keys = sorted(actual_keys - example_keys)
     return {
-        "synced": not missing and not bom_keys,
-        "missing_keys": missing,
-        "extra_keys": extra,
+        "synced": not bom_keys and not missing_keys and not extra_keys,
+        "missing_keys": missing_keys,
+        "extra_keys": extra_keys,
         "bom_keys": sorted(set(bom_keys)),
     }
 
@@ -196,6 +235,12 @@ def _check_model_bridge() -> bool | None:
     return False
 
 
+def _reranker_runtime_status() -> dict:
+    """检测 CrossEncoder 重排序器的运行时状态（使用单例缓存，不重复加载模型）。"""
+    from app.services.reranker import get_reranker_status
+    return get_reranker_status()
+
+
 def runtime_check_payload() -> dict:
     env_sync = env_sync_status()
     blocking_issues: list[dict] = []
@@ -209,24 +254,15 @@ def runtime_check_payload() -> dict:
                 ["Open the Settings page and save once, or rewrite the affected key without the BOM prefix."],
             )
         )
-    if env_sync["missing_keys"]:
+    if env_sync["missing_keys"] or env_sync["extra_keys"]:
         blocking_issues.append(
             _runtime_issue(
-                "env_missing_keys",
-                ".env is missing keys from .env.example",
-                "The runtime environment is missing required configuration keys.",
-                ["Compare .env with .env.example and add the missing keys."],
+                "env_key_mismatch",
+                ".env and .env.example keys differ",
+                "The runtime .env parameter list must match .env.example. Values are not compared or exposed.",
+                ["Compare .env and .env.example and add/remove only key names as needed."],
             )
         )
-    if env_sync["extra_keys"]:
-        warnings.append(
-            _runtime_issue(
-                "env_extra_keys",
-                ".env has extra keys",
-                "Extra keys are ignored by the application unless explicitly supported.",
-            )
-        )
-
     infrastructure = {
         "postgres": _check_postgres(),
         "qdrant": _check_qdrant(),
@@ -247,18 +283,7 @@ def runtime_check_payload() -> dict:
             )
     return {
         "env_sync": env_sync,
-        "reranker": {
-            "enabled": False,
-            "device": "cpu",
-            "model": "",
-            "url": "",
-            "reachable": False,
-            "healthy": False,
-            "reported_model": None,
-            "reported_device": None,
-            "model_matches": None,
-            "device_matches": None,
-        },
+        "reranker": _reranker_runtime_status(),
         "infrastructure": infrastructure,
         "blocking_issues": blocking_issues,
         "warnings": warnings,
@@ -277,6 +302,11 @@ def update_model_settings(payload: dict) -> dict:
         "embedding_dimensions": "embedding_dimensions",
         "graph_extraction_chunk_limit": "graph_extraction_chunk_limit",
         "graph_extraction_chunks_per_document": "graph_extraction_chunks_per_document",
+        "reranker_enabled": "reranker_enabled",
+        "reranker_model": "reranker_model",
+        "reranker_max_length": "reranker_max_length",
+        "semantic_chunking_enabled": "semantic_chunking_enabled",
+        "semantic_chunking_min_length": "semantic_chunking_min_length",
     }
     for key, env_key in key_map.items():
         value = payload.get(key)
@@ -297,4 +327,8 @@ def update_model_settings(payload: dict) -> dict:
         _apply_runtime_env(updates)
         get_settings.cache_clear()
         get_settings()
+        # 如果 reranker 模型配置发生变化，清除单例缓存以强制重新加载
+        if "reranker_model" in updates or "reranker_max_length" in updates:
+            from app.services.reranker import clear_reranker_cache
+            clear_reranker_cache()
     return model_settings_payload()

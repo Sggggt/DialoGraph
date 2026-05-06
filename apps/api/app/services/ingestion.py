@@ -14,9 +14,9 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.utils import source_type_from_path
 from app.models import Chunk, Concept, Course, Document, DocumentVersion, IngestionBatch, IngestionCompensationLog, IngestionJob
-from app.services.chunking import EMBEDDING_TEXT_VERSION, chunk_sections_with_stats, embedding_text, normalize_for_dedup
+from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION, chunk_sections_hierarchical_async, contextual_embedding_text, normalize_for_dedup
 from app.services.concept_graph import get_concept_cards, get_graph_payload, graph_extraction_provider, rebuild_course_graph
-from app.services.embeddings import EmbeddingProvider, is_degraded_mode
+from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode, vector_norm
 from app.services.ingestion_logs import emit_ingestion_log
 from app.services.parsers import derive_chapter, parse_document, sections_to_json
 from app.services.storage import compute_checksum, copy_source_file
@@ -24,7 +24,7 @@ from app.services.vector_store import VectorStore
 
 
 ALLOWED_SUFFIXES = {".pdf", ".ipynb", ".md", ".markdown", ".txt", ".docx", ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".bmp", ".html", ".htm"}
-EXCLUDED_PARTS = {"output", "tmp", "scripts", ".ipynb_checkpoints", "__pycache__"}
+EXCLUDED_PARTS = {"output", "scripts", ".ipynb_checkpoints", "__pycache__"}
 IGNORED_NAMES = {".ds_store"}
 TERMINAL_STATES = {"completed", "failed", "partial_failed", "skipped"}
 STATE_LABELS = {
@@ -210,6 +210,16 @@ def embedding_fallback_reason() -> str | None:
     settings = get_settings()
     if not settings.openai_api_key:
         return "missing_openai_api_key"
+    return None
+
+
+def chunk_context_summary(chunk: Chunk | None, max_chars: int = 150) -> str | None:
+    if chunk is None:
+        return None
+    for value in (chunk.summary, chunk.snippet, chunk.content):
+        text_value = (value or "").strip()
+        if text_value:
+            return text_value[:max_chars]
     return None
 
 
@@ -848,12 +858,17 @@ async def _ingest_file_locked(
     extracted_json.write_text(json.dumps(sections_to_json(sections), ensure_ascii=False, indent=2), encoding="utf-8")
 
     set_job_state(db, job, "chunking", batch_id=batch_id)
-    chunk_payloads, chunking_stats = chunk_sections_with_stats(sections, chapter=chapter, source_type=source_type)
+    chunk_payloads, chunking_stats = await chunk_sections_hierarchical_async(sections, chapter=chapter, source_type=source_type)
     existing_hashes = active_chunk_hashes_for_course(db, course.id, excluded_document_id=document.id)
     seen_hashes = set(existing_hashes)
     deduplicated_chunks = 0
     created_chunks: list[Chunk] = []
+    parent_chunks_map: dict[int, Chunk] = {}
+
+    # 第一遍：创建 parent chunks
     for payload in chunk_payloads:
+        if not payload.get("is_parent"):
+            continue
         content_hash = chunk_content_hash(payload["content"])
         if content_hash in seen_hashes:
             deduplicated_chunks += 1
@@ -874,10 +889,60 @@ async def _ingest_file_locked(
             metadata_json=payload["metadata"],
             embedding_status="pending",
             is_active=False,
+            parent_chunk_id=None,
+            summary=None,
+            keywords=[],
+            embedding_text_version=CURRENT_EMBEDDING_TEXT_VERSION,
         )
         db.add(chunk)
         created_chunks.append(chunk)
+        parent_chunks_map[int(payload["parent_key"])] = chunk
+
     db.flush()
+
+    # 第二遍：创建 child chunks
+    for payload in chunk_payloads:
+        if payload.get("is_parent"):
+            continue
+        content_hash = chunk_content_hash(payload["content"])
+        if content_hash in seen_hashes:
+            deduplicated_chunks += 1
+            continue
+        seen_hashes.add(content_hash)
+        payload["metadata"]["content_hash"] = content_hash
+        parent_chunk = parent_chunks_map.get(int(payload["parent_key"]))
+        chunk = Chunk(
+            course_id=course.id,
+            document_id=document.id,
+            document_version_id=version.id,
+            content=payload["content"],
+            snippet=payload["snippet"],
+            chapter=payload["chapter"],
+            section=payload["section"],
+            page_number=payload["page_number"],
+            token_count=payload["token_count"],
+            source_type=source_type,
+            metadata_json=payload["metadata"],
+            embedding_status="pending",
+            is_active=False,
+            parent_chunk_id=parent_chunk.id if parent_chunk else None,
+            summary=None,
+            keywords=[],
+            embedding_text_version=CURRENT_EMBEDDING_TEXT_VERSION,
+        )
+        if parent_chunk is not None:
+            chunk.metadata_json["parent_chunk_id"] = parent_chunk.id
+        db.add(chunk)
+        created_chunks.append(chunk)
+
+    db.flush()
+
+    # Phase 6: 知识增强 — 为 parent chunks 生成摘要和关键词
+    parent_chunks = [c for c in created_chunks if c.metadata_json.get("is_parent")]
+    if parent_chunks:
+        chat = ChatProvider()
+        await _generate_chunk_knowledge(parent_chunks, chat)
+        db.flush()
 
     if not created_chunks:
         job.document_id = document.id
@@ -894,7 +959,7 @@ async def _ingest_file_locked(
             "chunks_before_filter": chunking_stats["chunks_before_filter"],
             "chunks_filtered": chunking_stats["chunks_filtered"],
             "chunks_deduplicated": deduplicated_chunks,
-            "embedding_text_version": EMBEDDING_TEXT_VERSION,
+            "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
             **embedding_audit_payload(configured_embedding_provider(), False, "no_effective_chunks", 0),
         }
         db.commit()
@@ -908,17 +973,56 @@ async def _ingest_file_locked(
 
     set_job_state(db, job, "embedding", batch_id=batch_id)
     embedder = EmbeddingProvider()
-    embedding_inputs = [
-        embedding_text(
-            document_title=document.title,
-            chapter=chunk.chapter,
-            section=chunk.section,
-            source_type=source_type,
-            content_kind=chunk.metadata_json.get("content_kind"),
-            content=chunk.content,
-        )
-        for chunk in created_chunks
-    ]
+
+    # 按 section 分组 child chunks，用于构建相邻上下文
+    section_children: dict[int, list[Chunk]] = {}
+    for chunk in created_chunks:
+        if not chunk.metadata_json.get("is_parent"):
+            section_index = int((chunk.metadata_json or {}).get("section_index") or 0)
+            section_children.setdefault(section_index, []).append(chunk)
+
+    embedding_inputs = []
+    for chunk in created_chunks:
+        is_parent = chunk.metadata_json.get("is_parent", False)
+        if is_parent:
+            embedding_inputs.append(
+                contextual_embedding_text(
+                    document_title=document.title,
+                    chapter=chunk.chapter,
+                    section=chunk.section,
+                    source_type=source_type,
+                    content_kind=chunk.metadata_json.get("content_kind"),
+                    content=chunk.content,
+                    summary=chunk.summary,
+                    keywords=chunk.keywords or None,
+                    has_table=chunk.metadata_json.get("has_table", False),
+                    has_formula=chunk.metadata_json.get("has_formula", False),
+                )
+            )
+        else:
+            section_index = int((chunk.metadata_json or {}).get("section_index") or 0)
+            parent_chunk = parent_chunks_map.get(section_index)
+            children = section_children.get(section_index, [])
+            child_index = next((i for i, c in enumerate(children) if c.id == chunk.id), -1)
+            prev_summary = chunk_context_summary(children[child_index - 1]) if child_index > 0 else None
+            next_summary = chunk_context_summary(children[child_index + 1]) if child_index >= 0 and child_index + 1 < len(children) else None
+            embedding_inputs.append(
+                contextual_embedding_text(
+                    document_title=document.title,
+                    chapter=chunk.chapter,
+                    section=chunk.section,
+                    source_type=source_type,
+                    content_kind=chunk.metadata_json.get("content_kind"),
+                    content=chunk.content,
+                    parent_summary=chunk_context_summary(parent_chunk, max_chars=200),
+                    prev_summary=prev_summary,
+                    next_summary=next_summary,
+                    summary=chunk.summary,
+                    keywords=chunk.keywords or None,
+                    has_table=chunk.metadata_json.get("has_table", False),
+                    has_formula=chunk.metadata_json.get("has_formula", False),
+                )
+            )
     embedding_result = await embedder.embed_texts_with_meta(embedding_inputs, text_type="document")
     embeddings = embedding_result.vectors
     emit_ingestion_log(
@@ -954,13 +1058,19 @@ async def _ingest_file_locked(
                     "difficulty": document.difficulty,
                     "content": chunk.content,
                     "content_kind": chunk.metadata_json.get("content_kind"),
-                    "embedding_text_version": EMBEDDING_TEXT_VERSION,
+                    "is_parent": chunk.metadata_json.get("is_parent", False),
+                    "parent_chunk_id": str(chunk.parent_chunk_id) if chunk.parent_chunk_id else None,
+                    "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
                 },
             }
         )
     db.commit()
 
     new_chunk_ids = [chunk.id for chunk in created_chunks]
+    # 防御：写入 Qdrant 前再次检查全零向量
+    for point in vector_points:
+        if vector_norm(point["vector"]) <= 1e-12:
+            raise RuntimeError(f"Zero vector detected for chunk {point['id']} before upsert")
     upsert_log = create_vector_compensation_log(
         db,
         course_id=course.id,
@@ -972,6 +1082,19 @@ async def _ingest_file_locked(
         vector_store.upsert(vector_points)
     except Exception as exc:
         mark_vector_compensation_log(db, upsert_log.id, "failed", str(exc))
+        raise
+    # 防御：写入 Qdrant 后验证向量
+    try:
+        written = vector_store.get_points(new_chunk_ids)
+        for point in written:
+            if vector_norm(point["vector"]) <= 1e-12:
+                raise RuntimeError(f"Zero vector detected for chunk {point['id']} after upsert")
+    except Exception as exc:
+        mark_vector_compensation_log(db, upsert_log.id, "failed", f"Vector validation after upsert failed: {exc}")
+        try:
+            vector_store.delete(new_chunk_ids)
+        finally:
+            pass
         raise
 
     try:
@@ -1044,7 +1167,7 @@ async def _ingest_file_locked(
         "chunks_before_filter": chunking_stats["chunks_before_filter"],
         "chunks_filtered": chunking_stats["chunks_filtered"],
         "chunks_deduplicated": deduplicated_chunks,
-        "embedding_text_version": EMBEDDING_TEXT_VERSION,
+        "embedding_text_version": CURRENT_EMBEDDING_TEXT_VERSION,
         **graph_stats,
         **embedding_audit_payload(
             embedding_result.provider,
@@ -1066,7 +1189,7 @@ async def _ingest_file_locked(
     }
 
 
-async def run_batch_ingestion(batch_id: str) -> dict:
+async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
     from app.db import SessionLocal
 
     session = SessionLocal()
@@ -1118,6 +1241,7 @@ async def run_batch_ingestion(batch_id: str) -> dict:
                     existing_job_id=job.id,
                     batch_id=batch.id,
                     rebuild_graph=False,
+                    force=force,
                 )
                 coverage[result.get("source_type", "unknown")] += 1
                 if result["status"] == "skipped":
@@ -1421,3 +1545,51 @@ async def run_ingestion_job(job_id: str, source_path: Path, trigger_source: str 
         raise
     finally:
         session.close()
+
+
+async def _generate_chunk_knowledge(chunks: list[Chunk], chat: ChatProvider) -> None:
+    """为 parent chunks 批量生成摘要和关键词。直接修改 chunk 对象属性。
+
+    使用 ChatProvider.classify_json 调用 LLM，批量处理（每批5个）以降低 API 调用成本。
+    生成失败时静默忽略，不影响后续 ingestion 流程。
+    """
+    if not chunks:
+        return
+
+    system_prompt = (
+        "你是一个知识提取助手。为每个提供的文本块生成一段不超过100字的中文摘要和3-5个关键词。"
+        "输出严格JSON格式：{\"results\": [{\"summary\": \"...\", \"keywords\": [\"...\"]}]}。"
+        "摘要应准确概括文本核心内容，关键词应为文本中最重要的概念或术语。"
+    )
+
+    batch_size = 5
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i : i + batch_size]
+        user_content = "\n\n---\n\n".join(
+            f"[{j + 1}] {chunk.content[:800]}" for j, chunk in enumerate(batch)
+        )
+
+        try:
+            result = await chat.classify_json(
+                system_prompt=system_prompt,
+                user_prompt=user_content,
+                fallback={"results": [{"summary": "", "keywords": []} for _ in batch]},
+            )
+            if isinstance(result, list):
+                results = result
+            elif isinstance(result, dict):
+                results = result.get("results", [])
+            else:
+                results = []
+            for chunk, item in zip(batch, results):
+                if not isinstance(item, dict):
+                    continue
+                summary = (item.get("summary") or "").strip()
+                keywords = item.get("keywords") or []
+                if summary:
+                    chunk.summary = summary[:200]
+                if isinstance(keywords, list) and keywords:
+                    chunk.keywords = [str(k).strip() for k in keywords if str(k).strip()]
+        except Exception:
+            if not get_settings().enable_model_fallback:
+                raise

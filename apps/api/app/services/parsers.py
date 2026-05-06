@@ -80,23 +80,49 @@ def parse_html(path: Path) -> list[ParsedSection]:
     return [ParsedSection(title=title, text=text, section=title, metadata={"content_kind": "html"})]
 
 
+def _detect_formula(text: str) -> bool:
+    """检测文本中是否包含大量数学符号，可能是公式。"""
+    formula_chars = set("∑∫√λθπσμ±×÷≤≥≠≈∝∂∇∆∞∈∪∩⊂⊃⟨⟩αβγδεζηικνξορστυφχψω")
+    if not text:
+        return False
+    ratio = sum(1 for c in text if c in formula_chars) / len(text)
+    return ratio > 0.03
+
+
 def parse_pdf(path: Path) -> list[ParsedSection]:
     import fitz
 
     document = fitz.open(path)
     sections: list[ParsedSection] = []
     for idx, page in enumerate(document, start=1):
-        text = page.get_text("text").strip()
+        # 优先尝试 markdown 格式以保留表格结构
+        try:
+            text = page.get_text("markdown").strip()
+        except Exception:
+            text = page.get_text("text").strip()
+
         if not text:
             continue
-        page_title = text.splitlines()[0][:120]
+
+        # 检测表格（Markdown 表格特征：包含 | 和 --- 分隔行）
+        lines = text.splitlines()
+        has_table = any("|" in line and "---" in line for line in lines)
+        has_formula = _detect_formula(text)
+
+        page_title = lines[0][:120] if lines else ""
+        metadata: dict[str, Any] = {"content_kind": "pdf_page"}
+        if has_table:
+            metadata["has_table"] = True
+        if has_formula:
+            metadata["has_formula"] = True
+
         sections.append(
             ParsedSection(
                 title=page_title or f"{path.stem} p.{idx}",
                 text=text,
                 page_number=idx,
                 section=page_title or path.stem,
-                metadata={"content_kind": "pdf_page"},
+                metadata=metadata,
             )
         )
     return sections

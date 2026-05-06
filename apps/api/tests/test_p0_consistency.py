@@ -21,6 +21,22 @@ class _FakeEmbedder:
         return _EmbeddingResult(len(texts))
 
 
+class _FakeChatProvider:
+    async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict):
+        count = max(1, user_prompt.count("\n\n---\n\n") + 1)
+        return {
+            "results": [
+                {"summary": f"Unit summary {index + 1}", "keywords": ["degree", "centrality", "graph"]}
+                for index in range(count)
+            ]
+        }
+
+
+class _ListChatProvider:
+    async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict):
+        return [{"summary": "List summary", "keywords": ["modularity", "community"]}]
+
+
 def _create_active_document(db_session, course, source_path):
     from app.models import Chunk, Document, DocumentVersion
 
@@ -84,6 +100,7 @@ async def test_vector_upsert_failure_keeps_old_chunks_active(db_session, sample_
             raise RuntimeError("qdrant unavailable")
 
     monkeypatch.setattr(ingestion, "EmbeddingProvider", _FakeEmbedder)
+    monkeypatch.setattr(ingestion, "ChatProvider", _FakeChatProvider)
     monkeypatch.setattr(ingestion, "VectorStore", FailingVectorStore)
 
     with pytest.raises(RuntimeError, match="qdrant unavailable"):
@@ -136,6 +153,7 @@ async def test_db_activation_failure_deletes_new_vectors(db_session, sample_cour
         return real_commit()
 
     monkeypatch.setattr(ingestion, "EmbeddingProvider", _FakeEmbedder)
+    monkeypatch.setattr(ingestion, "ChatProvider", _FakeChatProvider)
     monkeypatch.setattr(ingestion, "VectorStore", TrackingVectorStore)
     monkeypatch.setattr(db_session, "commit", maybe_fail_commit)
 
@@ -214,7 +232,7 @@ def test_pending_upsert_compensation_keeps_active_vectors(db_session, sample_cou
 async def test_ingest_uses_enriched_embedding_text_and_payload_marker(db_session, sample_course, monkeypatch):
     from app.core.config import get_settings
     from app.services import ingestion
-    from app.services.chunking import EMBEDDING_TEXT_VERSION
+    from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION as EMBEDDING_TEXT_VERSION
 
     source_path = get_settings().course_paths_for_name(sample_course.name)["storage_root"] / "enriched.md"
     source_path.parent.mkdir(parents=True, exist_ok=True)
@@ -236,7 +254,14 @@ async def test_ingest_uses_enriched_embedding_text_and_payload_marker(db_session
         def upsert(self, points):
             captured["points"] = points
 
+        def get_points(self, ids):
+            return [{"id": point["id"], "vector": point["vector"], "payload": point["payload"]} for point in captured["points"]]
+
+        def delete(self, ids):
+            captured["deleted"] = ids
+
     monkeypatch.setattr(ingestion, "EmbeddingProvider", CapturingEmbedder)
+    monkeypatch.setattr(ingestion, "ChatProvider", _FakeChatProvider)
     monkeypatch.setattr(ingestion, "VectorStore", CapturingVectorStore)
 
     result = await ingestion.ingest_file(db_session, source_path, course_id=sample_course.id, rebuild_graph=False)
@@ -331,7 +356,14 @@ async def test_force_ingest_rebuilds_duplicate_document_in_same_course(db_sessio
         def upsert(self, points):
             self.points.extend(points)
 
+        def get_points(self, ids):
+            return [{"id": point["id"], "vector": point["vector"], "payload": point["payload"]} for point in self.points]
+
+        def delete(self, ids):
+            self.deleted = ids
+
     monkeypatch.setattr(ingestion, "EmbeddingProvider", _FakeEmbedder)
+    monkeypatch.setattr(ingestion, "ChatProvider", _FakeChatProvider)
     monkeypatch.setattr(ingestion, "VectorStore", CapturingVectorStore)
 
     result = await ingestion.ingest_file(db_session, duplicate, course_id=sample_course.id, rebuild_graph=False, force=True)
@@ -383,7 +415,7 @@ async def test_ingest_deduplicates_chunks_and_skips_empty_effective_payload(db_s
     )
     db_session.commit()
 
-    def fake_chunk_sections(*args, **kwargs):
+    async def fake_chunk_sections(*args, **kwargs):
         return (
             [
                 {
@@ -393,17 +425,19 @@ async def test_ingest_deduplicates_chunks_and_skips_empty_effective_payload(db_s
                     "section": "Dedup",
                     "page_number": None,
                     "token_count": 9,
-                    "metadata": {"content_kind": "markdown"},
+                    "metadata": {"content_kind": "markdown", "is_parent": True, "section_index": 1},
+                    "is_parent": True,
+                    "parent_key": 1,
                 }
             ],
-            {"chunks_before_filter": 1, "chunks_filtered": 0},
+            {"chunks_before_filter": 1, "chunks_filtered": 0, "parents_created": 1, "children_created": 0},
         )
 
     class UnexpectedEmbedder(_FakeEmbedder):
         async def embed_texts_with_meta(self, texts, text_type="document"):
             raise AssertionError("fully deduplicated chunks should not be embedded")
 
-    monkeypatch.setattr(ingestion, "chunk_sections_with_stats", fake_chunk_sections)
+    monkeypatch.setattr(ingestion, "chunk_sections_hierarchical_async", fake_chunk_sections)
     monkeypatch.setattr(ingestion, "EmbeddingProvider", UnexpectedEmbedder)
 
     result = await ingestion.ingest_file(db_session, source_path, course_id=sample_course.id, rebuild_graph=False)
@@ -411,3 +445,24 @@ async def test_ingest_deduplicates_chunks_and_skips_empty_effective_payload(db_s
     assert result["status"] == "skipped"
     assert result["stats"]["chunks_deduplicated"] == 1
     assert result["stats"]["embedding_fallback_reason"] == "no_effective_chunks"
+
+
+@pytest.mark.asyncio
+async def test_generate_chunk_knowledge_accepts_json_list_response():
+    from app.models import Chunk
+    from app.services.ingestion import _generate_chunk_knowledge
+
+    chunk = Chunk(
+        course_id="course",
+        document_id="document",
+        document_version_id="version",
+        content="Modularity measures community structure quality.",
+        snippet="Modularity measures community structure quality.",
+        source_type="markdown",
+        metadata_json={"is_parent": True},
+    )
+
+    await _generate_chunk_knowledge([chunk], _ListChatProvider())
+
+    assert chunk.summary == "List summary"
+    assert chunk.keywords == ["modularity", "community"]

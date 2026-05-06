@@ -15,6 +15,8 @@ from app.schemas import Citation, SearchFilters
 from app.services.concept_graph import get_graph_payload
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode
 from app.services.parsers import derive_chapter, is_invalid_chapter_label
+from app.services.reranker import get_reranker
+from app.services.runtime_settings import read_env_bool
 from app.services.vector_store import VectorStore
 
 
@@ -34,7 +36,7 @@ STORAGE_ALLOWED_SUFFIXES = {
     ".html",
     ".htm",
 }
-STORAGE_EXCLUDED_PARTS = {"output", "tmp", "scripts", ".ipynb_checkpoints", "__pycache__"}
+STORAGE_EXCLUDED_PARTS = {"output", "scripts", ".ipynb_checkpoints", "__pycache__"}
 STORAGE_IGNORED_NAMES = {".ds_store"}
 TERMINAL_BATCH_STATES = {"completed", "failed", "partial_failed", "skipped"}
 QUERY_TYPE_CONFIG = {
@@ -145,12 +147,20 @@ def default_model_audit() -> dict:
         "embedding_model": settings.embedding_model,
         "embedding_external_called": False,
         "embedding_fallback_reason": None,
-        "reranker_enabled": False,
+        "reranker_enabled": read_env_bool("RERANKER_ENABLED", settings.reranker_enabled),
         "reranker_called": False,
         "fallback_enabled": settings.enable_model_fallback,
         "degraded_mode": is_degraded_mode(),
         "vector_index_warning": None,
     }
+
+
+def did_rerank(results: list[dict]) -> bool:
+    return any(
+        item.get("metadata", {}).get("scores", {}).get("rerank") is not None
+        or item.get("metadata", {}).get("scores", {}).get("cross_encoder") is not None
+        for item in results
+    )
 
 
 def attach_model_audit(results: list[dict], audit: dict) -> list[dict]:
@@ -160,6 +170,49 @@ def attach_model_audit(results: list[dict], audit: dict) -> list[dict]:
         for key in PRIMARY_SCORE_KEYS:
             scores.setdefault(key, None)
         metadata["model_audit"] = dict(audit)
+    return results
+
+
+def is_parent_chunk(chunk: Chunk) -> bool:
+    return bool((chunk.metadata_json or {}).get("is_parent"))
+
+
+def is_child_retrieval_candidate(chunk: Chunk) -> bool:
+    return not is_parent_chunk(chunk)
+
+
+def expand_results_with_parent_context(db: Session, course_id: str, results: list[dict]) -> list[dict]:
+    if not results:
+        return results
+    parent_ids = {
+        str(item.get("metadata", {}).get("parent_chunk_id") or "")
+        for item in results
+        if item.get("metadata", {}).get("parent_chunk_id")
+    }
+    if not parent_ids:
+        return results
+    parents = {
+        chunk.id: chunk
+        for chunk in db.scalars(
+            select(Chunk).where(
+                Chunk.id.in_(parent_ids),
+                Chunk.course_id == course_id,
+                Chunk.is_active.is_(True),
+            )
+        ).all()
+    }
+    for item in results:
+        metadata = item.setdefault("metadata", {})
+        parent_id = metadata.get("parent_chunk_id")
+        parent = parents.get(parent_id)
+        if parent is None:
+            continue
+        metadata["parent_content"] = parent.content
+        metadata["parent_snippet"] = parent.snippet
+        metadata["parent_section"] = parent.section
+        metadata["retrieval_granularity"] = "child_with_parent_context"
+        item["child_content"] = item.get("content")
+        item["content"] = parent.content
     return results
 
 
@@ -175,6 +228,10 @@ def build_search_payload(chunk: Chunk, document: Document, query: str, score: fl
         snippet=chunk.snippet,
     )
     metadata = (chunk.metadata_json or {}) | {"chapter": chunk.chapter, "source_type": chunk.source_type}
+    metadata["is_parent"] = is_parent_chunk(chunk)
+    if chunk.parent_chunk_id:
+        metadata["parent_chunk_id"] = str(chunk.parent_chunk_id)
+        metadata["retrieval_granularity"] = "child"
     if scores:
         metadata["scores"] = scores
     return {
@@ -184,6 +241,7 @@ def build_search_payload(chunk: Chunk, document: Document, query: str, score: fl
         "citations": [citation.model_dump()],
         "metadata": metadata,
         "content": chunk.content,
+        "child_content": chunk.content if chunk.parent_chunk_id else None,
         "document_title": document.title,
         "source_path": document.source_path,
         "chapter": chunk.chapter,
@@ -220,7 +278,7 @@ async def dense_search_chunks(db: Session, course_id: str, query: str, filters: 
     dense_scores: list[float] = []
     for result in results:
         chunk = db.get(Chunk, result["id"])
-        if chunk is None or chunk.course_id != course_id or not chunk.is_active:
+        if chunk is None or chunk.course_id != course_id or not chunk.is_active or not is_child_retrieval_candidate(chunk):
             continue
         document = db.get(Document, chunk.document_id)
         if document is None or document.course_id != course_id:
@@ -271,11 +329,14 @@ async def hybrid_search_chunks_with_audit(db: Session, course_id: str, query: st
             dense_results = []
     lexical_results = lexical_search_chunks(db, course_id, query, filters, recall_k)
     if not dense_results:
-        results = lightweight_rerank(query, lexical_results, top_k) if lexical_results else []
+        results = rerank_or_return(query, lexical_results, top_k) if lexical_results else []
+        model_audit["reranker_called"] = did_rerank(results)
+        results = expand_results_with_parent_context(db, course_id, results)
         return attach_model_audit(results, model_audit), model_audit
     if not lexical_results:
         results = rerank_or_return(query, dense_results, top_k)
-        model_audit["reranker_called"] = any("rerank" in item.get("metadata", {}).get("scores", {}) for item in results)
+        model_audit["reranker_called"] = did_rerank(results)
+        results = expand_results_with_parent_context(db, course_id, results)
         return attach_model_audit(results, model_audit), model_audit
 
     candidates = weighted_score_fusion(
@@ -287,7 +348,8 @@ async def hybrid_search_chunks_with_audit(db: Session, course_id: str, query: st
     for item in candidates:
         item.setdefault("metadata", {}).setdefault("scores", {})["query_type"] = config["query_type"]
     results = rerank_or_return(query, candidates, top_k)
-    model_audit["reranker_called"] = any("rerank" in item.get("metadata", {}).get("scores", {}) for item in results)
+    model_audit["reranker_called"] = did_rerank(results)
+    results = expand_results_with_parent_context(db, course_id, results)
     return attach_model_audit(results, model_audit), model_audit
 
 
@@ -313,8 +375,10 @@ def lightweight_rerank(query: str, candidates: list[dict], top_k: int) -> list[d
 
         final_score = alpha * fused_score + (1.0 - alpha) * overlap_ratio
 
-        item.setdefault("metadata", {}).setdefault("scores", {})["lightweight_rerank"] = round(final_score, 4)
-        item.setdefault("metadata", {}).setdefault("scores", {})["term_overlap_ratio"] = round(overlap_ratio, 4)
+        scores = item.setdefault("metadata", {}).setdefault("scores", {})
+        scores["lightweight_rerank"] = round(final_score, 4)
+        scores["term_overlap_ratio"] = round(overlap_ratio, 4)
+        scores["rerank"] = round(final_score, 4)
         item["score"] = final_score
         scored.append(item)
 
@@ -323,6 +387,10 @@ def lightweight_rerank(query: str, candidates: list[dict], top_k: int) -> list[d
 
 
 def rerank_or_return(query: str, candidates: list[dict], top_k: int) -> list[dict]:
+    flag = read_env_bool("RERANKER_ENABLED", get_settings().reranker_enabled)
+    if flag:
+        reranker = get_reranker()
+        return reranker.rerank(query, candidates, top_k)
     return lightweight_rerank(query, candidates, top_k)
 
 
@@ -439,7 +507,8 @@ async def graph_enhanced_search(db: Session, course_id: str, query: str, filters
         scores = item.setdefault("metadata", {}).setdefault("scores", {})
         if "graph_boost" in scores:
             item["score"] = float(item["score"]) + float(scores["graph_boost"])
-    return sorted(merged.values(), key=lambda item: item["score"], reverse=True)[:top_k]
+    ranked = sorted(merged.values(), key=lambda item: item["score"], reverse=True)[:top_k]
+    return expand_results_with_parent_context(db, course_id, ranked)
 
 
 def lexical_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
@@ -453,6 +522,8 @@ def lexical_search_chunks(db: Session, course_id: str, query: str, filters: Sear
     corpus: list[list[str]] = []
     chunk_documents: list[tuple[Chunk, Document]] = []
     for chunk, document in rows:
+        if not is_child_retrieval_candidate(chunk):
+            continue
         if filters.chapter and chunk.chapter != filters.chapter:
             continue
         if filters.source_type and chunk.source_type != filters.source_type:

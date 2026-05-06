@@ -162,6 +162,15 @@ def main() -> None:
             payload={"course_id": created_course_id, "query": "What is degree centrality?", "top_k": 3},
         )
         require(search.get("results"), f"Search returned no results: {search}")
+        first_result = search["results"][0]
+        first_metadata = first_result.get("metadata") or {}
+        if first_metadata.get("parent_chunk_id"):
+            require(
+                first_metadata.get("retrieval_granularity") == "child_with_parent_context",
+                f"Child result did not carry parent retrieval granularity: {first_result}",
+            )
+            require(first_metadata.get("parent_content"), f"Child result did not include parent_content: {first_result}")
+            require(first_result.get("child_content"), f"Child result did not preserve child_content: {first_result}")
         audit = search.get("model_audit") or {}
         require(audit.get("embedding_external_called") is True, f"Search did not report a real embedding call: {audit}")
         require(audit.get("embedding_fallback_reason") is None, f"Search used fallback: {audit}")

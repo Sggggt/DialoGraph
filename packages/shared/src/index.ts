@@ -278,8 +278,11 @@ export interface ModelSettingsResponse {
   graph_extraction_chunks_per_document: number;
   reranker_enabled: boolean;
   reranker_model: string;
+  reranker_max_length: number;
   reranker_device: "cpu" | "cuda";
   reranker_url: string;
+  semantic_chunking_enabled: boolean;
+  semantic_chunking_min_length: number;
   model_bridge_enabled: boolean;
   has_api_key: boolean;
   degraded_mode: boolean;
@@ -297,7 +300,10 @@ export interface ModelSettingsUpdate {
   graph_extraction_chunks_per_document?: number | null;
   reranker_enabled?: boolean | null;
   reranker_model?: string | null;
+  reranker_max_length?: number | null;
   reranker_device?: "cpu" | "cuda" | null;
+  semantic_chunking_enabled?: boolean | null;
+  semantic_chunking_min_length?: number | null;
   model_bridge_enabled?: boolean | null;
 }
 

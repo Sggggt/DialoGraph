@@ -52,3 +52,4 @@ apps/api/.venv/
 apps/api/.env
 apps/worker/.venv/
 apps/worker/.env
+comparative_experiment/
