@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { motion } from "framer-motion";
@@ -77,9 +78,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <AmbientCanvas />
 
       <aside className="fixed inset-y-0 left-0 z-40 hidden w-[76px] border-r border-white/7 bg-[rgba(3,7,20,0.55)] backdrop-blur-2xl lg:flex lg:flex-col lg:items-center lg:gap-7 lg:py-6">
-        <div className="grid size-11 place-items-center rounded-2xl border border-cyan-300/20 bg-cyan-300/[0.06] text-[10px] font-semibold uppercase tracking-[0.24em] text-cyan-100 shadow-[0_0_24px_rgba(85,215,255,0.08)]">
-          KG
-        </div>
+        <Image
+          src="/diagraph-logo.svg"
+          alt="DialoGraph"
+          width={44}
+          height={44}
+          className="size-11 rounded-2xl border border-white/10 shadow-[0_0_28px_rgba(255,255,255,0.12)]"
+          priority
+        />
 
         <nav className="flex flex-col gap-2">
           {navigation.map(({ href, label, caption, icon: Icon }) => {
@@ -114,10 +120,20 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <div className="relative min-h-screen lg:pl-[76px]">
         <header className="fixed inset-x-0 top-0 z-30 border-b border-white/6 bg-[rgba(3,7,20,0.78)] backdrop-blur-2xl lg:left-[76px]">
           <div className="flex flex-wrap items-center justify-between gap-4 px-5 py-3 lg:px-7">
-            <div className="min-w-0">
-              <p className="text-[10px] uppercase tracking-[0.34em] text-cyan-100/42">课程知识库</p>
-              <h1 className="mt-1 break-words text-lg font-semibold text-white lg:text-xl">本地课程智能检索台</h1>
-              <p className="mt-1 text-xs text-white/45">{selectedCourse?.name ?? "选择课程空间"}</p>
+            <div className="flex min-w-0 items-center gap-3">
+              <Image
+                src="/diagraph-logo.svg"
+                alt="DialoGraph"
+                width={44}
+                height={44}
+                className="size-11 shrink-0 rounded-2xl border border-white/10 shadow-[0_0_28px_rgba(255,255,255,0.1)] lg:hidden"
+                priority
+              />
+              <div className="min-w-0">
+                <p className="text-[10px] uppercase tracking-[0.34em] text-cyan-100/42">课程知识库</p>
+                <h1 className="mt-1 break-words text-lg font-semibold text-white lg:text-xl">本地课程智能检索台</h1>
+                <p className="mt-1 text-xs text-white/45">{selectedCourse?.name ?? "选择课程空间"}</p>
+              </div>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-2">
               <div className="relative">

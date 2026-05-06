@@ -7,6 +7,11 @@ import { Providers } from "@/components/providers";
 export const metadata: Metadata = {
   title: "课程知识库",
   description: "将课程材料转为可检索、可溯源、可问答的本地知识库",
+  icons: {
+    icon: "/icon.svg",
+    shortcut: "/icon.svg",
+    apple: "/icon.svg",
+  },
 };
 
 export default function RootLayout({

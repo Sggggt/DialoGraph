@@ -1,0 +1,14 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DialoGraph logo">
+  <rect width="256" height="256" rx="44" fill="#020202"/>
+  <path d="M62 128C62 91.55 91.55 62 128 62C164.45 62 194 91.55 194 128C194 164.45 164.45 194 128 194" stroke="white" stroke-width="12" stroke-linecap="round"/>
+  <path d="M91 82C124 107 151 143 165 183" stroke="white" stroke-width="8" stroke-linecap="round" opacity="0.92"/>
+  <path d="M74 147C111 134 149 116 181 86" stroke="white" stroke-width="8" stroke-linecap="round" opacity="0.92"/>
+  <path d="M82 178C113 173 143 155 172 124" stroke="white" stroke-width="6" stroke-linecap="round" opacity="0.76"/>
+  <circle cx="91" cy="82" r="11" fill="white"/>
+  <circle cx="181" cy="86" r="11" fill="white"/>
+  <circle cx="172" cy="124" r="9" fill="white"/>
+  <circle cx="74" cy="147" r="9" fill="white"/>
+  <circle cx="165" cy="183" r="11" fill="white"/>
+  <circle cx="82" cy="178" r="8" fill="white"/>
+  <circle cx="128" cy="62" r="6" fill="white" opacity="0.82"/>
+</svg>
