@@ -85,6 +85,7 @@ export interface SearchResult {
   citations: Citation[];
   metadata: Record<string, unknown>;
   content?: string | null;
+  child_content?: string | null;
   document_title?: string | null;
   source_path?: string | null;
   chapter?: string | null;
@@ -226,20 +227,13 @@ export interface CleanupStaleGraphResponse {
 }
 
 export interface RebuildGraphResponse {
-  graph_rebuilt: boolean;
-  concepts: number;
-  relations: number;
-  graph_nodes: number;
-  graph_edges: number;
-  graph_extraction_provider: string;
-  graph_extraction_chunk_limit: number;
-  graph_extraction_chunks_per_document: number;
-  graph_llm_selected_chunks: number;
-  graph_llm_source_documents: number;
-  graph_llm_success_chunks: number;
-  graph_llm_failed_chunks: number;
-  graph_total_active_chunks: number;
-  graph_source_documents: number;
+  batch_id: string;
+  state: string;
+}
+
+export interface BatchLogTokenResponse {
+  token: string;
+  expires_at: string;
 }
 
 export interface DeleteCourseResponse {
@@ -362,6 +356,9 @@ export interface RelatedConcept {
   relation_type: string;
   target_name: string;
   confidence?: number | null;
+  weight?: number | null;
+  relation_source?: string | null;
+  is_inferred?: boolean;
 }
 
 export interface ConceptCard {
@@ -383,6 +380,12 @@ export interface GraphNode {
   chapter?: string | null;
   importance_score?: number | null;
   source_type?: string | null;
+  evidence_count?: number | null;
+  community_louvain?: number | null;
+  community_spectral?: number | null;
+  component_id?: number | null;
+  centrality_score?: number | null;
+  graph_rank_score?: number | null;
 }
 
 export interface GraphEdge {
@@ -392,6 +395,11 @@ export interface GraphEdge {
   confidence?: number | null;
   category?: string | null;
   evidence_chunk_id?: string | null;
+  weight?: number | null;
+  semantic_similarity?: number | null;
+  support_count?: number | null;
+  relation_source?: string | null;
+  is_inferred?: boolean;
 }
 
 export interface GraphResponse {
@@ -487,6 +495,11 @@ export interface GraphNodeRelation {
   target_concept_id?: string | null;
   target_name: string;
   confidence: number;
+  weight?: number | null;
+  semantic_similarity?: number | null;
+  support_count?: number | null;
+  relation_source?: string | null;
+  is_inferred?: boolean;
   evidence?: Citation | null;
 }
 
@@ -499,5 +512,11 @@ export interface GraphNodeDetail {
   chapter_refs: string[];
   concept_type: string;
   importance_score: number;
+  evidence_count: number;
+  community_louvain?: number | null;
+  community_spectral?: number | null;
+  component_id?: number | null;
+  centrality: Record<string, number>;
+  graph_rank_score: number;
   relations: GraphNodeRelation[];
 }

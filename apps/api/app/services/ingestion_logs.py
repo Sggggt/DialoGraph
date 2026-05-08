@@ -1,16 +1,45 @@
 from __future__ import annotations
 
 import queue
+import secrets
 import uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 
 TERMINAL_LOG_EVENTS = {"batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_missing"}
 _HISTORY_LIMIT = 500
+_LOG_TOKEN_TTL_SECONDS = 600
 _history: dict[str, list[dict[str, Any]]] = defaultdict(list)
 _subscribers: dict[str, list[queue.Queue[dict[str, Any]]]] = defaultdict(list)
+_log_stream_tokens: dict[str, dict[str, Any]] = {}
+
+
+def _cleanup_log_stream_tokens(now: datetime | None = None) -> None:
+    current = now or datetime.utcnow()
+    expired = [token for token, payload in _log_stream_tokens.items() if payload["expires_at"] <= current]
+    for token in expired:
+        _log_stream_tokens.pop(token, None)
+
+
+def create_log_stream_token(batch_id: str, ttl_seconds: int = _LOG_TOKEN_TTL_SECONDS) -> dict[str, Any]:
+    _cleanup_log_stream_tokens()
+    expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+    token = secrets.token_urlsafe(32)
+    _log_stream_tokens[token] = {"batch_id": batch_id, "expires_at": expires_at}
+    return {"token": token, "expires_at": expires_at}
+
+
+def validate_log_stream_token(batch_id: str, token: str | None) -> None:
+    _cleanup_log_stream_tokens()
+    if not token:
+        raise ValueError("Missing log stream token")
+    payload = _log_stream_tokens.get(token)
+    if not payload:
+        raise ValueError("Invalid or expired log stream token")
+    if payload["batch_id"] != batch_id:
+        raise ValueError("Log stream token is not valid for this batch")
 
 
 def _jsonable_payload(payload: dict[str, Any]) -> dict[str, Any]:

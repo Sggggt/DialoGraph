@@ -47,9 +47,10 @@ async def api_key_auth(request: Request, call_next):
     path = request.url.path
     if path in {"/api/health", "/docs", "/openapi.json", "/redoc"}:
         return await call_next(request)
+    if request.method == "GET" and path.startswith("/api/ingestion/batches/") and path.endswith("/logs"):
+        if request.query_params.get("token"):
+            return await call_next(request)
     provided = request.headers.get("x-api-key")
-    if not provided:
-        provided = request.query_params.get("api_key")
     if not provided:
         authorization = request.headers.get("authorization", "")
         if authorization.lower().startswith("bearer "):

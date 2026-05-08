@@ -50,6 +50,32 @@ async def test_openai_compatible_embeddings_reject_zero_vectors(no_fallback_env,
 
 
 @pytest.mark.asyncio
+async def test_openai_compatible_embeddings_retry_without_dimensions(no_fallback_env, monkeypatch):
+    from app.core.config import get_settings
+    from app.services import embeddings
+    from app.services.embeddings import EmbeddingProvider
+
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "2")
+    get_settings.cache_clear()
+    payloads: list[dict] = []
+
+    async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
+        payloads.append(dict(payload))
+        if "dimensions" in payload:
+            raise RuntimeError("InvalidParameter: dimensions is not supported")
+        return {"data": [{"embedding": [1.0, 0.0]}]}
+
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
+
+    result = await EmbeddingProvider().embed_texts_with_meta(["text"])
+
+    assert len(payloads) == 2
+    assert payloads[0]["dimensions"] == 2
+    assert "dimensions" not in payloads[1]
+    assert result.vectors == [[1.0, 0.0]]
+
+
+@pytest.mark.asyncio
 async def test_openai_compatible_request_retries_transient_errors(no_fallback_env, monkeypatch):
     from app.services import embeddings
 
@@ -78,6 +104,39 @@ async def test_openai_compatible_request_retries_transient_errors(no_fallback_en
 
     assert result == {"ok": True}
     assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_request_retries_read_timeout(no_fallback_env, monkeypatch):
+    import httpx
+
+    from app.services import embeddings
+
+    calls = 0
+
+    def flaky_curl(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("")
+        return {"ok": True}
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(embeddings, "_post_json_with_curl_resolve", flaky_curl)
+    monkeypatch.setattr(embeddings.asyncio, "sleep", no_sleep)
+
+    result = await embeddings.post_openai_compatible_json(
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        {"model": "unit-test"},
+        {"Authorization": "Bearer unit-test", "Content-Type": "application/json"},
+        timeout=1,
+        resolve_ip="127.0.0.1",
+    )
+
+    assert result == {"ok": True}
+    assert calls == 2
 
 
 @pytest.mark.asyncio
@@ -142,3 +201,83 @@ async def test_answer_prompt_enforces_latex_markdown_format(no_fallback_env, mon
     assert "\\frac{k_i}{n - 1}" in system_prompt
     assert "variables are not attached to neighboring words" in user_prompt
     assert result.answer.startswith("Use $$")
+
+
+@pytest.mark.asyncio
+async def test_chat_json_response_format_falls_back_to_prompt_only(no_fallback_env, monkeypatch):
+    from app.services import embeddings
+    from app.services.embeddings import ChatProvider
+
+    response_formats: list[object] = []
+
+    async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
+        response_formats.append(payload.get("response_format"))
+        if payload.get("response_format"):
+            raise RuntimeError("InvalidParameter: response_format is not supported")
+        return {"choices": [{"message": {"content": '{"route":"retrieve_notes"}'}}]}
+
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
+
+    result = await ChatProvider().classify_json("Return JSON.", "Classify.", fallback={})
+
+    assert response_formats == [{"type": "json_object"}, None]
+    assert result == {"route": "retrieve_notes"}
+
+
+@pytest.mark.asyncio
+async def test_graph_json_schema_falls_back_to_json_object_then_prompt_only(no_fallback_env, monkeypatch):
+    from app.services import embeddings
+    from app.services.embeddings import ChatProvider
+
+    response_formats: list[object] = []
+
+    async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
+        response_formats.append(payload.get("response_format"))
+        if payload.get("response_format"):
+            raise RuntimeError("InvalidParameter: response_format is not supported")
+        return {"choices": [{"message": {"content": '{"concepts":[],"relations":[]}'}}]}
+
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
+
+    result = await ChatProvider().extract_graph_payload("Graph material", "L1", "pdf")
+
+    assert [item.get("type") if isinstance(item, dict) else None for item in response_formats] == ["json_schema", "json_object", None]
+    assert result == {"concepts": [], "relations": []}
+
+
+@pytest.mark.asyncio
+async def test_chat_content_parts_are_normalized(no_fallback_env, monkeypatch):
+    from app.services import embeddings
+    from app.services.embeddings import ChatProvider
+
+    async def fake_post_json(url, payload, headers, *, timeout, resolve_ip=None):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Part one "},
+                            {"type": "text", "text": {"value": "part two"}},
+                        ]
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(embeddings, "post_openai_compatible_json", fake_post_json)
+
+    result = await ChatProvider().answer_question_with_meta(
+        "Question",
+        [
+            {
+                "document_title": "Doc",
+                "chapter": "L1",
+                "content": "Evidence",
+                "snippet": "Evidence",
+                "metadata": {},
+            }
+        ],
+        [],
+    )
+
+    assert result.answer == "Part one part two"

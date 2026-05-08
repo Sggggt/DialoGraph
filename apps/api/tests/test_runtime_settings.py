@@ -135,6 +135,28 @@ def test_runtime_check_reports_model_bridge_when_configured(monkeypatch):
     assert payload["warnings"] == []
 
 
+def test_settings_routes_compose_model_calls_through_bridge(monkeypatch, tmp_path):
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("MODEL_BRIDGE_PORT", "8766")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    monkeypatch.setenv("OPENAI_RESOLVE_IP", "1.2.3.4")
+    monkeypatch.delenv("API_OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("API_OPENAI_RESOLVE_IP", raising=False)
+    get_settings.cache_clear()
+
+    settings = get_settings()
+
+    assert settings.openai_base_url == "http://host.docker.internal:8766"
+    assert settings.openai_resolve_ip == "__none__"
+    assert settings.model_bridge_enabled is True
+
+    get_settings.cache_clear()
+
+
 def test_update_model_settings_updates_current_process_env(tmp_path, monkeypatch):
     from app.core.config import get_settings
     from app.services import runtime_settings

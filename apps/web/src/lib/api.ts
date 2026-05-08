@@ -1,11 +1,11 @@
 import type {
   AgentResponse,
   AgentTraceEventPayload,
+  BatchLogTokenResponse,
   BatchStartResponse,
   CleanupStaleDataResponse,
   CleanupStaleGraphResponse,
   ConceptCard,
-  RebuildGraphResponse,
   CourseFileSummary,
   CourseCreateRequest,
   CourseSummary,
@@ -165,12 +165,12 @@ export async function cleanupStaleGraph(courseId?: string | null): Promise<Clean
   return parseResponse<CleanupStaleGraphResponse>(response);
 }
 
-export async function rebuildGraph(courseId?: string | null): Promise<RebuildGraphResponse> {
+export async function rebuildGraph(courseId?: string | null): Promise<BatchStartResponse> {
   const response = await fetch(buildApiUrl("/maintenance/rebuild-graph", { course_id: courseId }), {
     method: "POST",
     headers: authHeaders(),
   });
-  return parseResponse<RebuildGraphResponse>(response);
+  return parseResponse<BatchStartResponse>(response);
 }
 
 export async function fetchGraph(courseId?: string | null): Promise<GraphResponse> {
@@ -241,8 +241,16 @@ export async function parseUploadedFiles(filePaths: string[], courseId?: string 
   return parseResponse<BatchStartResponse>(response);
 }
 
-export function getBatchLogUrl(batchId: string): string {
-  return buildApiUrl(`/ingestion/batches/${batchId}/logs`, { api_key: API_KEY });
+export async function createBatchLogToken(batchId: string): Promise<BatchLogTokenResponse> {
+  const response = await fetch(buildApiUrl(`/ingestion/batches/${batchId}/log-token`), {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return parseResponse<BatchLogTokenResponse>(response);
+}
+
+export function getBatchLogUrl(batchId: string, token: string): string {
+  return buildApiUrl(`/ingestion/batches/${batchId}/logs`, { token });
 }
 
 export async function fetchJobStatus(jobId: string): Promise<JobStatusResponse> {

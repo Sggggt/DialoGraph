@@ -64,11 +64,23 @@ def build_graph_judge_evidence(db: Session, course_id: str, sample_limit: int = 
         "relation_count": relation_count,
         "concepts_per_100_chunks": round((concept_count / max(chunk_count, 1)) * 100, 2),
         "relations_per_concept": round(relation_count / max(concept_count, 1), 2),
+        "community_count": len({item.community_louvain for item in all_concepts if item.community_louvain is not None}),
+        "mean_graph_rank_score": round(
+            sum(float(getattr(item, "graph_rank_score", 0.0) or 0.0) for item in all_concepts) / max(len(all_concepts), 1),
+            4,
+        ),
         "chapter_ref_counts": dict(chapter_counter),
         "invalid_chapter_refs": invalid_refs,
         "documents": [{"title": item.title, "tags": item.tags, "source_path": item.source_path} for item in documents[:sample_limit]],
         "concepts": [
-            {"name": item.canonical_name, "chapter_refs": item.chapter_refs, "importance_score": item.importance_score}
+            {
+                "name": item.canonical_name,
+                "chapter_refs": item.chapter_refs,
+                "importance_score": item.importance_score,
+                "community_louvain": getattr(item, "community_louvain", None),
+                "evidence_count": getattr(item, "evidence_count", 0),
+                "graph_rank_score": getattr(item, "graph_rank_score", 0.0),
+            }
             for item in concepts
         ],
         "sample_chunks": [

@@ -17,7 +17,7 @@ def make_chunk(chunk_id: str, document_id: str, content: str, content_kind: str 
     )
 
 
-def test_choose_llm_graph_chunks_spreads_across_documents():
+def test_choose_llm_graph_chunks_spreads_across_documents(no_fallback_env):
     from app.services.concept_graph import choose_llm_graph_chunks
 
     chunks = [
@@ -34,7 +34,7 @@ def test_choose_llm_graph_chunks_spreads_across_documents():
     assert len({chunk.document_id for chunk in chunks if chunk.id in selected}) == 3
 
 
-def test_choose_llm_graph_chunks_fills_remaining_slots():
+def test_choose_llm_graph_chunks_fills_remaining_slots(no_fallback_env):
     from app.services.concept_graph import choose_llm_graph_chunks
 
     chunks = [
@@ -131,10 +131,91 @@ async def test_rebuild_course_graph_reports_real_llm_selection_stats(db_session,
     assert stats["graph_llm_selected_chunks"] == 5
     assert stats["graph_llm_success_chunks"] == 5
     assert stats["graph_llm_source_documents"] == 3
+    assert stats["graph_probe_chunks"] == 3
+    assert stats["graph_probe_success_chunks"] == 3
+    assert stats["graph_probe_failed_chunks"] == 0
     refreshed_document = db_session.scalar(select(Document).where(Document.title == "Lecture 1"))
     refreshed_chunk = db_session.scalar(select(Chunk).where(Chunk.document_id == refreshed_document.id))
     assert refreshed_document.tags == ["Lecture 1"]
     assert refreshed_chunk.chapter == "Lecture 1"
+
+
+def test_choose_graph_probe_chunks_samples_short_middle_long():
+    from app.services.concept_graph import choose_graph_probe_chunks
+
+    chunks = [
+        make_chunk("short", "doc-a", "x"),
+        make_chunk("middle", "doc-a", "x" * 50),
+        make_chunk("long", "doc-a", "x" * 100),
+        make_chunk("tiny", "doc-a", "xx"),
+        make_chunk("wide", "doc-a", "x" * 75),
+    ]
+
+    probes = choose_graph_probe_chunks(chunks)
+
+    assert [chunk.id for chunk in probes] == ["short", "middle", "long"]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_course_graph_fails_fast_when_probe_fails(db_session, sample_course, monkeypatch):
+    from app.core.config import get_settings
+    from app.models import Chunk, Document, DocumentVersion
+    from app.services import concept_graph
+
+    monkeypatch.setenv("GRAPH_EXTRACTION_CHUNK_LIMIT", "5")
+    monkeypatch.setenv("GRAPH_EXTRACTION_CHUNKS_PER_DOCUMENT", "2")
+    get_settings.cache_clear()
+
+    document = Document(
+        course_id=sample_course.id,
+        title="Lecture 1",
+        source_path="Lecture 1.pdf",
+        source_type="pdf",
+        tags=["Lecture 1"],
+        checksum="checksum-probe",
+    )
+    db_session.add(document)
+    db_session.flush()
+    version = DocumentVersion(
+        document_id=document.id,
+        version=1,
+        checksum=document.checksum,
+        storage_path=document.source_path,
+        extracted_path=None,
+        is_active=True,
+    )
+    db_session.add(version)
+    db_session.flush()
+    for index in range(5):
+        db_session.add(
+            Chunk(
+                course_id=sample_course.id,
+                document_id=document.id,
+                document_version_id=version.id,
+                content=f"Bayesian graph probe failure {index} " * 20,
+                snippet="Bayesian graph probe failure",
+                chapter="Lecture 1",
+                section="Topic",
+                source_type="pdf",
+                metadata_json={"content_kind": "pdf_page"},
+                embedding_status="ready",
+            )
+        )
+    db_session.commit()
+
+    calls = 0
+
+    async def fake_extract_payloads(chunks, concurrency=4):
+        nonlocal calls
+        calls += 1
+        return {}, {chunk.id: "ReadTimeout: ReadTimeout('')" for chunk in chunks}
+
+    monkeypatch.setattr(concept_graph, "extract_llm_graph_payloads", fake_extract_payloads)
+
+    with pytest.raises(RuntimeError, match="轻量预检失败"):
+        await concept_graph.rebuild_course_graph(db_session, sample_course.id)
+
+    assert calls == 1
 
 
 def test_invalid_chapter_refs_are_not_added_to_concepts(db_session, sample_course):
@@ -254,6 +335,37 @@ def test_merge_graph_candidates_treats_non_mapping_payload_as_empty():
     assert merged["relations"] == []
 
 
+def test_validate_graph_payload_drops_relations_with_unknown_endpoints():
+    from app.services.concept_graph import validate_graph_payload
+
+    payload, warnings = validate_graph_payload(
+        {
+            "concepts": [
+                {"name": "Bayesian Inference", "aliases": [], "summary": "", "concept_type": "concept", "importance_score": 0.8}
+            ],
+            "relations": [
+                {
+                    "source": "Bayesian Inference",
+                    "target": "Missing Concept",
+                    "relation_type": "relates_to",
+                    "confidence": 0.9,
+                }
+            ],
+        }
+    )
+
+    assert payload["relations"] == []
+    assert payload["_validation_warnings"] == warnings
+    assert "Missing Concept" in warnings[0]
+
+
+def test_validate_graph_payload_rejects_bad_shape():
+    from app.services.concept_graph import validate_graph_payload
+
+    with pytest.raises(ValueError, match="schema validation failed"):
+        validate_graph_payload({"concepts": "not-a-list", "relations": []})
+
+
 @pytest.mark.asyncio
 async def test_extract_llm_graph_payloads_isolates_chunk_failures(monkeypatch):
     from app.services import concept_graph
@@ -277,6 +389,126 @@ async def test_extract_llm_graph_payloads_isolates_chunk_failures(monkeypatch):
     assert set(payloads) == {"ok"}
     assert set(errors) == {"bad"}
     assert "model timeout" in errors["bad"]
+
+
+@pytest.mark.asyncio
+async def test_extract_llm_graph_payloads_records_validation_failures(monkeypatch):
+    from app.services import concept_graph
+
+    class FakeChatProvider:
+        async def extract_graph_payload(self, text, chapter, source_type):
+            return {"concepts": "bad", "relations": []}
+
+    monkeypatch.setattr(concept_graph, "ChatProvider", FakeChatProvider)
+
+    payloads, errors = await concept_graph.extract_llm_graph_payloads([make_chunk("bad-shape", "doc-a", "content")])
+
+    assert payloads == {}
+    assert set(errors) == {"bad-shape"}
+    assert "schema validation failed" in errors["bad-shape"]
+
+
+@pytest.mark.asyncio
+async def test_extract_llm_graph_payloads_keeps_relation_warning_out_of_failures(monkeypatch):
+    from app.services import concept_graph
+
+    class FakeChatProvider:
+        async def extract_graph_payload(self, text, chapter, source_type):
+            return {
+                "concepts": [{"name": "Bayesian Inference"}],
+                "relations": [
+                    {
+                        "source": "Bayesian Inference",
+                        "target": "Missing Concept",
+                        "relation_type": "relates_to",
+                        "confidence": 0.9,
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(concept_graph, "ChatProvider", FakeChatProvider)
+
+    payloads, errors = await concept_graph.extract_llm_graph_payloads([make_chunk("warn", "doc-a", "content")])
+
+    assert errors == {}
+    assert payloads["warn"]["relations"] == []
+    assert "Missing Concept" in payloads["warn"]["_validation_warnings"][0]
+
+
+@pytest.mark.asyncio
+async def test_recover_existing_graph_algorithm_metrics_commits_success():
+    from app.services.ingestion import recover_existing_graph_algorithm_metrics
+
+    class FakeSession:
+        def __init__(self):
+            self.commits = 0
+            self.rollbacks = 0
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    async def fake_enricher(session, course_id):
+        assert course_id == "course-a"
+        return {"graph_algorithm_nodes": 2}
+
+    session = FakeSession()
+    stats = await recover_existing_graph_algorithm_metrics(session, "course-a", enricher=fake_enricher)
+
+    assert stats == {"graph_algorithm_recovered_existing": True, "graph_algorithm_nodes": 2}
+    assert session.commits == 1
+    assert session.rollbacks == 0
+
+
+@pytest.mark.asyncio
+async def test_recover_existing_graph_algorithm_metrics_reports_failure():
+    from app.services.ingestion import recover_existing_graph_algorithm_metrics
+
+    class FakeSession:
+        def __init__(self):
+            self.commits = 0
+            self.rollbacks = 0
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    async def fake_enricher(session, course_id):
+        raise RuntimeError("graph unavailable")
+
+    session = FakeSession()
+    stats = await recover_existing_graph_algorithm_metrics(session, "course-a", enricher=fake_enricher)
+
+    assert stats["graph_algorithm_recovered_existing"] is False
+    assert "graph unavailable" in stats["graph_algorithm_recovery_error"]
+    assert session.commits == 0
+    assert session.rollbacks == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_provider_repairs_invalid_graph_json(no_fallback_env, monkeypatch):
+    from app.services.embeddings import ChatProvider
+
+    calls = []
+
+    async def fake_post_chat_text(self, payload):
+        calls.append(payload)
+        if len(calls) == 1:
+            return "Here is the graph: not-json"
+        return '{"concepts":[{"name":"Bayesian Inference","aliases":[],"summary":"","concept_type":"concept","importance_score":0.8}],"relations":[]}'
+
+    monkeypatch.setattr(ChatProvider, "_post_chat_text", fake_post_chat_text)
+
+    payload = await ChatProvider().extract_graph_payload("Bayesian inference updates beliefs.", "Lecture 1", "pdf")
+
+    assert payload["concepts"][0]["name"] == "Bayesian Inference"
+    assert len(calls) == 2
+    assert calls[0]["response_format"]["type"] == "json_schema"
+    assert calls[1]["temperature"] == 0.0
 
 
 def test_sync_graph_chapter_labels_normalizes_existing_refs(db_session, sample_course):

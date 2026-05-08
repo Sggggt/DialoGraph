@@ -1,4 +1,4 @@
-**English** | [Chinese](./README.md)
+**English** | [中文](./README.md)
 
 <p align="center">
   <img src="./assets/diagraph-logo.svg" alt="DialoGraph logo" width="132" height="132">
@@ -6,168 +6,86 @@
 
 <h1 align="center">DialoGraph</h1>
 
-A Dockerized knowledge-base system for local course materials. DialoGraph parses PDFs, slides, documents, web pages, notebooks, and images into searchable chunks, vector indexes, concept graphs, and citation-backed answers.
+DialoGraph is a Dockerized knowledge infrastructure system for local course materials. It parses PDFs, slides, documents, web pages, notebooks, images, and Markdown into searchable text chunks, Qdrant vectors, PostgreSQL sparse knowledge graphs, and citation-backed answers.
 
-> The default stack runs on real PostgreSQL, Qdrant, Redis, and an OpenAI-compatible model API. Model fallback and database fallback are disabled by default; quality evaluation and production runs do not use fake embeddings, extractive substitute answers, or local JSON retrieval substitutes.
+The default runtime uses real PostgreSQL, Qdrant, Redis, and an OpenAI-compatible model API. Model fallback and database fallback are disabled by default; production-quality validation does not use zero vectors, fake embeddings, local JSON retrieval, or extractive substitute answers.
 
 ## At A Glance
 
-| Area | Current Implementation |
+| Area | Implementation |
 | --- | --- |
 | Runtime | Docker Compose, full-stack containers |
-| Backend | FastAPI, container system Python, no virtual environment |
-| Frontend | Next.js, connected through the API service |
-| Database | PostgreSQL 16 for courses, files, chunks, graphs, and QA records |
+| Backend | FastAPI, Pydantic, SQLAlchemy, NetworkX |
+| Frontend | Next.js 16.2.4, React 19, TypeScript, TanStack Query, ECharts |
+| Database | PostgreSQL 16 for courses, file versions, chunks, graphs, QA sessions, and traces |
 | Vector Store | Qdrant 1.17.1, collection `knowledge_chunks` |
-| Cache And Tasks | Redis 7 |
-| Model API | OpenAI-compatible endpoint for embeddings, chat, and graph extraction |
-| Retrieval | Child recall, fusion, rerank, then parent context assembly |
-| Graph | Concepts, aliases, relations, and evidence chunk links |
-| Quality Gate | No fallback, no zero vectors, DB/vector count consistency |
+| Cache And Coordination | Redis 7 |
+| Model API | OpenAI-compatible Embedding / Chat API |
+| Retrieval | Child chunk dense + BM25 recall, fusion, rerank, then parent context assembly |
+| Graph | LLM candidates, chunk-vector semantic graph, graph algorithms for sparse construction, deduplication, communities, centrality, and hidden links |
 
 ## Technology Stack
 
 | Layer | Technology | Role |
 | --- | --- | --- |
-| Frontend | Next.js, React, TypeScript | Course management, ingestion UI, search, QA, graph browsing, runtime settings |
-| API | FastAPI, Pydantic, SQLAlchemy | REST APIs, validation, transactions, ingestion tasks, agent orchestration |
-| Database | PostgreSQL 16 | Courses, file versions, chunks, graphs, QA sessions, execution traces |
-| Vector Search | Qdrant 1.17.1 | Parent/child vector storage, dense recall, vector health checks |
-| Lexical Search | PostgreSQL text data + `rank_bm25` | Child BM25 recall and lexical matching |
-| Cache And Tasks | Redis 7 | Runtime cache, task coordination, service dependency |
-| Parsing | PyMuPDF, PPTX/DOCX parsers, Markdown/HTML/Notebook parsers | Convert heterogeneous course files into structured sections and text |
-| Model API | OpenAI-compatible embedding/chat API | Embeddings, summaries, keywords, concept extraction, relation extraction, answer generation |
-| Reranking | Lightweight reranker, optional Cross-Encoder | Reorder fused retrieval candidates by relevance |
+| Frontend | Next.js 16.2.4, React 19, TypeScript, TanStack Query, ECharts | Course management, upload and ingestion UI, search, QA, graph browsing, runtime settings |
+| API | FastAPI, Pydantic, SQLAlchemy | REST / SSE APIs, typed validation, transaction orchestration, ingestion, retrieval, and QA orchestration |
+| Graph Algorithms | NetworkX, NumPy, SciPy | Sparse construction, connected components, Louvain, spectral clustering, centrality, Dijkstra hidden links |
+| Database | PostgreSQL 16 | Courses, file versions, chunks, graphs, QA sessions, traces, and compensation records |
+| Vector Search | Qdrant 1.17.1 | Parent / child chunk vectors, dense recall, vector health checks |
+| Lexical Search | PostgreSQL text data, BM25 | Child chunk lexical recall and hybrid fusion |
+| Cache And Coordination | Redis 7 | Runtime cache, task coordination, service dependency |
+| Parsing | PyMuPDF, PPTX / DOCX / Markdown / HTML / Notebook parsers, OCR path | Convert heterogeneous course files into structured sections and text |
+| Model API | OpenAI-compatible Embedding / Chat API | Embeddings, summaries, keywords, entity candidates, relation candidates, answer generation |
+| Reranking | Lightweight reranker, optional Cross-Encoder | Reorder fused candidates by relevance |
 | Deployment | Docker Compose | Fixed service boundaries, dependency versions, local persistence |
-| Testing | pytest, container system Python | Backend tests, pipeline tests, no-fallback quality gates |
-
-## System Architecture
-
-```mermaid
-flowchart TB
-    USER["User Browser"] --> WEB["Web App<br/>course-kg-web"]
-    WEB -->|"HTTP / SSE"| API["API Service<br/>course-kg-api"]
-
-    subgraph APP["Application Layer"]
-        API --> ROUTES["API Routes<br/>courses / files / ingestion / search / QA / graph / settings"]
-        ROUTES --> INGEST["Ingestion Pipeline<br/>parse -> chunk -> knowledge augmentation -> vector upsert -> graph extraction"]
-        ROUTES --> SEARCH["Retrieval Pipeline<br/>child recall -> fusion -> rerank -> parent context"]
-        ROUTES --> AGENT["Agent QA<br/>analyze -> route -> retrieve -> grade evidence -> answer -> trace"]
-        ROUTES --> GRAPH["Knowledge Graph<br/>concepts / relations / evidence / node details"]
-    end
-
-    subgraph INFRA["Infrastructure"]
-        POSTGRES[("PostgreSQL 16<br/>metadata, chunks, graph, QA records")]
-        QDRANT[("Qdrant 1.17.1<br/>vector collection knowledge_chunks")]
-        REDIS[("Redis 7<br/>tasks and runtime cache")]
-    end
-
-    subgraph STORAGE["Host Persistence"]
-        DATA["data/<br/>course files, parser artifacts, database data"]
-        MODEL_CACHE["data/models/huggingface<br/>reranker model cache"]
-    end
-
-    subgraph MODEL["External Model API"]
-        LLM["OpenAI-compatible endpoint<br/>embeddings / chat / graph extraction"]
-    end
-
-    API --> POSTGRES
-    API --> QDRANT
-    API --> REDIS
-    API -->|"OPENAI_BASE_URL"| LLM
-    API --- DATA
-    API --- MODEL_CACHE
-    POSTGRES --- DATA
-    REDIS --- DATA
-```
+| Testing | pytest, Vitest, Next build, Docker smoke | Behavioral regression, frontend/backend contracts, no-fallback quality gates |
 
 ## Core Capabilities
 
 | Capability | Description |
 | --- | --- |
 | Multi-format parsing | Supports PDF, PPT/PPTX, DOCX, Markdown, TXT, Notebook, HTML, and image materials |
-| Parent-child chunking | Parent chunks preserve full context; child chunks handle precise recall and reranking |
-| Contextual embedding text | Embedding input includes metadata, parent summaries, neighbor summaries, keywords, table markers, and formula markers |
-| Hybrid retrieval | Qdrant child dense recall fused with PostgreSQL child lexical recall |
-| Reranking | Lightweight reranking by default, with optional Cross-Encoder reranking |
-| Graph enhancement | Concepts and relations are linked through evidence chunks for relation, comparison, and multi-hop questions |
-| Observable QA | Agent traces, retrieval audits, model call audits, and citations are recorded |
-| Runtime checks | Health, runtime configuration, fallback status, and reranker status are exposed |
+| Parent-child chunking | Parent chunks keep full context; child chunks drive precise recall, reranking, and evidence citation |
+| Semantic chunking | Long text is split by structure, semantic boundaries, sentence boundaries, and length limits; embedding similarity can assist boundary selection |
+| Context-enriched vectors | Embedding input includes file metadata, chapter, parent summary, neighboring child summaries, keywords, table markers, and formula markers |
+| Hybrid retrieval | Qdrant child dense recall is fused with child BM25 recall before reranking |
+| Graph enhancement | Graph relations must link back to evidence chunks; the graph expands retrieval signals instead of replacing evidence |
+| Graph-theoretic construction | Sparse graphs, communities, centrality, Dijkstra, and relation completion reduce noise and preserve key structure |
+| Observable QA | Retrieval audits, model-call audits, agent traces, citations, and failure reasons are stored |
+| Runtime checks | Health checks, runtime checks, fallback state, Qdrant status, and model endpoint status are exposed |
 
-## Core Algorithms
-
-### Hierarchical Chunking
-
-DialoGraph uses a parent-child chunk structure to handle the context span problem in course materials:
-
-1. Parsers convert source files into `ParsedSection` objects while preserving chapter, page, source type, table, and formula metadata.
-2. Each structured section creates one parent chunk containing the complete section or natural paragraph.
-3. Each parent chunk is split into child chunks for precise recall and reranking.
-4. Markdown and Notebook files follow heading hierarchy; ordinary long text follows semantic boundaries, sentence boundaries, and safe length limits.
-5. When `SEMANTIC_CHUNKING_ENABLED=true` and text length reaches `SEMANTIC_CHUNKING_MIN_LENGTH`, the system can use embedding-similarity semantic splitting.
-
-This design avoids the weak recall of overly large chunks and the context loss of overly small chunks.
-
-### Context-Enriched Embeddings
-
-Child vectors are not built from child text alone. `contextual_embedding_text()` builds context-enriched embedding input:
-
-```text
-file metadata
-chapter and source type
-child content
-parent summary or parent content
-neighboring child summaries
-keywords
-table and formula markers
-```
-
-Parent chunks keep their own content, summary, and keywords. Child chunks inherit parent summary and include neighboring child summaries, reducing context loss in fine-grained chunks. The current embedding text version is `contextual_enriched_v2`.
-
-### Small-To-Big Retrieval
-
-The main retrieval path follows small-to-big retrieval:
+## System Architecture
 
 ```mermaid
-flowchart LR
-    Q["Query"] --> DENSE["Child Dense Recall"]
-    Q --> BM25["Child BM25 Recall"]
-    DENSE --> FUSION["Weighted Fusion"]
-    BM25 --> FUSION
-    FUSION --> RERANK["Rerank"]
-    RERANK --> PARENT["Load Parent By parent_chunk_id"]
-    PARENT --> RESULT["Child Evidence + Parent Context"]
+flowchart TB
+    USER["User Browser"] --> WEB["Next.js Web<br/>course-kg-web"]
+    WEB -->|"HTTP / SSE"| API["FastAPI<br/>course-kg-api"]
+
+    subgraph APP["Application Layer"]
+        API --> INGEST["Ingestion Pipeline<br/>parse -> parent/child chunk -> augment -> vector upsert"]
+        API --> RETRIEVAL["Retrieval Pipeline<br/>dense/BM25 -> fusion -> rerank -> parent context"]
+        API --> GRAPH["Graph Pipeline<br/>LLM candidates -> vector similarity graph -> sparse graph -> communities/centrality/inference"]
+        API --> QA["Observable QA<br/>route -> retrieve -> grade evidence -> answer -> citation check"]
+    end
+
+    subgraph STORE["Storage And Runtime"]
+        PG[("PostgreSQL<br/>metadata, chunks, sparse graph, audit records")]
+        QD[("Qdrant<br/>chunk vectors and similarity recall")]
+        RD[("Redis<br/>runtime cache and task coordination")]
+        FS["data/<br/>course files, parser artifacts, local persistence"]
+    end
+
+    subgraph MODEL["Model API"]
+        LLM["OpenAI-compatible endpoint<br/>embedding / chat / graph extraction"]
+    end
+
+    API --> PG
+    API --> QD
+    API --> RD
+    API --> FS
+    API --> LLM
 ```
-
-Algorithm details:
-
-- Qdrant and BM25 recall child chunks by default, avoiding parent/child competition in the same candidate pool.
-- Dense and lexical results are combined by weighted score fusion; dense-only hits remain valid when lexical recall has no match.
-- Reranking operates on fused child candidates.
-- Final results attach `parent_content` through `parent_chunk_id`, giving the answer model complete local context.
-- Result metadata includes `retrieval_granularity=child_with_parent_context`, rerank scores, and model-call audit fields.
-
-### Graph-Enhanced Retrieval
-
-The graph is used to expand evidence candidates, not to replace textual evidence:
-
-1. Run hybrid retrieval to get text candidates.
-2. Use hit chunks and `evidence_chunk_id` to find related concepts and relations.
-3. Expand one-hop relations and collect relation evidence chunks.
-4. Merge relation evidence back into candidates with `graph_boost`.
-5. Rerank and attach parent context through the same final path.
-
-This keeps graph expansion grounded in text evidence and avoids generating answers from unsupported graph links.
-
-### Agent QA
-
-Agent QA decomposes retrieval-augmented answering into observable steps:
-
-```text
-question analysis -> routing -> query rewriting -> retrieval -> evidence grading -> context synthesis -> answer generation -> citation check -> self-check
-```
-
-Each node writes execution traces, so the frontend can show the current node, retrieved evidence, model audit, and final citations.
 
 ## Data Flow
 
@@ -182,36 +100,198 @@ sequenceDiagram
     participant Model as Model API
 
     User->>Web: Upload or select course files
-    Web->>API: Create ingestion task
-    API->>Files: Store original file
-    API->>DB: Create document, version, batch, and job records
-    API->>API: Parse files and create parent/child chunks
+    Web->>API: Create ingestion batch
+    API->>DB: Create batch, job, document/version state
+    API->>Files: Store original file and parser artifacts
+    API->>API: Parse chapters, pages, tables, formulas, and Notebook cells
+    API->>API: Create parent/child chunks and context-enriched text
     API->>Model: Generate summaries, keywords, and embeddings
-    API->>Vector: Upsert parent and child vectors
-    API->>DB: Activate chunks and document version
-    API->>Model: Extract concepts and relations
-    API->>DB: Store graph and evidence links
-    API-->>Web: Stream ingestion logs and final status
+    API->>Vector: Upsert active chunk vectors
+    API->>DB: Activate document version and chunks
+    API->>Model: Extract entity/relation candidates
+    API->>API: Run sparse graph construction, communities, centrality, and inference
+    API->>DB: Store concepts, relations, evidence, and graph-algorithm fields
+    API-->>Web: Stream logs, progress, retry, and failure state over SSE
 ```
 
-Ingestion uses explicit transactions and file-level locks. Each course has at most one non-terminal ingestion batch at a time. Qdrant write failures are recorded for compensation, and startup checks interrupted batches.
+Ingestion uses explicit batch / job state and file-level locks. A course keeps at most one non-terminal ingestion batch at a time. PostgreSQL is the source of truth for lifecycle state; Qdrant and Redis are derived or runtime stores. Failures record compensation or actionable error context instead of silently degrading.
+
+## Ingestion, Chunking, And Vectors
+
+### Hierarchical Chunking
+
+1. Parsers convert source files into `ParsedSection` objects while preserving chapter, page, source type, table, formula, Notebook cell, and image OCR metadata.
+2. Each structured section creates a parent chunk that preserves the full section, page span, or natural semantic segment.
+3. Parent chunks are split into child chunks for precise recall, reranking, and evidence localization.
+4. Markdown and Notebook files prefer heading and cell hierarchy; ordinary long text uses semantic boundaries, sentence boundaries, and safe length limits.
+5. When `SEMANTIC_CHUNKING_ENABLED=true` and text length reaches `SEMANTIC_CHUNKING_MIN_LENGTH`, embedding similarity can assist chunk boundary selection.
+
+### Context-Enriched Embeddings
+
+Child vectors are not built from child text alone. `contextual_embedding_text()` builds context-enriched input:
+
+```text
+file metadata
+chapter, page, and source type
+child chunk content
+parent summary or parent content
+neighboring child summaries
+keywords
+table, formula, and content-kind markers
+```
+
+Parent chunks keep their own text, summary, and keywords. Child chunks inherit parent semantic summaries and neighboring context, reducing context loss in fine-grained chunks. The current embedding text version is `contextual_enriched_v2`.
+
+### Deduplication And Idempotency
+
+Ingestion detects duplicates by course, normalized title, and checksum. Unchanged files are skipped with `unchanged_checksum`; duplicate copies with the same normalized title and checksum are skipped with `duplicate_document`, avoiding duplicate chunks and vectors. Forced reingestion regenerates document versions, chunks, Qdrant vectors, and graph candidates.
+
+## Graph Construction
+
+DialoGraph builds graphs with an evidence-first policy: the LLM produces candidate entities and explicit relations, while chunk vectors and graph algorithms decide the final structure. PostgreSQL is the source of truth for the sparse graph; Qdrant provides chunk vectors and similarity signals.
+
+```mermaid
+flowchart LR
+    CHUNK["Active child chunks"] --> VEC["Qdrant chunk vectors"]
+    CHUNK --> LLM["LLM entity/relation candidates"]
+    LLM --> ENTITY["Concept merge<br/>alias and duplicate reduction"]
+    VEC --> CENTROID["Concept vector centroid"]
+    ENTITY --> SPARSE["Dynamic R-NN + K-NN sparse graph"]
+    CENTROID --> SPARSE
+    SPARSE --> CC["Connected components<br/>noise ablation"]
+    CC --> COMM["Louvain + spectral communities"]
+    COMM --> CENTRAL["Centrality ranking"]
+    CENTRAL --> DIJK["Dijkstra hidden links"]
+    DIJK --> COMPLETE["Traversal + prompt relation completion"]
+    COMPLETE --> PG["PostgreSQL graph tables"]
+    PG --> UI["Community-aware graph UI"]
+```
+
+### 1. Entities And Evidence
+
+Each concept stores a canonical name, aliases, chapter references, importance, and evidence chunk count. Concept vectors are not generated from names. They are centroids of supporting chunk vectors:
+
+$$
+\mathbf{v}_e = \frac{1}{|C_e|}\sum_{c \in C_e}\mathbf{v}_c
+$$
+
+$C_e$ is the set of active child chunks supporting entity $e$. The centroid is normalized before semantic graph construction.
+
+### 2. Dynamic R-NN + K-NN Sparse Graph
+
+Each concept dynamically chooses outgoing candidates from its evidence volume:
+
+$$
+K_i = \operatorname{clamp}(4 + \lfloor \log_2(1 + m_i) \rfloor, 4, 12)
+$$
+
+Each concept dynamically limits accepted reciprocal candidates from chapter coverage:
+
+$$
+R_i = \operatorname{clamp}(2 + \lfloor \log_2(1 + r_i) \rfloor, 2, 8)
+$$
+
+$m_i$ is evidence chunk count and $r_i$ is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reciprocal cap, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
+
+### 3. Edge Weights And Graph Algorithms
+
+Edge weight combines LLM confidence, semantic similarity, evidence support, and structural consistency:
+
+$$
+w_{ij}=0.45c_{ij}^{llm}+0.30s_{ij}^{sem}+0.15s_{ij}^{evidence}+0.10s_{ij}^{structure}
+$$
+
+When no explicit LLM relation exists, $c_{ij}^{llm}=0$. The final $w_{ij}$ is clipped to $[0,1]$. The graph stage runs:
+
+- Connected-component ablation: removes isolated, low-evidence, low-importance noise while preserving enough course nodes.
+- Louvain community detection: primary community labels and frontend color groups.
+- Spectral clustering: secondary partitions for large components and large communities.
+- Centrality: degree, weighted degree, PageRank, betweenness, closeness, and a combined `centrality_score`.
+- Graph simplification: keeps central nodes, community representatives, bridge edges, and high-evidence concepts.
+
+### 4. Hidden Links And Relation Completion
+
+Dijkstra searches 2-3 hop hidden relations on a non-negative cost graph:
+
+$$
+cost_{ij}=\frac{1}{0.05+w_{ij}}
+$$
+
+If endpoint semantic similarity is high and path cost is low, the system writes a `relates_to` edge with `relation_source="dijkstra_inferred"` and uses the path score to repair weak existing weights. The system then extracts evidence snippets from two-hop neighborhoods around high-centrality nodes and asks the LLM to complete only evidence-supported relations.
+
+The frontend colors graph nodes by Louvain community, sizes nodes by centrality and graph rank, and renders inferred edges as dashed lines. Users can filter communities and open key entity details quickly.
+
+## Retrieval And QA
+
+```mermaid
+flowchart LR
+    Q["Question"] --> DENSE["child dense recall"]
+    Q --> BM25["child BM25 recall"]
+    DENSE --> FUSION["weighted fusion"]
+    BM25 --> FUSION
+    FUSION --> RERANK["rerank"]
+    RERANK --> PARENT["load parent_chunk_id"]
+    PARENT --> ANSWER["answer with citations"]
+    Q -. "multi-hop / relation intent" .-> GRAPH["graph-enhanced evidence expansion"]
+    GRAPH --> RERANK
+```
+
+Retrieval recalls child chunks by default, avoiding parent/child competition inside one candidate pool. Final results attach parent context through `parent_chunk_id` and keep dense, BM25, fused, rerank, graph boost, and model audit metadata.
+
+Graph-enhanced retrieval does not replace text evidence. It starts from retrieved chunks, finds related concepts and relations, merges relation evidence chunks back into candidates, then reranks and cites through the same answer path.
+
+### Small-To-Big Retrieval
+
+The main retrieval path sends only child chunks through recall and reranking, then attaches parent context:
+
+```text
+child dense recall + child BM25 recall
+-> weighted fusion
+-> rerank
+-> load parent_chunk_id
+-> child evidence + parent context + citations
+```
+
+This avoids both coarse recall from overly large chunks and missing context from tiny chunks. Retrieval results carry `retrieval_granularity=child_with_parent_context`, dense score, BM25 score, fused score, rerank score, graph boost, and model audit fields.
+
+### Agent QA
+
+The QA path is split into observable nodes:
+
+```text
+question analysis -> routing -> query rewriting -> retrieval -> evidence grading -> context synthesis -> answer generation -> citation check -> self-check
+```
+
+Each node writes `agent_trace_events`, including node name, status, input/output summaries, candidate documents, scores, duration, and error information. Answers must include real chunk citations; the graph only enhances evidence candidates and does not produce unsupported conclusions.
+
+## Technical Advantages
+
+| Advantage | Detail |
+| --- | --- |
+| Evidence-first | Answers, relations, and graph expansion return to real chunks and parent context |
+| Context and precision | Child chunks provide precise recall; parent chunks provide complete explanation context |
+| Controlled graph structure | R-NN + K-NN caps edge growth, while components and communities reduce noise |
+| Course-material aware | Preserves chapters, pages, formulas, tables, Notebook cells, and source types |
+| Auditable | Stores batch/job/log state, model calls, retrieval scores, fallback state, and citations |
+| Recoverable | PostgreSQL stores lifecycle state; Qdrant / Redis can be repaired from durable records |
+| No silent degradation | Missing models, database, or Qdrant fail fast with actionable error context |
+| Extensible | Reranking, semantic chunking, graph enhancement, and model endpoints are isolated by configuration and service layers |
 
 ## Data Model
 
 ```mermaid
 erDiagram
     Course ||--o{ Document : has
-    Course ||--o{ Concept : has
-    Course ||--o{ IngestionBatch : has
-    Course ||--o{ QASession : has
     Document ||--o{ DocumentVersion : versions
     DocumentVersion ||--o{ Chunk : chunks
     Chunk ||--o{ Chunk : children
+    Course ||--o{ Concept : has
     Concept ||--o{ ConceptAlias : aliases
     Concept ||--o{ ConceptRelation : source
     Concept ||--o{ ConceptRelation : target
+    Course ||--o{ IngestionBatch : batches
     IngestionBatch ||--o{ IngestionJob : jobs
-    IngestionJob ||--o{ IngestionCompensationLog : compensations
+    Course ||--o{ QASession : sessions
     QASession ||--o{ AgentRun : runs
     AgentRun ||--o{ AgentTraceEvent : traces
 ```
@@ -219,65 +299,14 @@ erDiagram
 | Table | Purpose |
 | --- | --- |
 | `courses` | Course workspace |
-| `documents` / `document_versions` | File metadata and file versions |
-| `chunks` | Parent chunks, child chunks, summaries, keywords, vector status, and evidence text |
-| `concepts` / `concept_aliases` / `concept_relations` | Concepts, aliases, relations, and evidence chunk links |
-| `ingestion_batches` / `ingestion_jobs` | Batch ingestion and per-file jobs |
-| `ingestion_logs` / `ingestion_compensation_logs` | SSE logs and compensation records |
-| `qa_sessions` / `agent_runs` / `agent_trace_events` | QA sessions, agent runs, and node traces |
-
-## Chunking And Embeddings
-
-| Stage | Behavior |
-| --- | --- |
-| Structural parsing | Extracts chapters, pages, tables, formulas, cells, and image text by file type |
-| Parent chunk creation | Preserves complete sections or natural paragraphs for answer context |
-| Child chunk creation | Splits parent chunks by semantic boundaries, sentence boundaries, and safe length limits |
-| Knowledge augmentation | Generates summaries, keywords, and content-kind markers |
-| Embedding input | Built by `contextual_embedding_text()` as context-enriched text |
-| Version marker | Current embedding text version is `contextual_enriched_v2` |
-
-Retrieval only sends child chunks through recall and reranking, then attaches parent metadata:
-
-```text
-parent_chunk_id
-parent_content
-retrieval_granularity=child_with_parent_context
-```
-
-## Retrieval And QA
-
-```mermaid
-flowchart LR
-    Q["User Question"] --> ANALYZE["Question Analysis"]
-    ANALYZE --> DENSE["Child Dense Recall"]
-    ANALYZE --> LEXICAL["Child Lexical Recall"]
-    DENSE --> FUSION["Weighted Fusion"]
-    LEXICAL --> FUSION
-    FUSION --> RERANK["Rerank"]
-    RERANK --> CONTEXT["Attach Parent Context"]
-    CONTEXT --> ANSWER["Generate Answer And Citations"]
-    ANALYZE -. "relation, comparison, multi-hop" .-> GRAPH["Graph-Enhanced Retrieval"]
-    GRAPH --> RERANK
-```
-
-| Path | Use Case | Output |
-| --- | --- | --- |
-| Hybrid retrieval | Definitions, formulas, examples, factual questions | Child evidence, parent context, rerank scores |
-| Graph-enhanced retrieval | Relation, comparison, and multi-hop questions | Text evidence, related concepts, relation evidence |
-| Agent QA | Questions that need analysis, rewriting, evidence grading, and tracing | Answer, citations, model audit, node trace |
-
-## Technical Advantages
-
-| Advantage | Practical Effect |
-| --- | --- |
-| Balanced context and precision | Child chunks provide precise recall; parent chunks provide complete context, reducing both vague large-chunk retrieval and small-chunk context loss |
-| Evidence-first answering | Answers are grounded in real chunks and parent context; graph relations must still link back to evidence chunks |
-| Course-material awareness | Chapters, pages, tables, formulas, Notebook cells, and source types are preserved for better academic retrieval |
-| Auditability | Results carry scores, parent context, reranking data, model-call audit fields, fallback state, and citations |
-| Maintainability | Docker fixes service boundaries; PostgreSQL, Qdrant, and Redis have clear responsibilities; scripts support re-embedding and quality checks |
-| Explicit quality gates | Fallback is disabled, zero vectors are checked, and DB/Qdrant count consistency is verified |
-| Extensibility | Reranking, semantic chunking, graph enhancement, and model providers are isolated through configuration or service layers |
+| `documents` / `document_versions` | File metadata, versions, and parser artifact paths |
+| `chunks` | Parent/child text chunks, summaries, keywords, embedding text version, and evidence text |
+| `concepts` | Concepts, chapter references, evidence counts, communities, centrality, and graph rank |
+| `concept_aliases` | Concept aliases and normalized aliases |
+| `concept_relations` | Sparse edges, relation types, evidence chunks, weights, semantic similarity, support count, and inference source |
+| `ingestion_batches` / `ingestion_jobs` | Batch ingestion and single-file jobs |
+| `ingestion_logs` / `ingestion_compensation_logs` | Event streams and cross-store compensation records |
+| `qa_sessions` / `agent_runs` / `agent_trace_events` | QA sessions, agent runs, and observable traces |
 
 ## Configuration
 
@@ -287,24 +316,26 @@ Copy the configuration template:
 Copy-Item .env.example .env
 ```
 
-Common settings:
+Common variables:
 
 | Variable | Description |
 | --- | --- |
-| `API_HOST_PORT` / `WEB_HOST_PORT` | Host access ports |
-| `DATABASE_URL` | PostgreSQL connection string |
-| `QDRANT_URL` / `QDRANT_COLLECTION` | Qdrant URL and collection |
+| `API_HOST_PORT` / `WEB_HOST_PORT` | Host ports |
+| `DATABASE_URL` | PostgreSQL connection URL |
+| `ENABLE_DATABASE_FALLBACK` | Database fallback switch, default `false` |
+| `QDRANT_URL` / `QDRANT_COLLECTION` | Qdrant URL and collection name |
 | `REDIS_URL` | Redis URL |
 | `COURSE_NAME` | Default course name |
 | `DATA_ROOT` | Local data root |
 | `OPENAI_API_KEY` / `OPENAI_BASE_URL` | OpenAI-compatible model endpoint |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | Embedding model and dimensions |
-| `CHAT_MODEL` | Chat model |
+| `OPENAI_RESOLVE_IP` | Target IP when model-domain resolution must be pinned |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE` | Embedding model, dimensions, and batch size |
+| `CHAT_MODEL` | Chat and graph extraction model |
+| `GRAPH_EXTRACTION_CHUNK_LIMIT` / `GRAPH_EXTRACTION_CHUNKS_PER_DOCUMENT` | Graph extraction chunk cap and per-document sampling cap |
 | `ENABLE_MODEL_FALLBACK` | Model fallback switch, default `false` |
-| `ENABLE_DATABASE_FALLBACK` | Database fallback switch, default `false` |
-| `RERANKER_ENABLED` / `RERANKER_MODEL` | Cross-Encoder reranker settings |
-| `SEMANTIC_CHUNKING_ENABLED` | Semantic chunking switch |
-| `SEMANTIC_CHUNKING_MIN_LENGTH` | Minimum text length for semantic chunking |
+| `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_MAX_LENGTH` | Cross-Encoder reranker settings |
+| `SEMANTIC_CHUNKING_ENABLED` / `SEMANTIC_CHUNKING_MIN_LENGTH` | Semantic chunking switch and minimum text length |
+| `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT` | Host model-bridge switch and port |
 
 Docker Compose overrides infrastructure URLs inside the API container:
 
@@ -314,75 +345,100 @@ QDRANT_URL=http://qdrant:6333
 REDIS_URL=redis://redis:6379/0
 ```
 
-If the host can reach the model provider but container networking is unstable, enable the model bridge:
-
-```env
-MODEL_BRIDGE_ENABLED=true
-MODEL_BRIDGE_PORT=8765
-```
-
-The bridge forwards to the real model API. It does not replace the model and is not a fallback path.
+If the host can reach a model provider but container networking to that provider is unstable, enable the model bridge. The bridge forwards the real OpenAI-compatible endpoint only; it does not generate fake responses and is not a fallback path.
 
 ## Running
 
-```powershell
-# Build images
-docker compose -f infra/docker-compose.yml build api web
+1. Configure `.env` with a real model endpoint:
 
-# Start the full stack
-docker compose -f infra/docker-compose.yml up -d postgres redis qdrant api web
-
-# Check containers
-docker ps
-
-# Check health
-curl http://127.0.0.1:8000/api/health
-curl http://127.0.0.1:8000/api/settings/runtime-check
+```env
+OPENAI_API_KEY=...
+OPENAI_BASE_URL=https://api.openai.com/v1
+EMBEDDING_MODEL=text-embedding-v4
+CHAT_MODEL=qwen-plus
+ENABLE_MODEL_FALLBACK=false
+ENABLE_DATABASE_FALLBACK=false
 ```
 
-Web app:
+2. Start the Docker stack:
+
+```powershell
+docker compose -f infra/docker-compose.yml up -d api web postgres redis qdrant
+```
+
+Windows users can also double-click `start-app.bat` to launch the backend, frontend, and infrastructure containers. This script **does not** force an image rebuild, making it suitable for daily quick starts.
+
+If the application code or dependencies have changed and you need to rebuild the local images, run:
+
+```powershell
+docker compose -f infra/docker-compose.yml build api web
+```
+
+Or on Windows simply run `rebuild-images.bat`. To force a rebuild without cache, use `rebuild-images.bat -NoCache`.
+
+3. Open the web app:
 
 ```text
 http://127.0.0.1:3000
 ```
 
-## Tests And Quality Gates
+## Validation
 
-Tests run inside the API container system Python:
-
-```powershell
-docker exec course-kg-api python -m pytest apps/api/tests
-```
-
-Common quality checks:
+Backend tests:
 
 ```powershell
-docker exec course-kg-api python scripts/quality_gate.py
-docker exec course-kg-api python scripts/analyze_chunk_quality.py
+docker exec course-kg-api python -m pytest tests
 ```
 
-Acceptance criteria:
+Frontend checks:
+
+```powershell
+npm run typecheck --workspace web
+npm run lint --workspace web
+npm run test --workspace web
+```
+
+Docker smoke:
+
+```powershell
+python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
+```
+
+Course quality gate:
+
+```powershell
+docker exec course-kg-api python /app/scripts/quality_gate.py --course-name "Course Name"
+```
+
+Reingest one course and clean stale derived data:
+
+```powershell
+docker exec course-kg-api python /app/scripts/reingest_all_courses.py --course-name "Course Name" --cleanup-stale
+```
+
+Validation focus:
 
 | Check | Expected |
 | --- | --- |
-| Health | `/api/health` returns `degraded_mode=false` |
-| Runtime configuration | `/api/settings/runtime-check` has no blocking issues |
-| Model fallback | `ENABLE_MODEL_FALLBACK=false` |
-| Database fallback | `ENABLE_DATABASE_FALLBACK=false` |
-| Embedding call | Retrieval audit shows the real embedding API was called |
-| Fallback reason | `fallback_reason` is empty |
-| Vector health | Qdrant has no zero vectors |
-| Count consistency | Active chunks match valid vectors |
+| Health | `/api/health` returns available service status |
+| Runtime configuration | `/api/settings/runtime-check` has no blocking issue |
+| Model fallback | `ENABLE_MODEL_FALLBACK=false`; model outages fail fast |
+| Database fallback | `ENABLE_DATABASE_FALLBACK=false`; database outages fail fast |
+| Vector health | Qdrant vector count matches active chunks and no zero vectors exist |
+| Retrieval quality | Child recall, parent context, rerank, and citation fields are complete |
+| Graph quality | Node count meets the retention floor, edge growth is near-linear, and community, centrality, and weight fields are populated |
+| Log observability | Ingestion logs expose progress, retry, failure reason, and terminal event |
 
 ## Version Control Rules
 
-Not tracked:
+Excluded from Git:
 
-- `.env` and local secrets.
-- `data/`, database files, model caches, and runtime outputs.
-- `node_modules/`, `.next/`, cache directories, and test reports.
-- `comparative_experiment/`.
+- `.env`, local secrets, Authorization headers, and provider responses.
+- `data/`, `output/`, `models/`, and `comparative_experiment/` runtime data.
+- `node_modules/`, `.next/`, `dist/`, `build/`, coverage, and Playwright reports.
+- `.db`, `.sqlite*`, `__pycache__/`, `*.pyc`, `*.tsbuildinfo`, logs, and temporary files.
 
-Tracked:
+Tracked in Git:
 
-- Source code, tests, scripts, Docker orchestration, configuration templates, and README files.
+- `apps/api`, `apps/web`, `packages/shared`, `scripts`, and `infra`.
+- README files, `.env.example`, Docker configuration, tests, schemas, and shared type contracts.

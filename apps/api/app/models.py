@@ -107,6 +107,12 @@ class Concept(TimestampMixin, Base):
     summary: Mapped[str] = mapped_column(Text, default="")
     chapter_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
     importance_score: Mapped[float] = mapped_column(Float, default=0.0)
+    evidence_count: Mapped[int] = mapped_column(Integer, default=0)
+    community_louvain: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    community_spectral: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    component_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    centrality_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    graph_rank_score: Mapped[float] = mapped_column(Float, default=0.0)
 
     course: Mapped["Course"] = relationship(back_populates="concepts")
     aliases: Mapped[list["ConceptAlias"]] = relationship(back_populates="concept")
@@ -136,6 +142,12 @@ class ConceptRelation(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.55)
     extraction_method: Mapped[str] = mapped_column(String(64), default="heuristic")
     is_validated: Mapped[bool] = mapped_column(Boolean, default=False)
+    weight: Mapped[float] = mapped_column(Float, default=0.0)
+    semantic_similarity: Mapped[float] = mapped_column(Float, default=0.0)
+    support_count: Mapped[int] = mapped_column(Integer, default=1)
+    relation_source: Mapped[str] = mapped_column(String(64), default="llm")
+    is_inferred: Mapped[bool] = mapped_column(Boolean, default=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

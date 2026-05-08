@@ -5,17 +5,18 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import AgentRun, AgentTraceEvent, QASession
+from app.models import AgentRun, AgentTraceEvent, IngestionBatch, QASession
 from app.core.config import get_settings
 from app.schemas import (
     AgentRequest,
     AgentResponse,
+    BatchLogTokenResponse,
     BatchStartResponse,
     CleanupStaleDataResponse,
     CleanupStaleGraphResponse,
@@ -61,10 +62,18 @@ from app.services.ingestion import (
     run_batch_ingestion,
     run_ingestion_job,
     run_uploaded_files_ingestion,
+    run_graph_rebuild,
     remove_course_file,
     summarize_course,
 )
-from app.services.ingestion_logs import TERMINAL_LOG_EVENTS, list_ingestion_logs, subscribe_ingestion_logs, unsubscribe_ingestion_logs
+from app.services.ingestion_logs import (
+    TERMINAL_LOG_EVENTS,
+    create_log_stream_token,
+    list_ingestion_logs,
+    subscribe_ingestion_logs,
+    unsubscribe_ingestion_logs,
+    validate_log_stream_token,
+)
 from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, cleanup_stale_graph, delete_course_data
 from app.services.retrieval import (
     get_dashboard_snapshot,
@@ -177,9 +186,24 @@ def cleanup_course_stale_graph(course_id: str | None = None, db: Session = Depen
 
 
 @router.post("/maintenance/rebuild-graph", response_model=RebuildGraphResponse)
-async def rebuild_graph_endpoint(course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+async def rebuild_graph_endpoint(background_tasks: BackgroundTasks, course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+    from app.services.ingestion import active_batch_for_course
+
     course = get_requested_course(db, course_id)
-    return await rebuild_course_graph(db, course.id)
+    active = active_batch_for_course(db, course.id)
+    if active is not None:
+        raise HTTPException(status_code=409, detail=f"课程已有活跃批次：{active.id}")
+    batch = IngestionBatch(
+        course_id=course.id,
+        source_root="graph_rebuild",
+        trigger_source="rebuild_graph",
+        status="extracting_graph",
+    )
+    db.add(batch)
+    db.commit()
+    db.refresh(batch)
+    background_tasks.add_task(run_graph_rebuild, batch.id, course.id)
+    return {"batch_id": batch.id, "state": "extracting_graph"}
 
 
 @router.get("/courses/current/graph", response_model=GraphResponse)
@@ -297,9 +321,29 @@ def batch_status(batch_id: str, db: Session = Depends(get_db)) -> dict:
     return batch
 
 
+@router.post("/ingestion/batches/{batch_id}/log-token", response_model=BatchLogTokenResponse)
+def batch_log_token(batch_id: str, db: Session = Depends(get_db)) -> dict:
+    if get_batch_status(db, batch_id) is None:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return create_log_stream_token(batch_id)
+
+
 @router.get("/ingestion/batches/{batch_id}/logs")
-async def batch_logs(batch_id: str):
+async def batch_logs(batch_id: str, token: str | None = None, x_api_key: str | None = Header(default=None)):
     from app.db import SessionLocal
+
+    allowed_keys = get_settings().api_key_list
+    header_authorized = bool(x_api_key and x_api_key in allowed_keys)
+    if allowed_keys and not header_authorized:
+        try:
+            validate_log_stream_token(batch_id, token)
+        except ValueError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+    elif token:
+        try:
+            validate_log_stream_token(batch_id, token)
+        except ValueError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
 
     with SessionLocal() as session:
         batch_exists = get_batch_status(session, batch_id) is not None

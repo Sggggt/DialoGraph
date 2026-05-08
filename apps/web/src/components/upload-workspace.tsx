@@ -6,7 +6,7 @@ import { motion } from "framer-motion";
 import type { CourseFileStatus, CourseFileSummary } from "@course-kg/shared";
 import { AlertCircle, CheckCircle2, Clock3, Database, FileCheck2, Files, LoaderCircle, Network, PanelRightOpen, RefreshCcw, Trash2, UploadCloud, X } from "lucide-react";
 
-import { cleanupStaleData, cleanupStaleGraph, fetchBatchStatus, fetchCourseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, removeCourseFile, uploadFile } from "@/lib/api";
+import { cleanupStaleData, cleanupStaleGraph, createBatchLogToken, fetchBatchStatus, fetchCourseFiles, fetchDashboard, getBatchLogUrl, parseUploadedFiles, removeCourseFile, uploadFile } from "@/lib/api";
 import { useCourseContext } from "@/components/course-context";
 import { ErrorBlock, LoadingBlock } from "@/components/query-state";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -42,10 +42,16 @@ type IngestionLogEvent = {
   embedding_fallback_method?: string | null;
   graph_extraction_provider?: string;
   graph_extraction_model?: string;
+  retry_count?: number;
+  max_retries?: number;
 };
 
 const terminalLogEvents = new Set(["batch_completed", "batch_failed", "batch_partial_failed", "batch_skipped", "batch_missing"]);
+const failureLogEvents = new Set(["batch_failed", "batch_partial_failed", "graph_failed"]);
 const terminalBatchStates = new Set(["completed", "partial_failed", "failed", "skipped"]);
+const failureBatchStates = new Set(["partial_failed", "failed"]);
+const logStreamMaxRetries = 3;
+const logStreamRetryDelayMs = 1200;
 
 const logEventLabels: Record<string, string> = {
   batch_started: "批次开始",
@@ -65,6 +71,7 @@ const logEventLabels: Record<string, string> = {
   batch_failed: "批次失败",
   batch_skipped: "批次跳过",
   batch_missing: "批次丢失",
+  log_stream_retry: "日志重连",
 };
 
 function logEventLabel(event: string): string {
@@ -102,6 +109,16 @@ function isBatchNotFoundError(error: unknown): boolean {
     return false;
   }
   return error.message.includes("Batch not found") || error.message.includes("Request failed with 404");
+}
+
+function formatBatchFailureDetails(errors?: Array<{ source_path?: string | null; message?: string | null }>): string | null {
+  if (!errors || errors.length === 0) {
+    return null;
+  }
+  return errors
+    .slice(0, 5)
+    .map((item) => `${item.source_path ?? "unknown"}: ${item.message ?? "未返回错误信息"}`)
+    .join("\n");
 }
 
 type FileBrowserItem = CourseFileSummary & {
@@ -164,6 +181,8 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const [selectedFilePathValues, setSelectedFilePathValues] = useLocalStorage<string[]>(`upload.selectedFilePaths.${storageScope}`, []);
   const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
   const [cleanupDialog, setCleanupDialog] = useState<"data" | "graph" | null>(null);
+  const [failureDialog, setFailureDialog] = useState<{ title: string; message: string; details?: string | null } | null>(null);
+  const [logStreamRetryCount, setLogStreamRetryCount] = useState(0);
 
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedCourseId],
@@ -243,6 +262,12 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
       setSelectedFilePathValues([]);
       void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+    },
+    onError: (error) => {
+      setFailureDialog({
+        title: "解析启动失败",
+        message: error instanceof Error ? error.message : "解析任务启动失败，后端未返回错误详情。",
+      });
     },
   });
 
@@ -367,37 +392,143 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
 
   useEffect(() => {
     if (!activeLogBatchId) {
+      queueMicrotask(() => setLogStreamRetryCount(0));
       return;
     }
-    const source = new EventSource(getBatchLogUrl(activeLogBatchId));
-    source.onmessage = (event) => {
-      const item = JSON.parse(event.data) as IngestionLogEvent;
+    const streamBatchId = activeLogBatchId;
+    let closed = false;
+    let retryCount = 0;
+    let source: EventSource | null = null;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const appendLog = (item: IngestionLogEvent) => {
       setLogs((current) => [...current, item].slice(-300));
-      if (terminalLogEvents.has(item.event)) {
-        source.close();
-        setActiveLogBatchId(null);
-        if (item.event === "batch_missing") {
-          setBatchId(null);
-          setDismissedBatchId(activeLogBatchId);
-        }
-        void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
-        void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
-        void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, activeLogBatchId] });
+    };
+
+    const closeSource = () => {
+      source?.close();
+      source = null;
+    };
+
+    const connect = async () => {
+      if (closed) {
+        return;
       }
+      closeSource();
+      let token: string;
+      try {
+        token = (await createBatchLogToken(streamBatchId)).token;
+      } catch (error) {
+        if (closed) {
+          return;
+        }
+        retryCount += 1;
+        setLogStreamRetryCount(retryCount);
+        appendLog({
+          timestamp: new Date().toISOString(),
+          event: "log_stream_retry",
+          message:
+            retryCount <= logStreamMaxRetries
+              ? `日志流授权失败，正在第 ${retryCount}/${logStreamMaxRetries} 次重试。`
+              : `日志流授权失败，已重试 ${logStreamMaxRetries} 次仍未恢复。`,
+          retry_count: retryCount,
+          max_retries: logStreamMaxRetries,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (retryCount <= logStreamMaxRetries) {
+          retryTimer = setTimeout(() => {
+            void connect();
+          }, logStreamRetryDelayMs * retryCount);
+          return;
+        }
+        setFailureDialog({
+          title: "解析日志流授权失败",
+          message: "日志流 token 创建失败，无法继续同步解析进度。请检查 API 鉴权或后端日志。",
+          details: error instanceof Error ? error.message : String(error),
+        });
+        setActiveLogBatchId(null);
+        return;
+      }
+      source = new EventSource(getBatchLogUrl(streamBatchId, token));
+      source.onmessage = (event) => {
+        if (closed) {
+          return;
+        }
+        retryCount = 0;
+        setLogStreamRetryCount(0);
+        const item = JSON.parse(event.data) as IngestionLogEvent;
+        appendLog(item);
+        if (failureLogEvents.has(item.event)) {
+          setFailureDialog({
+            title: item.event === "graph_failed" ? "图谱重建失败" : "解析失败",
+            message: item.message || "任务失败，后端未返回错误详情。",
+            details: item.error ?? null,
+          });
+        }
+        if (terminalLogEvents.has(item.event)) {
+          closeSource();
+          setActiveLogBatchId(null);
+          if (item.event === "batch_missing") {
+            setBatchId(null);
+            setDismissedBatchId(streamBatchId);
+          }
+          void queryClient.invalidateQueries({ queryKey: ["course-files", selectedCourseId] });
+          void queryClient.invalidateQueries({ queryKey: ["dashboard", selectedCourseId] });
+          void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, streamBatchId] });
+        }
+      };
+      source.onerror = () => {
+        closeSource();
+        if (closed) {
+          return;
+        }
+        retryCount += 1;
+        setLogStreamRetryCount(retryCount);
+        appendLog({
+          timestamp: new Date().toISOString(),
+          event: "log_stream_retry",
+          message:
+            retryCount <= logStreamMaxRetries
+              ? `日志流断开，正在第 ${retryCount}/${logStreamMaxRetries} 次重连。`
+              : `日志流断开，已重试 ${logStreamMaxRetries} 次仍未恢复。`,
+          retry_count: retryCount,
+          max_retries: logStreamMaxRetries,
+        });
+        if (retryCount <= logStreamMaxRetries) {
+          retryTimer = setTimeout(() => {
+            void connect();
+          }, logStreamRetryDelayMs * retryCount);
+          return;
+        }
+        setFailureDialog({
+          title: "解析日志流中断",
+          message: "日志流重连失败，任务状态可能仍在后端继续执行。请刷新批次状态或重新打开日志查看最新结果。",
+        });
+        setActiveLogBatchId(null);
+        void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, streamBatchId] });
+      };
     };
-    source.onerror = () => {
-      source.close();
-      setActiveLogBatchId(null);
-      void queryClient.invalidateQueries({ queryKey: ["batch", selectedCourseId, activeLogBatchId] });
-    };
+    void connect();
     return () => {
-      source.close();
+      closed = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+      }
+      closeSource();
     };
   }, [activeLogBatchId, queryClient, selectedCourseId]);
 
   useEffect(() => {
     if (batchQuery.data?.state && terminalBatchStates.has(batchQuery.data.state)) {
+      const terminalBatch = batchQuery.data;
       queueMicrotask(() => {
+        if (failureBatchStates.has(terminalBatch.state)) {
+          setFailureDialog({
+            title: terminalBatch.state === "partial_failed" ? "解析部分失败" : "解析失败",
+            message: `${batchStateLabel(terminalBatch.state)}：成功 ${terminalBatch.success_count}，失败 ${terminalBatch.failure_count}，跳过 ${terminalBatch.skipped_count}。`,
+            details: formatBatchFailureDetails(terminalBatch.errors),
+          });
+        }
         setBatchId(null);
         setDismissedBatchId(activeBatchId);
       });
@@ -854,6 +985,27 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
         </DialogContent>
       </Dialog>
 
+      <Dialog open={failureDialog !== null} onOpenChange={(open) => !open && setFailureDialog(null)}>
+        <DialogContent className="max-w-md border border-rose-200/18 bg-[rgba(18,6,12,0.94)] p-0 text-white shadow-[0_30px_80px_rgba(0,0,0,0.4)] backdrop-blur-2xl">
+          <DialogHeader className="border-b border-rose-200/12 px-6 py-5">
+            <DialogTitle>{failureDialog?.title ?? "任务失败"}</DialogTitle>
+            <DialogDescription>{failureDialog?.message ?? "后端未返回错误详情。"}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 px-6 py-5">
+            {failureDialog?.details ? (
+              <pre className="max-h-52 overflow-auto whitespace-pre-wrap rounded-2xl border border-rose-200/12 bg-black/20 px-4 py-3 text-xs leading-5 text-rose-50/78">
+                {failureDialog.details}
+              </pre>
+            ) : null}
+            <div className="flex justify-end">
+              <button type="button" onClick={() => setFailureDialog(null)} className="rounded-full border border-rose-200/20 px-4 py-2 text-sm text-rose-50/78 transition hover:text-white">
+                关闭
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {logOpen ? (
         <div className="fixed inset-y-0 right-0 z-50 flex w-full justify-end bg-black/24 backdrop-blur-[2px] sm:w-auto sm:bg-transparent">
           <motion.aside
@@ -875,6 +1027,11 @@ function UploadWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
             <p className="mt-3 rounded-full border border-cyan-200/12 bg-cyan-300/[0.045] px-3 py-2 text-[11px] leading-5 text-cyan-50/62">
               {modelAudit}
             </p>
+            {logStreamRetryCount > 0 ? (
+              <p className="mt-2 rounded-full border border-amber-200/14 bg-amber-300/[0.055] px-3 py-2 text-[11px] leading-5 text-amber-50/72">
+                日志流重连 {Math.min(logStreamRetryCount, logStreamMaxRetries)}/{logStreamMaxRetries}
+              </p>
+            ) : null}
 
             <div className="mt-4 h-[calc(100%-132px)] overflow-y-auto pr-1">
               {logs.length > 0 ? (

@@ -43,6 +43,13 @@ _SOURCE_PATH_LOCKS_GUARD = Lock()
 _MAX_SOURCE_PATH_LOCKS = 256
 
 
+def exception_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message:
+        return message
+    return f"{exc.__class__.__name__}: {exc!r}"
+
+
 def normalized_source_path(path: Path) -> str:
     return str(path.resolve()).lower()
 
@@ -140,7 +147,7 @@ def process_pending_vector_compensations(db: Session) -> int:
             processed += 1
         except Exception as exc:
             log.status = "failed"
-            log.error_message = str(exc)
+            log.error_message = exception_message(exc)
     if pending:
         db.commit()
     return processed
@@ -150,6 +157,7 @@ def finalize_graph_generation_failure(session: Session, batch_id: str, exc: Exce
     batch = session.get(IngestionBatch, batch_id)
     if batch is None:
         raise RuntimeError(f"Batch {batch_id} disappeared") from exc
+    error_message = exception_message(exc)
     graph_stats = {
         "graph_rebuilt": False,
         "graph_nodes": 0,
@@ -157,11 +165,11 @@ def finalize_graph_generation_failure(session: Session, batch_id: str, exc: Exce
         "concepts": 0,
         "relations": 0,
         "graph_extraction_provider": graph_extraction_provider(),
-        "graph_error": f"{type(exc).__name__}: {exc}",
+        "graph_error": error_message,
     }
     batch.stats = {**stats, **graph_stats}
     batch.status = "partial_failed" if batch.success_count > 0 else "failed"
-    batch.last_error = f"图谱生成失败：{exc}"
+    batch.last_error = f"图谱生成失败：{error_message}"
     batch.completed_at = datetime.utcnow()
     session.commit()
     emit_ingestion_log(batch_id, "graph_failed", batch.last_error, **graph_stats)
@@ -186,6 +194,76 @@ async def rebuild_course_graph_for_batch(session: Session, course_id: str, batch
         if "unexpected keyword argument 'batch_id'" not in str(exc):
             raise
         return await rebuild_course_graph(session, course_id)
+
+
+async def recover_existing_graph_algorithm_metrics(session: Session, course_id: str, enricher=None) -> dict:
+    if enricher is None:
+        from app.services.graph_algorithms import enrich_course_graph_without_completion
+
+        enricher = enrich_course_graph_without_completion
+    try:
+        stats = await enricher(session, course_id)
+        session.commit()
+        return {"graph_algorithm_recovered_existing": True, **stats}
+    except Exception as exc:
+        session.rollback()
+        return {
+            "graph_algorithm_recovered_existing": False,
+            "graph_algorithm_recovery_error": exception_message(exc),
+        }
+
+
+async def run_graph_rebuild(batch_id: str, course_id: str) -> dict:
+    from app.db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        batch = session.get(IngestionBatch, batch_id)
+        if batch is None:
+            raise RuntimeError(f"Batch {batch_id} not found")
+        batch.status = "extracting_graph"
+        batch.started_at = datetime.utcnow()
+        session.commit()
+        emit_ingestion_log(batch_id, "batch_graph_started", "正在重建课程图谱")
+
+        try:
+            graph_stats = await rebuild_course_graph_for_batch(session, course_id, batch_id)
+        except Exception as exc:
+            session.rollback()
+            recovery_stats = await recover_existing_graph_algorithm_metrics(session, course_id)
+            batch = session.get(IngestionBatch, batch_id)
+            if batch is not None:
+                graph_stats = {
+                    "graph_rebuilt": False,
+                    "graph_nodes": 0,
+                    "graph_edges": 0,
+                    "concepts": 0,
+                    "relations": 0,
+                    "graph_extraction_provider": graph_extraction_provider(),
+                    "graph_error": exception_message(exc),
+                    **recovery_stats,
+                }
+                batch.stats = {**(batch.stats or {}), **graph_stats}
+                batch.status = "failed"
+                batch.last_error = exception_message(exc)
+                batch.completed_at = datetime.utcnow()
+                session.commit()
+            emit_ingestion_log(batch_id, "graph_failed", f"图谱重建失败：{exception_message(exc)}")
+            emit_ingestion_log(batch_id, "batch_failed", f"批次失败：{exception_message(exc)}")
+            raise
+
+        batch = session.get(IngestionBatch, batch_id)
+        if batch is None:
+            raise RuntimeError(f"Batch {batch_id} disappeared")
+        batch.status = "completed"
+        batch.completed_at = datetime.utcnow()
+        batch.stats = {**(batch.stats or {}), **graph_stats}
+        session.commit()
+        emit_ingestion_log(batch_id, "graph_rebuilt", f"图谱已重建：{graph_stats.get('graph_nodes', 0)} 个节点，{graph_stats.get('graph_edges', 0)} 条边", **graph_stats)
+        emit_ingestion_log(batch_id, "batch_completed", "图谱重建完成")
+        return graph_stats
+    finally:
+        session.close()
 
 
 def embedding_audit_payload(provider: str, external_called: bool, fallback_reason: str | None, vector_count: int) -> dict:
@@ -841,7 +919,6 @@ async def _ingest_file_locked(
         )
     )
     job.document_id = document.id
-    vector_store = VectorStore(course_name=course.name)
 
     version = DocumentVersion(
         document_id=document.id,
@@ -860,7 +937,8 @@ async def _ingest_file_locked(
     set_job_state(db, job, "chunking", batch_id=batch_id)
     chunk_payloads, chunking_stats = await chunk_sections_hierarchical_async(sections, chapter=chapter, source_type=source_type)
     existing_hashes = active_chunk_hashes_for_course(db, course.id, excluded_document_id=document.id)
-    seen_hashes = set(existing_hashes)
+    seen_parent_hashes = set(existing_hashes)
+    seen_child_hashes = set(existing_hashes)
     deduplicated_chunks = 0
     created_chunks: list[Chunk] = []
     parent_chunks_map: dict[int, Chunk] = {}
@@ -870,10 +948,10 @@ async def _ingest_file_locked(
         if not payload.get("is_parent"):
             continue
         content_hash = chunk_content_hash(payload["content"])
-        if content_hash in seen_hashes:
+        if content_hash in seen_parent_hashes:
             deduplicated_chunks += 1
             continue
-        seen_hashes.add(content_hash)
+        seen_parent_hashes.add(content_hash)
         payload["metadata"]["content_hash"] = content_hash
         chunk = Chunk(
             course_id=course.id,
@@ -905,10 +983,10 @@ async def _ingest_file_locked(
         if payload.get("is_parent"):
             continue
         content_hash = chunk_content_hash(payload["content"])
-        if content_hash in seen_hashes:
+        if content_hash in seen_child_hashes:
             deduplicated_chunks += 1
             continue
-        seen_hashes.add(content_hash)
+        seen_child_hashes.add(content_hash)
         payload["metadata"]["content_hash"] = content_hash
         parent_chunk = parent_chunks_map.get(int(payload["parent_key"]))
         chunk = Chunk(
@@ -1078,6 +1156,7 @@ async def _ingest_file_locked(
         operation="upsert",
         vector_ids=new_chunk_ids,
     )
+    vector_store = VectorStore(course_name=course.name)
     try:
         vector_store.upsert(vector_points)
     except Exception as exc:
@@ -1252,16 +1331,17 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
                     emit_ingestion_log(batch_id, "file_completed", f"{path.name} 解析完成", source_path=str(path), stats=result.get("stats", {}))
             except Exception as exc:
                 session.rollback()
+                error_message = exception_message(exc)
                 failed_job = session.get(IngestionJob, job.id)
                 if failed_job is not None:
                     failed_job.status = "failed"
-                    failed_job.error_message = str(exc)
+                    failed_job.error_message = error_message
                 batch = session.get(IngestionBatch, batch_id)
                 if batch is not None:
                     batch.failure_count += 1
-                    batch.last_error = str(exc)
-                errors.append({"source_path": str(path), "message": str(exc)})
-                emit_ingestion_log(batch_id, "file_failed", f"{path.name} 解析失败：{exc}", source_path=str(path), error=str(exc))
+                    batch.last_error = error_message
+                errors.append({"source_path": str(path), "message": error_message})
+                emit_ingestion_log(batch_id, "file_failed", f"{path.name} 解析失败：{error_message}", source_path=str(path), error=error_message)
                 session.commit()
             finally:
                 batch = session.get(IngestionBatch, batch_id)
@@ -1304,6 +1384,7 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
                 graph_stats = await rebuild_course_graph_for_batch(session, batch.course_id, batch_id)
             except Exception as exc:
                 session.rollback()
+                recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch.course_id)
                 return finalize_graph_generation_failure(
                     session,
                     batch_id,
@@ -1312,6 +1393,7 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
                         "coverage_by_source_type": dict(coverage),
                         "errors": errors,
                         "degraded_mode": is_degraded_mode(),
+                        **recovery_stats,
                     },
                 )
         else:
@@ -1423,16 +1505,17 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                     emit_ingestion_log(batch_id, "file_completed", f"{path.name} 解析完成", source_path=str(path), stats=result.get("stats", {}))
             except Exception as exc:
                 session.rollback()
+                error_message = exception_message(exc)
                 failed_job = session.get(IngestionJob, job.id)
                 if failed_job is not None:
                     failed_job.status = "failed"
-                    failed_job.error_message = str(exc)
+                    failed_job.error_message = error_message
                 batch = session.get(IngestionBatch, batch_id)
                 if batch is not None:
                     batch.failure_count += 1
-                    batch.last_error = str(exc)
-                errors.append({"source_path": str(path), "message": str(exc)})
-                emit_ingestion_log(batch_id, "file_failed", f"{path.name} 解析失败：{exc}", source_path=str(path), error=str(exc))
+                    batch.last_error = error_message
+                errors.append({"source_path": str(path), "message": error_message})
+                emit_ingestion_log(batch_id, "file_failed", f"{path.name} 解析失败：{error_message}", source_path=str(path), error=error_message)
                 session.commit()
             finally:
                 batch = session.get(IngestionBatch, batch_id)
@@ -1475,6 +1558,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                 graph_stats = await rebuild_course_graph_for_batch(session, batch.course_id, batch_id)
             except Exception as exc:
                 session.rollback()
+                recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch.course_id)
                 return finalize_graph_generation_failure(
                     session,
                     batch_id,
@@ -1485,6 +1569,7 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
                         "errors": errors,
                         "force": force,
                         "degraded_mode": is_degraded_mode(),
+                        **recovery_stats,
                     },
                 )
         else:
@@ -1540,7 +1625,7 @@ async def run_ingestion_job(job_id: str, source_path: Path, trigger_source: str 
         job = session.get(IngestionJob, job_id)
         if job:
             job.status = "failed"
-            job.error_message = str(exc)
+            job.error_message = exception_message(exc)
             session.commit()
         raise
     finally:

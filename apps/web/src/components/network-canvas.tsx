@@ -18,6 +18,27 @@ const palette: Record<string, string> = {
   document: "#6be2bf",
   concept: "#63cbff",
 };
+const communityPalette = [
+  "#5eead4",
+  "#60a5fa",
+  "#f59e0b",
+  "#f472b6",
+  "#a78bfa",
+  "#34d399",
+  "#fb7185",
+  "#facc15",
+  "#38bdf8",
+  "#c084fc",
+  "#a3e635",
+  "#fdba74",
+];
+
+function colorForNode(node: GraphResponse["nodes"][number]): string {
+  if (node.category === "concept" && typeof node.community_louvain === "number") {
+    return communityPalette[Math.abs(node.community_louvain) % communityPalette.length];
+  }
+  return palette[node.category] ?? "#63cbff";
+}
 
 export type NetworkCanvasHandle = {
   resetView: () => void;
@@ -150,16 +171,16 @@ function buildBaseOption(graph: GraphResponse): EChartsOption {
           fixed: false,
           symbolSize:
             node.category === "concept"
-              ? 16 + Math.min(14, (node.value ?? 2) * 0.85)
+              ? 14 + Math.min(26, Math.max((node.value ?? 2) * 0.75, (node.centrality_score ?? 0) * 48, (node.graph_rank_score ?? 0) * 34))
               : node.category === "document"
                 ? 16
                 : 20,
           itemStyle: {
-            color: palette[node.category] ?? "#63cbff",
-            borderWidth: 0.8,
-            borderColor: "rgba(255,255,255,0.14)",
-            shadowBlur: 7,
-            shadowColor: "rgba(99, 203, 255, 0.08)",
+            color: colorForNode(node),
+            borderWidth: node.category === "concept" && (node.centrality_score ?? 0) > 0.18 ? 1.8 : 0.8,
+            borderColor: node.category === "concept" && (node.centrality_score ?? 0) > 0.18 ? "rgba(255,255,255,0.72)" : "rgba(255,255,255,0.14)",
+            shadowBlur: node.category === "concept" ? 10 + Math.min(16, (node.centrality_score ?? 0) * 44) : 7,
+            shadowColor: node.category === "concept" ? "rgba(255, 255, 255, 0.16)" : "rgba(99, 203, 255, 0.08)",
           },
           label: {
             color: "#dff7ff",
@@ -173,8 +194,10 @@ function buildBaseOption(graph: GraphResponse): EChartsOption {
           category: edge.category,
           evidence_chunk_id: edge.evidence_chunk_id,
           lineStyle: {
-            color: edge.category === "semantic" ? "rgba(84, 213, 255, 0.16)" : "rgba(155, 165, 255, 0.11)",
-            width: edge.category === "semantic" ? 1.05 : 0.8,
+            color: edge.is_inferred ? "rgba(255, 207, 112, 0.26)" : edge.category === "semantic" ? "rgba(84, 213, 255, 0.18)" : "rgba(155, 165, 255, 0.11)",
+            width: edge.category === "semantic" ? 0.8 + Math.min(2.8, (edge.weight ?? edge.confidence ?? 0.4) * 2.6) : 0.8,
+            opacity: edge.category === "semantic" ? 0.36 + Math.min(0.48, (edge.weight ?? 0.3) * 0.55) : 0.38,
+            type: edge.is_inferred ? "dashed" : "solid",
           },
         })),
       },

@@ -9,6 +9,7 @@ playwright-report/
 blob-report/
 .turbo/
 .cache/
+.runtime/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
@@ -23,8 +24,7 @@ models/
 *.pyo
 *.pyd
 *.db
-*.sqlite
-*.sqlite3
+*.sqlite*
 *.db-journal
 *.db-shm
 *.db-wal
@@ -40,6 +40,8 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 .env
+.env.*
+!.env.example
 .env.local
 .env.*.local
 *.egg-info/
@@ -50,6 +52,9 @@ apps/web/.next/
 apps/web/node_modules/
 apps/api/.venv/
 apps/api/.env
+apps/api/output/
 apps/worker/.venv/
 apps/worker/.env
 comparative_experiment/
+AGENTS.md
+CLAUDE.md

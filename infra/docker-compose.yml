@@ -1,6 +1,9 @@
 services:
   api:
     image: ${API_IMAGE:-course-kg-api:local}
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
     pull_policy: never
     container_name: course-kg-api
     env_file:
@@ -10,8 +13,6 @@ services:
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       DATA_ROOT: /app/data
-      STORAGE_ROOT: /app/data/storage
-      INGESTION_ROOT: /app/data/ingestion
       OPENAI_BASE_URL: ${API_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-https://api.openai.com/v1}}
       OPENAI_RESOLVE_IP: ${API_OPENAI_RESOLVE_IP:-${OPENAI_RESOLVE_IP:-}}
       ENABLE_MODEL_FALLBACK: "false"
@@ -42,6 +43,9 @@ services:
 
   web:
     image: ${WEB_IMAGE:-course-kg-web:local}
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
     pull_policy: never
     container_name: course-kg-web
     environment:

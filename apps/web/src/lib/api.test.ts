@@ -75,10 +75,17 @@ describe("api client", () => {
     });
   });
 
-  it("adds API key to batch log URLs for EventSource", async () => {
-    const { getBatchLogUrl } = await import("./api");
+  it("uses short-lived tokens for batch log EventSource URLs", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ token: "stream-token", expires_at: "2026-05-08T00:00:00Z" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { createBatchLogToken, getBatchLogUrl } = await import("./api");
 
-    expect(getBatchLogUrl("batch-1")).toBe("http://api.test/api/ingestion/batches/batch-1/logs?api_key=test-key");
+    await expect(createBatchLogToken("batch-1")).resolves.toMatchObject({ token: "stream-token" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.test/api/ingestion/batches/batch-1/log-token",
+      expect.objectContaining({ method: "POST", headers: { "X-API-Key": "test-key" } }),
+    );
+    expect(getBatchLogUrl("batch-1", "stream-token")).toBe("http://api.test/api/ingestion/batches/batch-1/logs?token=stream-token");
   });
 
   it("calls stale cleanup endpoints with API key headers", async () => {

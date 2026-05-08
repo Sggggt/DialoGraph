@@ -7,11 +7,13 @@ from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.models import Chunk, Concept, ConceptAlias, ConceptRelation, Course, Document
-from app.schemas import Citation
+from app.schemas import Citation, GraphExtractionPayload
 from app.services.embeddings import ChatProvider
+from app.services.graph_algorithms import enrich_course_graph
 from app.services.ingestion_logs import emit_ingestion_log
 from app.services.parsers import canonical_chapter_label, derive_chapter, is_invalid_chapter_label
 
@@ -155,6 +157,31 @@ def _has_graph_concepts(value: object) -> bool:
     payload = _graph_payload(value)
     concepts = payload.get("concepts", [])
     return isinstance(concepts, list) and bool(concepts)
+
+
+def validate_graph_payload(value: object) -> tuple[dict, list[str]]:
+    try:
+        payload = GraphExtractionPayload.model_validate(value).model_dump()
+    except ValidationError as exc:
+        raise ValueError(f"graph payload schema validation failed: {exc}") from exc
+
+    concept_names = {concept["name"] for concept in payload["concepts"]}
+    valid_relations = []
+    warnings = []
+    for relation in payload["relations"]:
+        source = relation["source"]
+        target = relation["target"]
+        if source not in concept_names or target not in concept_names:
+            warnings.append(
+                "dropped relation because source/target is not in concepts: "
+                f"{source!r} -> {target!r} ({relation['relation_type']})"
+            )
+            continue
+        valid_relations.append(relation)
+    payload["relations"] = valid_relations
+    if warnings:
+        payload["_validation_warnings"] = warnings
+    return payload, warnings
 
 
 def normalize_concept_name(name: object) -> str:
@@ -369,6 +396,7 @@ async def upsert_concepts_from_chunk(
     fallback = heuristic_extract_graph(chunk.content) if settings.enable_model_fallback else {"concepts": [], "relations": []}
     if use_llm:
         llm_payload = llm_payload if llm_payload is not None else await ChatProvider().extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type)
+        llm_payload, _warnings = validate_graph_payload(llm_payload)
     else:
         llm_payload = {"concepts": [], "relations": []}
     extracted = merge_graph_candidates(llm_payload, fallback)
@@ -414,6 +442,9 @@ async def upsert_concepts_from_chunk(
         )
         if existing:
             existing.confidence = max(existing.confidence, confidence)
+            existing.weight = max(float(getattr(existing, "weight", 0.0) or 0.0), confidence)
+            existing.support_count = int(getattr(existing, "support_count", 1) or 1) + 1
+            existing.relation_source = "llm"
             if confidence >= (existing.confidence or 0):
                 existing.evidence_chunk_id = chunk.id
             existing.extraction_method = "llm+rules"
@@ -429,6 +460,12 @@ async def upsert_concepts_from_chunk(
                 confidence=confidence,
                 extraction_method=extraction_method,
                 is_validated=confidence >= 0.82,
+                weight=confidence,
+                semantic_similarity=0.0,
+                support_count=1,
+                relation_source="llm",
+                is_inferred=False,
+                metadata_json={},
             )
         )
         relation_count += 1
@@ -491,6 +528,26 @@ def choose_llm_graph_chunks(
     return selected_ids
 
 
+def choose_graph_probe_chunks(chunks: list[Chunk], limit: int = 3) -> list[Chunk]:
+    if len(chunks) <= limit:
+        return chunks[:]
+    ranked_by_length = sorted(chunks, key=lambda chunk: len(chunk.content or ""))
+    indexes = {0, len(ranked_by_length) // 2, len(ranked_by_length) - 1}
+    return [ranked_by_length[index] for index in sorted(indexes)][:limit]
+
+
+async def run_llm_graph_extraction(chunks: list[Chunk], batch_id: str | None = None) -> tuple[dict[str, dict], dict[str, str]]:
+    try:
+        extraction_result = await extract_llm_graph_payloads(chunks, batch_id=batch_id)
+    except TypeError as exc:
+        if "unexpected keyword argument 'batch_id'" not in str(exc):
+            raise
+        extraction_result = await extract_llm_graph_payloads(chunks)
+    if isinstance(extraction_result, tuple):
+        return extraction_result
+    return extraction_result, {}
+
+
 async def extract_llm_graph_payloads(
     chunks: list[Chunk],
     concurrency: int = GRAPH_EXTRACTION_CONCURRENCY,
@@ -507,7 +564,8 @@ async def extract_llm_graph_payloads(
         nonlocal completed
         async with semaphore:
             try:
-                payloads[chunk.id] = await provider.extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type)
+                payload, _warnings = validate_graph_payload(await provider.extract_graph_payload(chunk.content, chunk.chapter, chunk.source_type))
+                payloads[chunk.id] = payload
             except Exception as exc:
                 errors[chunk.id] = f"{type(exc).__name__}: {exc}"
             finally:
@@ -553,16 +611,40 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
             graph_source_documents=len(graph_document_ids),
             total_active_chunks=len(chunks),
         )
-    try:
-        extraction_result = await extract_llm_graph_payloads(selected_llm_chunks, batch_id=batch_id)
-    except TypeError as exc:
-        if "unexpected keyword argument 'batch_id'" not in str(exc):
-            raise
-        extraction_result = await extract_llm_graph_payloads(selected_llm_chunks)
-    if isinstance(extraction_result, tuple):
-        llm_payloads, llm_errors = extraction_result
-    else:
-        llm_payloads, llm_errors = extraction_result, {}
+    probe_chunks = choose_graph_probe_chunks(selected_llm_chunks)
+    if batch_id and probe_chunks:
+        emit_ingestion_log(
+            batch_id,
+            "batch_graph_probe_started",
+            f"正在用 {len(probe_chunks)} 个真实片段进行图谱抽取轻量预检",
+            probe_chunks=len(probe_chunks),
+            probe_chunk_ids=[chunk.id for chunk in probe_chunks],
+            probe_chunk_lengths=[len(chunk.content or "") for chunk in probe_chunks],
+        )
+    llm_payloads, llm_errors = await run_llm_graph_extraction(probe_chunks, batch_id=batch_id)
+    if batch_id and probe_chunks:
+        emit_ingestion_log(
+            batch_id,
+            "batch_graph_probe_completed",
+            f"图谱抽取预检完成：成功 {len(llm_payloads)} / {len(probe_chunks)}",
+            probe_chunks=len(probe_chunks),
+            probe_success_chunks=len(llm_payloads),
+            probe_failed_chunks=len(llm_errors),
+            probe_errors=llm_errors,
+        )
+    if probe_chunks and not llm_payloads:
+        sample_error = next(iter(llm_errors.values()), "model did not return graph extraction probe results")
+        raise RuntimeError(f"图谱抽取轻量预检失败：{sample_error}")
+    probe_ids = {chunk.id for chunk in probe_chunks}
+    remaining_chunks = [chunk for chunk in selected_llm_chunks if chunk.id not in probe_ids]
+    remaining_payloads, remaining_errors = await run_llm_graph_extraction(remaining_chunks, batch_id=batch_id)
+    llm_payloads = {**llm_payloads, **remaining_payloads}
+    llm_errors = {**llm_errors, **remaining_errors}
+    llm_validation_warnings = {
+        chunk_id: payload.get("_validation_warnings", [])
+        for chunk_id, payload in llm_payloads.items()
+        if payload.get("_validation_warnings")
+    }
     if llm_chunk_ids and not llm_payloads:
         sample_error = next(iter(llm_errors.values()), "模型没有返回图谱抽取结果")
         raise RuntimeError(f"所有已选片段的图谱抽取均失败：{sample_error}")
@@ -584,6 +666,7 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
             llm_success_chunks += 1
         concept_count += created
         relation_count += relations
+    graph_algorithm_stats = await enrich_course_graph(db, course_id)
     db.commit()
     graph = get_graph_payload(db, course_id)
     return {
@@ -600,6 +683,11 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         "graph_llm_success_chunks": llm_success_chunks,
         "graph_llm_failed_chunks": len(llm_errors),
         "graph_llm_errors": llm_errors,
+        "graph_llm_validation_warnings": llm_validation_warnings,
+        "graph_probe_chunks": len(probe_chunks),
+        "graph_probe_success_chunks": len([chunk for chunk in probe_chunks if chunk.id in llm_payloads]),
+        "graph_probe_failed_chunks": len([chunk for chunk in probe_chunks if chunk.id in llm_errors]),
+        **graph_algorithm_stats,
         "graph_total_active_chunks": len(chunks),
         "graph_source_documents": len(graph_document_ids),
     }
@@ -716,6 +804,9 @@ def get_concept_cards(db: Session, course_id: str) -> list[dict]:
                 "relation_type": relation.relation_type,
                 "target_name": relation.target_name,
                 "confidence": relation.confidence,
+                "weight": getattr(relation, "weight", None),
+                "relation_source": getattr(relation, "relation_source", None),
+                "is_inferred": bool(getattr(relation, "is_inferred", False)),
             }
         )
     return [
@@ -770,6 +861,12 @@ def get_graph_node_detail(db: Session, course_id: str, concept_id: str) -> dict 
         "chapter_refs": concept.chapter_refs,
         "concept_type": concept.concept_type,
         "importance_score": concept.importance_score,
+        "evidence_count": getattr(concept, "evidence_count", 0),
+        "community_louvain": getattr(concept, "community_louvain", None),
+        "community_spectral": getattr(concept, "community_spectral", None),
+        "component_id": getattr(concept, "component_id", None),
+        "centrality": getattr(concept, "centrality_json", {}) or {},
+        "graph_rank_score": getattr(concept, "graph_rank_score", 0.0),
         "relations": [
             {
                 "relation_id": relation.id,
@@ -777,6 +874,11 @@ def get_graph_node_detail(db: Session, course_id: str, concept_id: str) -> dict 
                 "target_concept_id": relation.target_concept_id,
                 "target_name": relation.target_name,
                 "confidence": relation.confidence,
+                "weight": getattr(relation, "weight", None),
+                "semantic_similarity": getattr(relation, "semantic_similarity", None),
+                "support_count": getattr(relation, "support_count", None),
+                "relation_source": getattr(relation, "relation_source", None),
+                "is_inferred": bool(getattr(relation, "is_inferred", False)),
                 "evidence": build_citation(db, relation.evidence_chunk_id),
             }
             for relation in relations
@@ -846,9 +948,21 @@ def get_graph_payload(db: Session, course_id: str, chapter: str | None = None) -
     filtered_concepts = [
         concept
         for concept in filtered_concepts
-        if concept.importance_score >= 0.7 or relation_counts.get(concept.id, 0) >= 2 or len(concept.chapter_refs) >= 2
+        if concept.importance_score >= 0.55
+        or relation_counts.get(concept.id, 0) >= 1
+        or len(concept.chapter_refs) >= 1
+        or float(getattr(concept, "graph_rank_score", 0.0) or 0.0) > 0
     ]
-    filtered_concepts = sorted(filtered_concepts, key=lambda concept: (concept.importance_score, relation_counts.get(concept.id, 0)), reverse=True)[:260]
+    filtered_concepts = sorted(
+        filtered_concepts,
+        key=lambda concept: (
+            float(getattr(concept, "graph_rank_score", 0.0) or 0.0),
+            float((getattr(concept, "centrality_json", {}) or {}).get("centrality_score", 0.0)),
+            concept.importance_score,
+            relation_counts.get(concept.id, 0),
+        ),
+        reverse=True,
+    )[:360]
     concept_ids = {concept.id for concept in filtered_concepts}
     for concept in filtered_concepts:
         nodes.append(
@@ -859,6 +973,12 @@ def get_graph_payload(db: Session, course_id: str, chapter: str | None = None) -
                 "value": max(2.0, concept.importance_score * 12),
                 "chapter": concept.chapter_refs[0] if concept.chapter_refs else None,
                 "importance_score": concept.importance_score,
+                "evidence_count": getattr(concept, "evidence_count", 0),
+                "community_louvain": getattr(concept, "community_louvain", None),
+                "community_spectral": getattr(concept, "community_spectral", None),
+                "component_id": getattr(concept, "component_id", None),
+                "centrality_score": float((getattr(concept, "centrality_json", {}) or {}).get("centrality_score", 0.0)),
+                "graph_rank_score": getattr(concept, "graph_rank_score", 0.0),
             }
         )
 
@@ -872,6 +992,11 @@ def get_graph_payload(db: Session, course_id: str, chapter: str | None = None) -
                     "confidence": relation.confidence,
                     "category": "semantic",
                     "evidence_chunk_id": relation.evidence_chunk_id,
+                    "weight": getattr(relation, "weight", None),
+                    "semantic_similarity": getattr(relation, "semantic_similarity", None),
+                    "support_count": getattr(relation, "support_count", None),
+                    "relation_source": getattr(relation, "relation_source", None),
+                    "is_inferred": bool(getattr(relation, "is_inferred", False)),
                 }
             )
     return {"nodes": nodes, "edges": edges, "focus_chapter": chapter}

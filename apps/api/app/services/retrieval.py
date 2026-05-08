@@ -387,7 +387,10 @@ def lightweight_rerank(query: str, candidates: list[dict], top_k: int) -> list[d
 
 
 def rerank_or_return(query: str, candidates: list[dict], top_k: int) -> list[dict]:
-    flag = read_env_bool("RERANKER_ENABLED", get_settings().reranker_enabled)
+    settings = get_settings()
+    if not settings.reranker_enabled:
+        return lightweight_rerank(query, candidates, top_k)
+    flag = read_env_bool("RERANKER_ENABLED", settings.reranker_enabled)
     if flag:
         reranker = get_reranker()
         return reranker.rerank(query, candidates, top_k)

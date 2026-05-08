@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -12,7 +16,8 @@ from urllib.parse import urlparse
 class BridgeConfig:
     target_base_url: str = ""
     resolve_ip: str | None = None
-    timeout: int = 120
+    timeout: int = 180
+    resolved_ip_cache: tuple[str, float] | None = None
 
 
 class ModelBridgeHandler(BaseHTTPRequestHandler):
@@ -52,16 +57,19 @@ class ModelBridgeHandler(BaseHTTPRequestHandler):
         if not auth_header:
             raise ValueError("Missing Authorization header")
 
-        body_path = None
-        output_path = None
-        config_path = None
+        cleanup_private_temp_dirs("coursekg-model-bridge-", max_age_seconds=3600)
+        temp_dir = tempfile.mkdtemp(prefix="coursekg-model-bridge-")
         try:
-            with tempfile.NamedTemporaryFile("wb", delete=False, suffix=".json") as body_file:
+            os.chmod(temp_dir, 0o700)
+        except OSError:
+            pass
+        try:
+            with tempfile.NamedTemporaryFile("wb", delete=False, suffix=".json", dir=temp_dir) as body_file:
                 body_file.write(body)
                 body_path = body_file.name
-            with tempfile.NamedTemporaryFile("wb", delete=False, suffix=".json") as output_file:
+            with tempfile.NamedTemporaryFile("wb", delete=False, suffix=".json", dir=temp_dir) as output_file:
                 output_path = output_file.name
-            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".curl") as config_file:
+            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".curl", dir=temp_dir) as config_file:
                 config_file.write(f'url = "{target_url}"\n')
                 config_file.write("request = POST\n")
                 config_file.write(f"connect-timeout = {min(BridgeConfig.timeout, 30)}\n")
@@ -69,16 +77,20 @@ class ModelBridgeHandler(BaseHTTPRequestHandler):
                 config_file.write("retry = 2\n")
                 config_file.write("retry-delay = 1\n")
                 config_file.write("retry-all-errors\n")
-                if BridgeConfig.resolve_ip and BridgeConfig.resolve_ip != "__none__":
-                    config_file.write(f'resolve = "{parsed.hostname}:{port}:{BridgeConfig.resolve_ip}"\n')
+                resolve_ip = resolve_target_ip(parsed.hostname)
+                if resolve_ip:
+                    config_file.write(f'resolve = "{parsed.hostname}:{port}:{resolve_ip}"\n')
                 config_file.write(f'header = "Authorization: {auth_header}"\n')
                 config_file.write('header = "Content-Type: application/json"\n')
                 config_file.write(f'data-binary = "@{body_path.replace("\\", "/")}"\n')
                 config_file.write(f'output = "{output_path.replace("\\", "/")}"\n')
                 config_file.write('write-out = "%{http_code}"\n')
                 config_path = config_file.name
+            curl_binary = shutil.which("curl.exe") or shutil.which("curl")
+            if not curl_binary:
+                raise RuntimeError("curl is required by the model bridge but was not found")
             result = subprocess.run(
-                ["curl.exe", "-sS", "-K", config_path],
+                [curl_binary, "-sS", "-K", config_path],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -97,12 +109,7 @@ class ModelBridgeHandler(BaseHTTPRequestHandler):
                 response_body = b"{}"
             return status_code, response_body
         finally:
-            for path in (body_path, output_path, config_path):
-                if path:
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _send_json(self, status_code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -119,12 +126,82 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--target-base-url", required=True)
     parser.add_argument("--resolve-ip", default="")
-    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--timeout", type=int, default=180)
     return parser.parse_args()
+
+
+def resolve_target_ip(hostname: str) -> str | None:
+    configured = (BridgeConfig.resolve_ip or "").strip()
+    if configured and configured != "__none__":
+        return configured
+
+    cached = BridgeConfig.resolved_ip_cache
+    now = time.time()
+    if cached and cached[1] > now:
+        return cached[0]
+
+    ip = resolve_public_a_record(hostname)
+    if ip:
+        BridgeConfig.resolved_ip_cache = (ip, now + 300)
+    return ip
+
+
+def resolve_public_a_record(hostname: str) -> str | None:
+    for resolver_url in (
+        f"https://dns.alidns.com/resolve?name={hostname}&type=A",
+        f"https://cloudflare-dns.com/dns-query?name={hostname}&type=A",
+    ):
+        try:
+            request = urllib.request.Request(resolver_url, headers={"accept": "application/dns-json"})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            for answer in payload.get("Answer", []):
+                if int(answer.get("type", 0)) != 1:
+                    continue
+                value = str(answer.get("data", "")).strip()
+                if is_public_ip(value):
+                    return value
+        except Exception:
+            continue
+    return None
+
+
+def is_public_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def cleanup_private_temp_dirs(prefix: str, *, max_age_seconds: int) -> None:
+    temp_root = tempfile.gettempdir()
+    cutoff = time.time() - max_age_seconds
+    try:
+        names = os.listdir(temp_root)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        path = os.path.join(temp_root, name)
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
 
 
 def main() -> None:
     args = parse_args()
+    cleanup_private_temp_dirs("coursekg-model-bridge-", max_age_seconds=0)
     BridgeConfig.target_base_url = args.target_base_url.rstrip("/")
     BridgeConfig.resolve_ip = args.resolve_ip or None
     BridgeConfig.timeout = args.timeout

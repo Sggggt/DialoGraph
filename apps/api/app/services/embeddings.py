@@ -9,16 +9,23 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from pydantic import ValidationError
 
 from app.core.config import get_settings
+from app.schemas import GraphExtractionPayload
 
 
 class FallbackDisabledError(RuntimeError):
+    pass
+
+
+class GraphExtractionError(RuntimeError):
     pass
 
 
@@ -41,6 +48,34 @@ def validate_embedding_vectors(vectors: list[list[float]], *, expected_count: in
 def is_degraded_mode() -> bool:
     settings = get_settings()
     return not settings.openai_api_key
+
+
+def _exception_message(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            return exc.response.text or str(exc)
+        except Exception:
+            return str(exc)
+    return str(exc)
+
+
+def _is_unsupported_parameter_error(exc: Exception, parameter_name: str) -> bool:
+    message = _exception_message(exc).lower()
+    if parameter_name.lower() not in message:
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "invalidparameter",
+            "invalid parameter",
+            "unsupported",
+            "not support",
+            "not supported",
+            "unknown parameter",
+            "unrecognized",
+            "extra inputs",
+        )
+    )
 
 
 class EmbeddingProvider:
@@ -94,13 +129,25 @@ class EmbeddingProvider:
             "Authorization": f"Bearer {self.settings.openai_api_key}",
             "Content-Type": "application/json",
         }
-        data = await post_openai_compatible_json(
-            f"{self.settings.openai_base_url.rstrip('/')}/embeddings",
-            payload,
-            headers,
-            timeout=60.0,
-            resolve_ip=self.settings.openai_resolve_ip,
-        )
+        try:
+            data = await post_openai_compatible_json(
+                f"{self.settings.openai_base_url.rstrip('/')}/embeddings",
+                payload,
+                headers,
+                timeout=60.0,
+                resolve_ip=self.settings.openai_resolve_ip,
+            )
+        except Exception as exc:
+            if not _is_unsupported_parameter_error(exc, "dimensions"):
+                raise
+            payload.pop("dimensions", None)
+            data = await post_openai_compatible_json(
+                f"{self.settings.openai_base_url.rstrip('/')}/embeddings",
+                payload,
+                headers,
+                timeout=60.0,
+                resolve_ip=self.settings.openai_resolve_ip,
+            )
         return [item["embedding"] for item in data["data"]]
 
     def _fake_embedding(self, text: str) -> list[float]:
@@ -202,15 +249,16 @@ class ChatProvider:
             f"{text[:7000]}"
         )
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        payload: dict[str, Any] = {
-            "model": self.settings.chat_model,
-            "messages": messages,
-            "temperature": 0.1,
-            "response_format": {"type": "json_object"},
+        schema_format: dict[str, Any] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "graph_extraction_payload",
+                "schema": GraphExtractionPayload.model_json_schema(),
+            },
         }
         try:
-            return await self._post_chat_json(payload)
-        except Exception:
+            return await self._extract_graph_payload_with_format(messages, schema_format)
+        except Exception as exc:
             if not self.settings.enable_model_fallback:
                 raise
             return {"concepts": [], "relations": []}
@@ -227,7 +275,7 @@ class ChatProvider:
             "response_format": {"type": "json_object"},
         }
         try:
-            return await self._post_chat_json(payload)
+            return await self._post_chat_json_with_response_format_fallback(payload)
         except Exception:
             if not self.settings.enable_model_fallback:
                 raise
@@ -304,13 +352,169 @@ class ChatProvider:
             f"{self.settings.openai_base_url.rstrip('/')}/chat/completions",
             payload,
             headers,
-            timeout=90.0,
+            timeout=180.0,
             resolve_ip=self.settings.openai_resolve_ip,
         )
-        return data["choices"][0]["message"]["content"]
+        return self._normalize_chat_content(data)
 
     async def _post_chat_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._parse_json_object(await self._post_chat_text(payload))
+
+    async def _post_chat_json_with_response_format_fallback(self, payload: dict[str, Any]) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for candidate in self._response_format_candidates(payload.get("response_format")):
+            candidate_payload = self._payload_with_response_format(payload, candidate)
+            try:
+                return await self._post_chat_json(candidate_payload)
+            except Exception as exc:
+                last_error = exc
+                if not self._is_unsupported_response_format_error(exc):
+                    raise
+        raise RuntimeError(f"Chat JSON request failed after response_format fallback: {last_error}")
+
+    async def _extract_graph_payload_with_format(self, messages: list[dict[str, str]], response_format: dict[str, Any]) -> dict[str, Any]:
+        raw_text = await self._post_chat_text_with_response_format_fallback(
+            {
+                "model": self.settings.chat_model,
+                "messages": messages,
+                "temperature": 0.1,
+                "response_format": response_format,
+            }
+        )
+        try:
+            parsed = json.loads(raw_text.strip())
+        except json.JSONDecodeError:
+            raw_text = await self._repair_graph_payload(raw_text, response_format)
+            try:
+                parsed = json.loads(raw_text.strip())
+            except json.JSONDecodeError as exc:
+                raise GraphExtractionError(f"Graph extraction JSON parse failed after repair: {exc}") from exc
+        try:
+            return GraphExtractionPayload.model_validate(parsed).model_dump()
+        except ValidationError as exc:
+            raise GraphExtractionError(f"Graph extraction payload failed schema validation: {exc}") from exc
+
+    async def _repair_graph_payload(self, raw_text: str, response_format: dict[str, Any]) -> str:
+        payload: dict[str, Any] = {
+            "model": self.settings.chat_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Repair the user-provided graph extraction output into strict JSON that matches the schema. "
+                        "Return only the JSON object with concepts and relations. Do not add markdown or commentary."
+                    ),
+                },
+                {"role": "user", "content": raw_text[:12000]},
+            ],
+            "temperature": 0.0,
+            "response_format": response_format,
+        }
+        return await self._post_chat_text_with_response_format_fallback(payload)
+
+    async def _post_chat_text_with_response_format_fallback(self, payload: dict[str, Any]) -> str:
+        last_error: Exception | None = None
+        for candidate in self._response_format_candidates(payload.get("response_format")):
+            candidate_payload = self._payload_with_response_format(payload, candidate)
+            try:
+                return await self._post_chat_text(candidate_payload)
+            except Exception as exc:
+                last_error = exc
+                if not self._is_unsupported_response_format_error(exc):
+                    raise
+        raise RuntimeError(f"Chat request failed after response_format fallback: {last_error}")
+
+    def _response_format_candidates(self, response_format: dict[str, Any] | None) -> list[dict[str, Any] | None]:
+        if not response_format:
+            return [None]
+        response_type = response_format.get("type")
+        if response_type == "json_schema":
+            return [response_format, {"type": "json_object"}, None]
+        if response_type == "json_object":
+            return [response_format, None]
+        return [response_format, None]
+
+    def _payload_with_response_format(self, payload: dict[str, Any], response_format: dict[str, Any] | None) -> dict[str, Any]:
+        candidate = dict(payload)
+        if response_format is None:
+            candidate.pop("response_format", None)
+            messages = [dict(item) for item in candidate.get("messages", [])]
+            if messages and messages[0].get("role") == "system":
+                messages[0]["content"] = f"{messages[0].get('content', '')}\nReturn only a valid JSON object. Do not use markdown fences."
+            else:
+                messages.insert(0, {"role": "system", "content": "Return only a valid JSON object. Do not use markdown fences."})
+            candidate["messages"] = messages
+        else:
+            candidate["response_format"] = response_format
+        return candidate
+
+    def _normalize_chat_content(self, data: dict[str, Any]) -> str:
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("Chat response did not contain choices")
+        choice = choices[0]
+        if isinstance(choice.get("text"), str):
+            return choice["text"]
+        message = choice.get("message") or {}
+        refusal = message.get("refusal")
+        if isinstance(refusal, str) and refusal.strip():
+            raise RuntimeError(f"Chat response refusal: {refusal.strip()}")
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                return content
+            raise RuntimeError("Chat response content is empty")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                    elif isinstance(text, dict) and isinstance(text.get("value"), str):
+                        parts.append(text["value"])
+                    elif isinstance(part.get("content"), str):
+                        parts.append(part["content"])
+            normalized = "".join(parts).strip()
+            if normalized:
+                return normalized
+        raise RuntimeError("Chat response did not contain text content")
+
+    def _is_unsupported_structured_output_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "json_schema" in message and any(
+            marker in message
+            for marker in (
+                "response_format",
+                "invalid",
+                "unsupported",
+                "not support",
+                "not supported",
+                "invalidparameter",
+                "invalid parameter",
+            )
+        )
+
+    def _is_unsupported_response_format_error(self, exc: Exception) -> bool:
+        message = _exception_message(exc).lower()
+        if "response_format" not in message and "json_schema" not in message and "json_object" not in message:
+            return False
+        return any(
+            marker in message
+            for marker in (
+                "invalid",
+                "unsupported",
+                "not support",
+                "not supported",
+                "unknown parameter",
+                "unrecognized",
+                "invalidparameter",
+                "invalid parameter",
+                "extra inputs",
+            )
+        )
 
     def _extractive_answer(self, question: str, contexts: list[dict]) -> str:
         lead = next((item for item in contexts if item.get("metadata", {}).get("content_kind") != "code"), contexts[0])
@@ -355,7 +559,12 @@ async def post_openai_compatible_json(
                 return await asyncio.to_thread(_post_json_with_curl_resolve, url, payload, headers, timeout, normalized_resolve_ip)
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 response = await client.post(url, json=payload, headers=headers)
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    raise httpx.HTTPStatusError(
+                        f"OpenAI-compatible request failed with HTTP {response.status_code}: {response.text}",
+                        request=response.request,
+                        response=response,
+                    )
                 return response.json()
         except Exception as exc:
             last_error = exc
@@ -369,6 +578,8 @@ def _is_retryable_openai_error(exc: Exception) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
         return status_code == 429 or status_code >= 500
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True
     message = str(exc).lower()
     non_retryable_markers = ("invalidparameter", "invalid parameter", "unauthorized", "forbidden", "401", "403")
     if any(marker in message for marker in non_retryable_markers):
@@ -403,14 +614,18 @@ def _post_json_with_curl_resolve(
     parsed = urlparse(url)
     if not parsed.hostname:
         raise ValueError(f"Invalid OpenAI-compatible URL: {url}")
+    _cleanup_private_temp_dirs("coursekg-openai-", max_age_seconds=3600)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    payload_path = None
-    config_path = None
+    temp_dir = tempfile.mkdtemp(prefix="coursekg-openai-")
     try:
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json") as payload_file:
+        os.chmod(temp_dir, 0o700)
+    except OSError:
+        pass
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".json", dir=temp_dir) as payload_file:
             json.dump(payload, payload_file, ensure_ascii=False)
             payload_path = payload_file.name
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".curl") as config_file:
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".curl", dir=temp_dir) as config_file:
             payload_ref = payload_path.replace("\\", "/")
             config_file.write(f'url = "{url}"\n')
             config_file.write("request = POST\n")
@@ -439,9 +654,22 @@ def _post_json_with_curl_resolve(
             raise RuntimeError(json.dumps(data["error"], ensure_ascii=False))
         return data
     finally:
-        for path in (payload_path, config_path):
-            if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _cleanup_private_temp_dirs(prefix: str, *, max_age_seconds: int) -> None:
+    temp_root = tempfile.gettempdir()
+    cutoff = time.time() - max_age_seconds
+    try:
+        names = os.listdir(temp_root)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        path = os.path.join(temp_root, name)
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue

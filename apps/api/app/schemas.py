@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 JobState = Literal[
@@ -20,6 +20,16 @@ CourseFileStatus = Literal["pending", "parsing", "parsed", "failed", "skipped"]
 SourceType = Literal["pdf", "ppt", "pptx", "docx", "markdown", "text", "image", "notebook", "html", "unknown"]
 AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
 AgentRunState = Literal["queued", "running", "needs_clarification", "completed", "failed"]
+GraphRelationType = Literal[
+    "defines",
+    "relates_to",
+    "prerequisite_of",
+    "example_of",
+    "solves",
+    "compares",
+    "extends",
+    "mentions",
+]
 
 
 class SearchFilters(BaseModel):
@@ -62,6 +72,41 @@ class Citation(BaseModel):
     snippet: str
 
 
+class GraphExtractionConcept(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    aliases: list[str] = Field(default_factory=list)
+    summary: str = ""
+    concept_type: str = Field(default="concept", min_length=1, max_length=64)
+    importance_score: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @field_validator("name", "summary", "concept_type")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("aliases")
+    @classmethod
+    def strip_aliases(cls, value: list[str]) -> list[str]:
+        return [item.strip() for item in value if item.strip()]
+
+
+class GraphExtractionRelation(BaseModel):
+    source: str = Field(min_length=1, max_length=255)
+    target: str = Field(min_length=1, max_length=255)
+    relation_type: GraphRelationType
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @field_validator("source", "target")
+    @classmethod
+    def strip_endpoint(cls, value: str) -> str:
+        return value.strip()
+
+
+class GraphExtractionPayload(BaseModel):
+    concepts: list[GraphExtractionConcept] = Field(default_factory=list)
+    relations: list[GraphExtractionRelation] = Field(default_factory=list)
+
+
 class SearchRequest(BaseModel):
     query: str
     course_id: str | None = None
@@ -76,6 +121,7 @@ class SearchResult(BaseModel):
     citations: list[Citation]
     metadata: dict
     content: str | None = None
+    child_content: str | None = None
     document_title: str | None = None
     source_path: str | None = None
     chapter: str | None = None
@@ -217,20 +263,13 @@ class CleanupStaleGraphResponse(BaseModel):
 
 
 class RebuildGraphResponse(BaseModel):
-    graph_rebuilt: bool
-    concepts: int
-    relations: int
-    graph_nodes: int
-    graph_edges: int
-    graph_extraction_provider: str
-    graph_extraction_chunk_limit: int
-    graph_extraction_chunks_per_document: int
-    graph_llm_selected_chunks: int
-    graph_llm_source_documents: int
-    graph_llm_success_chunks: int
-    graph_llm_failed_chunks: int
-    graph_total_active_chunks: int
-    graph_source_documents: int
+    batch_id: str
+    state: str
+
+
+class BatchLogTokenResponse(BaseModel):
+    token: str
+    expires_at: datetime
 
 
 class DeleteCourseResponse(BaseModel):
@@ -340,6 +379,9 @@ class RelatedConcept(BaseModel):
     relation_type: str
     target_name: str
     confidence: float | None = None
+    weight: float | None = None
+    relation_source: str | None = None
+    is_inferred: bool = False
 
 
 class ConceptCard(BaseModel):
@@ -361,6 +403,12 @@ class GraphNode(BaseModel):
     chapter: str | None = None
     importance_score: float | None = None
     source_type: str | None = None
+    evidence_count: int | None = None
+    community_louvain: int | None = None
+    community_spectral: int | None = None
+    component_id: int | None = None
+    centrality_score: float | None = None
+    graph_rank_score: float | None = None
 
 
 class GraphEdge(BaseModel):
@@ -370,6 +418,11 @@ class GraphEdge(BaseModel):
     confidence: float | None = None
     category: str | None = None
     evidence_chunk_id: str | None = None
+    weight: float | None = None
+    semantic_similarity: float | None = None
+    support_count: int | None = None
+    relation_source: str | None = None
+    is_inferred: bool = False
 
 
 class GraphResponse(BaseModel):
@@ -489,6 +542,11 @@ class GraphNodeRelation(BaseModel):
     target_concept_id: str | None = None
     target_name: str
     confidence: float
+    weight: float | None = None
+    semantic_similarity: float | None = None
+    support_count: int | None = None
+    relation_source: str | None = None
+    is_inferred: bool = False
     evidence: Citation | None = None
 
 
@@ -501,6 +559,12 @@ class GraphNodeDetail(BaseModel):
     chapter_refs: list[str]
     concept_type: str
     importance_score: float
+    evidence_count: int = 0
+    community_louvain: int | None = None
+    community_spectral: int | None = None
+    component_id: int | None = None
+    centrality: dict = Field(default_factory=dict)
+    graph_rank_score: float = 0.0
     relations: list[GraphNodeRelation]
 
 

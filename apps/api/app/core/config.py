@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_resolve_ip: str | None = None
+    model_bridge_enabled: bool = False
+    model_bridge_port: int = 8765
     embedding_model: str = "text-embedding-v4"
     chat_model: str = "qwen-plus"
     embedding_dimensions: int = 1024
@@ -103,12 +105,30 @@ def get_settings() -> Settings:
 
     api_base_url = os.getenv("API_OPENAI_BASE_URL")
     api_resolve_ip = os.getenv("API_OPENAI_RESOLVE_IP")
+    model_bridge_enabled = str(os.getenv("MODEL_BRIDGE_ENABLED") or env_entries.get("MODEL_BRIDGE_ENABLED", "")).lower() in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }
+    model_bridge_port = os.getenv("MODEL_BRIDGE_PORT") or env_entries.get("MODEL_BRIDGE_PORT")
+    if model_bridge_port:
+        try:
+            settings.model_bridge_port = int(model_bridge_port)
+        except ValueError:
+            pass
+    settings.model_bridge_enabled = model_bridge_enabled
     if api_base_url:
         settings.openai_base_url = api_base_url
+    elif model_bridge_enabled:
+        settings.openai_base_url = f"http://host.docker.internal:{settings.model_bridge_port}"
+        settings.openai_resolve_ip = "__none__"
     elif settings.openai_base_url == "https://api.openai.com/v1" and env_entries.get("OPENAI_BASE_URL"):
         settings.openai_base_url = env_entries["OPENAI_BASE_URL"]
     if api_resolve_ip is not None:
         settings.openai_resolve_ip = api_resolve_ip
+    elif model_bridge_enabled:
+        settings.openai_resolve_ip = "__none__"
     elif env_entries.get("OPENAI_RESOLVE_IP") is not None:
         settings.openai_resolve_ip = env_entries.get("OPENAI_RESOLVE_IP")
 

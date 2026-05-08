@@ -176,6 +176,7 @@ def test_api_key_middleware_rejects_missing_key(monkeypatch):
     client = TestClient(app)
     assert client.get("/api/health").status_code == 200
     assert client.get("/api/settings/model").status_code == 401
+    assert client.get("/api/settings/model?api_key=secret-key").status_code == 401
     assert client.get("/api/settings/model", headers={"X-API-Key": "secret-key"}).status_code == 200
 
     monkeypatch.delenv("API_KEYS")
