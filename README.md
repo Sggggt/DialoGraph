@@ -182,13 +182,13 @@ $$
 每个概念按证据量动态决定发出候选边数量：
 
 $$
-K_i = \operatorname{clamp}(4 + \lfloor \log_2(1 + m_i) \rfloor, 4, 12)
+K_i = \mathrm{clamp}(4 + \lfloor \log_2(1 + m_i) \rfloor, 4, 12)
 $$
 
 每个概念按章节覆盖动态限制接收反向候选：
 
 $$
-R_i = \operatorname{clamp}(2 + \lfloor \log_2(1 + r_i) \rfloor, 2, 8)
+R_i = \mathrm{clamp}(2 + \lfloor \log_2(1 + r_i) \rfloor, 2, 8)
 $$
 
 $m_i$ 是证据 chunk 数，$r_i$ 是章节引用数。系统保留互为近邻、通过反向接收限制的近邻，以及高置信 LLM 显式关系，从而让边数随节点数近线性增长。

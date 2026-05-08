@@ -182,13 +182,13 @@ $C_e$ is the set of active child chunks supporting entity $e$. The centroid is n
 Each concept dynamically chooses outgoing candidates from its evidence volume:
 
 $$
-K_i = \operatorname{clamp}(4 + \lfloor \log_2(1 + m_i) \rfloor, 4, 12)
+K_i = \mathrm{clamp}(4 + \lfloor \log_2(1 + m_i) \rfloor, 4, 12)
 $$
 
 Each concept dynamically limits accepted reciprocal candidates from chapter coverage:
 
 $$
-R_i = \operatorname{clamp}(2 + \lfloor \log_2(1 + r_i) \rfloor, 2, 8)
+R_i = \mathrm{clamp}(2 + \lfloor \log_2(1 + r_i) \rfloor, 2, 8)
 $$
 
 $m_i$ is evidence chunk count and $r_i$ is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reciprocal cap, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
