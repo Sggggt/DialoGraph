@@ -191,8 +191,15 @@ def is_parent_chunk(chunk: Chunk) -> bool:
     return bool((chunk.metadata_json or {}).get("is_parent"))
 
 
-def is_child_retrieval_candidate(chunk: Chunk) -> bool:
-    return not is_parent_chunk(chunk)
+def is_child_retrieval_candidate(chunk: Chunk, db: Session) -> bool:
+    if not is_parent_chunk(chunk):
+        return True
+    # Parent chunks with no children are valid retrieval candidates themselves
+    # (they are the finest-grained unit for that document segment).
+    has_children = db.scalar(
+        select(1).where(Chunk.parent_chunk_id == chunk.id).limit(1)
+    ) is not None
+    return not has_children
 
 
 def expand_results_with_parent_context(db: Session, course_id: str, results: list[dict]) -> list[dict]:
@@ -300,7 +307,7 @@ async def dense_search_chunks(db: Session, course_id: str, query: str, filters: 
     dense_scores: list[float] = []
     for result in results:
         chunk = db.get(Chunk, result["id"])
-        if chunk is None or chunk.course_id != course_id or not chunk.is_active or not is_child_retrieval_candidate(chunk):
+        if chunk is None or chunk.course_id != course_id or not chunk.is_active or not is_child_retrieval_candidate(chunk, db):
             continue
         document = db.get(Document, chunk.document_id)
         if document is None or document.course_id != course_id:
@@ -806,11 +813,11 @@ async def local_graph_search(
     # 4. Build result set: seed chunks get highest score, neighbor next, base dense fills remaining
     result_map: dict[str, dict] = {}
     for chunk in seed_chunks:
-        if not is_child_retrieval_candidate(chunk):
+        if not is_child_retrieval_candidate(chunk, db):
             continue
         result_map[str(chunk.id)] = chunk_to_result(chunk, score=1.0, source="local_graph_seed")
     for chunk in neighbor_chunks:
-        if not is_child_retrieval_candidate(chunk):
+        if not is_child_retrieval_candidate(chunk, db):
             continue
         cid = str(chunk.id)
         if cid not in result_map:
@@ -933,7 +940,7 @@ def lexical_search_chunks(db: Session, course_id: str, query: str, filters: Sear
     corpus: list[list[str]] = []
     chunk_documents: list[tuple[Chunk, Document]] = []
     for chunk, document in rows:
-        if not is_child_retrieval_candidate(chunk):
+        if not is_child_retrieval_candidate(chunk, db):
             continue
         if filters.chapter and chunk.chapter != filters.chapter:
             continue

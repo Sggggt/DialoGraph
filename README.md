@@ -310,7 +310,7 @@ $$
 | `community`      | `community_search_chunks`                           | 限定在感知到的 Louvain 社区内，对社区概念关联的 evidence chunk 做 dense 召回融合，社区内 chunk 额外 +0.15 分数 boost |
 | `hybrid`（默认） | `layered_search_chunks` / `graph_enhanced_search` | 按 Query Type 分层路由：Layer 1 Fast / Layer 2 Standard / Layer 3 Deep Graph                                         |
 
-所有策略都遵循 **Small-to-Big** 原则：只召回 child chunks，避免 parent/child 竞争，最终通过 `parent_chunk_id` 装配 parent context。
+所有策略都遵循 **Small-to-Big** 原则：召回最小粒度单元（child chunks，或没有 child 的 parent chunks 自身），避免 parent/child 在同一候选池竞争，最终通过 `parent_chunk_id` 装配 parent context。
 
 ### DocumentGrader（文档评分层）
 
@@ -393,14 +393,14 @@ embedding 向量与检索结果写入 Redis，TTL 绑定 embedding text version 
 
 ### Small-to-Big 检索
 
-主检索路径只让 child chunks 进入召回和精排，最终再装配 parent context：
+主检索路径只让最小粒度单元进入召回和精排，最终再装配 parent context：
 
 ```text
-child dense recall + child BM25 recall
+最小粒度单元 dense recall + 最小粒度单元 BM25 recall
 -> weighted fusion
 -> rerank
--> load parent_chunk_id
--> child evidence + parent context + citations
+-> load parent_chunk_id（如有）
+-> 最小粒度证据 + parent context（如有）+ citations
 ```
 
 检索结果携带 `retrieval_granularity=child_with_parent_context`、dense score、BM25 score、融合分数、精排分数、graph boost 和模型审计字段。

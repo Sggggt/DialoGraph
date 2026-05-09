@@ -310,7 +310,7 @@ The execution layer dispatches to different retrieval backends based on strategy
 | `community`        | `community_search_chunks`                           | Restricts to perceived Louvain communities, blends dense recall with community-concept evidence chunks, and applies a +0.15 score boost inside the community |
 | `hybrid` (default) | `layered_search_chunks` / `graph_enhanced_search` | Query-Type layer routing: Layer 1 Fast / Layer 2 Standard / Layer 3 Deep Graph                                                                               |
 
-All strategies follow the **Small-to-Big** principle: only child chunks enter recall and reranking; parent context is assembled later via `parent_chunk_id`.
+All strategies follow the **Small-to-Big** principle: only the finest-grained units enter recall and reranking (child chunks, or parent chunks that have no children and thus represent the finest granularity themselves); parent context is assembled later via `parent_chunk_id` where available.
 
 ### DocumentGrader
 
@@ -393,14 +393,14 @@ Embeddings and retrieval results are cached in Redis with TTL bound to embedding
 
 ### Small-To-Big Retrieval
 
-The main retrieval path sends only child chunks through recall and reranking, then attaches parent context:
+The main retrieval path sends only the finest-grained units through recall and reranking, then attaches parent context:
 
 ```text
-child dense recall + child BM25 recall
+finest-grained dense recall + finest-grained BM25 recall
 -> weighted fusion
 -> rerank
--> load parent_chunk_id
--> child evidence + parent context + citations
+-> load parent_chunk_id (if available)
+-> finest-grained evidence + parent context (if available) + citations
 ```
 
 This avoids both coarse recall from overly large chunks and missing context from tiny chunks. Retrieval results carry `retrieval_granularity=child_with_parent_context`, dense score, BM25 score, fused score, rerank score, graph boost, and model audit fields.

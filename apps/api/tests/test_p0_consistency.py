@@ -408,7 +408,7 @@ async def test_ingest_deduplicates_chunks_and_skips_empty_effective_payload(db_s
             chapter="Existing",
             section="Existing",
             source_type="markdown",
-            metadata_json={"content_kind": "markdown"},
+            metadata_json={"content_kind": "markdown", "is_parent": True},
             embedding_status="ready",
             is_active=True,
         )

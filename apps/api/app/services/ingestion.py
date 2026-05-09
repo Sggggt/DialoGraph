@@ -819,15 +819,19 @@ def deactivate_duplicate_documents(
     return stale_chunk_ids
 
 
-def chunk_content_hash(content: str) -> str:
-    return hashlib.sha256(normalize_for_dedup(content).encode("utf-8", errors="ignore")).hexdigest()
+def chunk_content_hash(content: str, is_parent: bool = False) -> str:
+    prefix = "parent:" if is_parent else "child:"
+    return hashlib.sha256((prefix + normalize_for_dedup(content)).encode("utf-8", errors="ignore")).hexdigest()
 
 
 def active_chunk_hashes_for_course(db: Session, course_id: str, excluded_document_id: str | None = None) -> set[str]:
-    query = select(Chunk.content).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))
+    query = select(Chunk.content, Chunk.metadata_json).where(Chunk.course_id == course_id, Chunk.is_active.is_(True))
     if excluded_document_id:
         query = query.where(Chunk.document_id != excluded_document_id)
-    return {chunk_content_hash(content) for content in db.scalars(query).all()}
+    return {
+        chunk_content_hash(content, bool(metadata.get("is_parent")))
+        for content, metadata in db.execute(query).all()
+    }
 
 
 async def ingest_file(
@@ -993,7 +997,7 @@ async def _ingest_file_locked(
     for payload in chunk_payloads:
         if not payload.get("is_parent"):
             continue
-        content_hash = chunk_content_hash(payload["content"])
+        content_hash = chunk_content_hash(payload["content"], is_parent=True)
         if content_hash in seen_parent_hashes:
             deduplicated_chunks += 1
             continue
@@ -1028,7 +1032,7 @@ async def _ingest_file_locked(
     for payload in chunk_payloads:
         if payload.get("is_parent"):
             continue
-        content_hash = chunk_content_hash(payload["content"])
+        content_hash = chunk_content_hash(payload["content"], is_parent=False)
         if content_hash in seen_child_hashes:
             deduplicated_chunks += 1
             continue
