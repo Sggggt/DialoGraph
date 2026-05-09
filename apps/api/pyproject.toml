@@ -30,7 +30,10 @@ dependencies = [
   "networkx>=3.4.2",
   "numpy>=2.1.0",
   "scipy>=1.14.0",
-  "portalocker>=3.0.0"
+  "portalocker>=3.0.0",
+  "jieba>=0.42.1",
+  "redis>=5.0.0",
+  "tiktoken>=0.8.0",
 ]
 
 [project.optional-dependencies]

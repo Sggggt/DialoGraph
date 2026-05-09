@@ -13,18 +13,36 @@ interface AgentTracePanelProps {
 }
 
 const traceNodeLabels: Record<string, string> = {
+  perception: "感知",
+  retrieval_planner: "检索规划",
   query_analyzer: "问题分析",
   router: "路由判断",
   query_rewriter: "查询改写",
+  retrieval_decision: "检索决策",
   retrievers: "检索召回",
   document_grader: "证据筛选",
+  evidence_evaluator: "证据评估",
+  retry_planner: "重试规划",
+  context_synthesizer: "上下文合成",
   answer_generator: "答案生成",
   citation_checker: "引用校验",
+  citation_verifier: "引用验证",
+  reflection: "反思",
+  answer_corrector: "答案修正",
+  self_check: "自检",
   error: "错误",
 };
 
 function traceNodeLabel(node: string): string {
   return traceNodeLabels[node] ?? node;
+}
+
+function traceBadgeVariant(node: string, output: string | null, status: string): "default" | "secondary" | "destructive" | "outline" {
+  if (status === "failed") return "destructive";
+  if (node === "reflection" && output?.includes("has_issue=True")) return "destructive";
+  if (node === "retrieval_decision" && output?.includes("skip_retrieval=True")) return "outline";
+  if (node === "citation_verifier" && output && parseInt(output.match(/(\d+) unverified/)?.[1] ?? "0", 10) > 0) return "destructive";
+  return "secondary";
 }
 
 export function AgentTracePanel({ trace }: AgentTracePanelProps) {
@@ -46,14 +64,21 @@ export function AgentTracePanel({ trace }: AgentTracePanelProps) {
             ) : (
               trace.map((event, index) => {
                 const Icon = event.status === "failed" ? XCircle : event.duration_ms > 0 ? CheckCircle2 : Activity;
+                const badgeVariant = traceBadgeVariant(event.node, event.output_summary ?? null, event.status);
                 return (
                   <div key={event.id ?? `${event.node}-${index}`} className="rounded-lg border border-white/10 bg-black/10 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div className="flex min-w-0 items-center gap-2">
                         <Icon data-icon="inline-start" />
                         <span className="truncate text-sm font-medium">{traceNodeLabel(event.node)}</span>
+                        {event.node === "reflection" && event.output_summary?.includes("has_issue=True") ? (
+                          <Badge variant="destructive" className="text-[10px]">需修正</Badge>
+                        ) : null}
+                        {event.node === "retrieval_decision" && event.output_summary?.includes("skip_retrieval=True") ? (
+                          <Badge variant="outline" className="text-[10px]">跳过检索</Badge>
+                        ) : null}
                       </div>
-                      <Badge variant={event.status === "failed" ? "destructive" : "secondary"}>
+                      <Badge variant={badgeVariant}>
                         <Clock3 data-icon="inline-start" />
                         {event.duration_ms} ms
                       </Badge>

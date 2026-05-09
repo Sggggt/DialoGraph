@@ -34,7 +34,9 @@ def sanitize_metadata(value: Any) -> Any:
 
 
 def rough_token_count(text: str) -> int:
-    return max(1, len(text.split()))
+    from app.services.chinese_text import estimate_tokens
+
+    return max(1, estimate_tokens(text))
 
 
 DEFAULT_CHUNK_SIZE = 800
@@ -74,6 +76,26 @@ def split_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: i
     return [chunk for chunk in chunks if chunk]
 
 
+def _smart_join(parts: list[str]) -> str:
+    """Join sentence/paragraph parts with a space only when both neighbours are
+    Latin-script (to avoid inserting spurious spaces inside Chinese text)."""
+    if not parts:
+        return ""
+    result = [parts[0]]
+    for prev, nxt in zip(parts, parts[1:]):
+        # Need a space when both sides look like Latin words without intervening
+        # punctuation/whitespace.
+        prev_needs_space = prev and prev[-1].isalnum() and not _RE_CJK_CHAR.search(prev[-1])
+        nxt_needs_space = nxt and nxt[0].isalnum() and not _RE_CJK_CHAR.search(nxt[0])
+        if prev_needs_space and nxt_needs_space:
+            result.append(" ")
+        result.append(nxt)
+    return "".join(result)
+
+
+_RE_CJK_CHAR = re.compile(r"[\u4e00-\u9fff]")
+
+
 def split_text_sentences(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[str]:
     """基于句子边界的文本切分，确保不会在句子中间截断。支持中英文标点。"""
     normalized = normalize_text(text)
@@ -91,13 +113,13 @@ def split_text_sentences(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_
         sentence_len = len(sentence)
         if sentence_len > chunk_size:
             if current_chunk:
-                chunks.append(" ".join(current_chunk))
+                chunks.append(_smart_join(current_chunk))
                 current_chunk = []
                 current_length = 0
             chunks.extend(split_text(sentence, chunk_size, chunk_overlap))
             continue
         if current_length + sentence_len > chunk_size and current_chunk:
-            chunks.append(" ".join(current_chunk))
+            chunks.append(_smart_join(current_chunk))
             overlap_chunk: list[str] = []
             overlap_length = 0
             for s in reversed(current_chunk):
@@ -112,7 +134,7 @@ def split_text_sentences(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_
         current_length += sentence_len + 1
 
     if current_chunk:
-        chunks.append(" ".join(current_chunk))
+        chunks.append(_smart_join(current_chunk))
 
     return [c.strip() for c in chunks if c.strip()]
 
@@ -166,7 +188,7 @@ async def split_text_semantic_embeddings(
     def flush() -> None:
         nonlocal current, current_length
         if current:
-            chunks.append(" ".join(current).strip())
+            chunks.append(_smart_join(current).strip())
             overlap_units: list[str] = []
             overlap_length = 0
             for unit in reversed(current):

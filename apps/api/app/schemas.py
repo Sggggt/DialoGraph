@@ -262,9 +262,16 @@ class CleanupStaleGraphResponse(BaseModel):
     removed_concepts: int = 0
 
 
+class RebuildGraphRequest(BaseModel):
+    mode: str = "incremental"
+
+
 class RebuildGraphResponse(BaseModel):
     batch_id: str
     state: str
+    mode: str = "full"
+    affected_documents: int = 0
+    previous_batch_id: str | None = None
 
 
 class BatchLogTokenResponse(BaseModel):

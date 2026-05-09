@@ -113,6 +113,7 @@ class Concept(TimestampMixin, Base):
     component_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     centrality_json: Mapped[dict] = mapped_column(JSON, default=dict)
     graph_rank_score: Mapped[float] = mapped_column(Float, default=0.0)
+    source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
 
     course: Mapped["Course"] = relationship(back_populates="concepts")
     aliases: Mapped[list["ConceptAlias"]] = relationship(back_populates="concept")
@@ -148,6 +149,7 @@ class ConceptRelation(Base):
     relation_source: Mapped[str] = mapped_column(String(64), default="llm")
     is_inferred: Mapped[bool] = mapped_column(Boolean, default=False)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

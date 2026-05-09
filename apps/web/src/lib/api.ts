@@ -165,10 +165,11 @@ export async function cleanupStaleGraph(courseId?: string | null): Promise<Clean
   return parseResponse<CleanupStaleGraphResponse>(response);
 }
 
-export async function rebuildGraph(courseId?: string | null): Promise<BatchStartResponse> {
+export async function rebuildGraph(courseId?: string | null, mode: "incremental" | "full" = "incremental"): Promise<BatchStartResponse> {
   const response = await fetch(buildApiUrl("/maintenance/rebuild-graph", { course_id: courseId }), {
     method: "POST",
-    headers: authHeaders(),
+    headers: jsonHeaders(),
+    body: JSON.stringify({ mode }),
   });
   return parseResponse<BatchStartResponse>(response);
 }

@@ -226,9 +226,16 @@ export interface CleanupStaleGraphResponse {
   removed_concepts: number;
 }
 
+export interface RebuildGraphRequest {
+  mode: "incremental" | "full";
+}
+
 export interface RebuildGraphResponse {
   batch_id: string;
   state: string;
+  mode: string;
+  affected_documents: number;
+  previous_batch_id?: string | null;
 }
 
 export interface BatchLogTokenResponse {

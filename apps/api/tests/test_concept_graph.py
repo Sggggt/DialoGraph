@@ -511,6 +511,39 @@ async def test_chat_provider_repairs_invalid_graph_json(no_fallback_env, monkeyp
     assert calls[1]["temperature"] == 0.0
 
 
+def test_get_or_create_concept_tracks_source_document_ids(db_session, sample_course):
+    from app.services.concept_graph import get_or_create_concept
+
+    concept, created = get_or_create_concept(
+        db_session,
+        sample_course.id,
+        "Test Concept",
+        "chapter",
+        "unit test summary",
+        aliases=[],
+        concept_type="concept",
+        importance_score=0.5,
+        document_id="doc-1",
+    )
+    assert created is True
+    assert "doc-1" in concept.source_document_ids
+
+    concept2, created2 = get_or_create_concept(
+        db_session,
+        sample_course.id,
+        "Test Concept",
+        "chapter",
+        "unit test summary",
+        aliases=[],
+        concept_type="concept",
+        importance_score=0.5,
+        document_id="doc-2",
+    )
+    assert created2 is False
+    assert concept2.id == concept.id
+    assert sorted(concept2.source_document_ids) == ["doc-1", "doc-2"]
+
+
 def test_sync_graph_chapter_labels_normalizes_existing_refs(db_session, sample_course):
     from app.models import Chunk, Concept, ConceptRelation, Document, DocumentVersion
     from app.services.concept_graph import sync_graph_chapter_labels

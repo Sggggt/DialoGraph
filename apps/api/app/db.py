@@ -97,6 +97,7 @@ SCHEMA_PATCHES: dict[str, dict[str, str]] = {
         "component_id": "INTEGER",
         "centrality_json": "JSON DEFAULT '{}'",
         "graph_rank_score": "FLOAT DEFAULT 0",
+        "source_document_ids": "JSON DEFAULT '[]'",
     },
     "concept_relations": {
         "confidence": "FLOAT DEFAULT 0.55",
@@ -108,6 +109,7 @@ SCHEMA_PATCHES: dict[str, dict[str, str]] = {
         "relation_source": "VARCHAR(64) DEFAULT 'llm'",
         "is_inferred": "BOOLEAN DEFAULT false",
         "metadata_json": "JSON DEFAULT '{}'",
+        "source_document_ids": "JSON DEFAULT '[]'",
     },
     "ingestion_jobs": {
         "batch_id": "VARCHAR(36)",

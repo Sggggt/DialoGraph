@@ -5,7 +5,7 @@ import asyncio
 from collections import defaultdict
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 from pydantic import ValidationError
 
@@ -338,6 +338,7 @@ def get_or_create_concept(
     aliases: list[str],
     concept_type: str,
     importance_score: float,
+    document_id: str | None = None,
 ) -> tuple[Concept, bool]:
     normalized = normalize_concept_name(name)
     chapter_ref = None if is_invalid_chapter_label(chapter) else chapter
@@ -358,6 +359,7 @@ def get_or_create_concept(
             concept_type=concept_type or "concept",
             importance_score=importance_score,
             chapter_refs=[chapter_ref] if chapter_ref else [],
+            source_document_ids=[document_id] if document_id else [],
         )
         db.add(concept)
         db.flush()
@@ -370,6 +372,8 @@ def get_or_create_concept(
             concept.concept_type = concept_type
         if chapter_ref and chapter_ref not in concept.chapter_refs:
             concept.chapter_refs = sorted({*concept.chapter_refs, chapter_ref})
+        if document_id and document_id not in (concept.source_document_ids or []):
+            concept.source_document_ids = sorted({*(concept.source_document_ids or []), document_id})
 
     all_aliases = {clean_display_name(concept.canonical_name), *[clean_display_name(alias) for alias in aliases if is_valid_concept(alias)]}
     for alias in all_aliases:
@@ -405,6 +409,7 @@ async def upsert_concepts_from_chunk(
 
     concept_map: dict[str, Concept] = {}
     created_count = 0
+    doc_id = str(chunk.document_id) if chunk.document_id else None
     for concept_data in extracted["concepts"]:
         concept, created = get_or_create_concept(
             db=db,
@@ -415,6 +420,7 @@ async def upsert_concepts_from_chunk(
             aliases=concept_data.get("aliases", []),
             concept_type=concept_data.get("concept_type") or "concept",
             importance_score=_safe_float(concept_data.get("importance_score", 0.5), 0.5),
+            document_id=doc_id,
         )
         concept_map[normalize_concept_name(concept_data["name"])] = concept
         if created:
@@ -448,6 +454,8 @@ async def upsert_concepts_from_chunk(
             if confidence >= (existing.confidence or 0):
                 existing.evidence_chunk_id = chunk.id
             existing.extraction_method = "llm+rules"
+            if doc_id and doc_id not in (existing.source_document_ids or []):
+                existing.source_document_ids = sorted({*(existing.source_document_ids or []), doc_id})
             continue
         db.add(
             ConceptRelation(
@@ -466,6 +474,7 @@ async def upsert_concepts_from_chunk(
                 relation_source="llm",
                 is_inferred=False,
                 metadata_json={},
+                source_document_ids=[doc_id] if doc_id else [],
             )
         )
         relation_count += 1
@@ -650,6 +659,10 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         raise RuntimeError(f"所有已选片段的图谱抽取均失败：{sample_error}")
     llm_document_ids = {chunk.document_id for chunk in chunks if chunk.id in llm_chunk_ids}
 
+    try:
+        _backup_course_graph_tables(db, course_id)
+    except Exception:
+        pass
     db.query(ConceptRelation).filter(ConceptRelation.course_id == course_id).delete(synchronize_session=False)
     concept_ids = [concept.id for concept in db.scalars(select(Concept).where(Concept.course_id == course_id)).all()]
     if concept_ids:
@@ -690,6 +703,184 @@ async def rebuild_course_graph(db: Session, course_id: str, batch_id: str | None
         **graph_algorithm_stats,
         "graph_total_active_chunks": len(chunks),
         "graph_source_documents": len(graph_document_ids),
+    }
+
+
+def _ensure_graph_backup_tables(db: Session) -> None:
+    from sqlalchemy import text
+
+    db.execute(text(
+        "CREATE TABLE IF NOT EXISTS concepts_backup AS SELECT * FROM concepts WHERE 1=0"
+    ))
+    db.execute(text(
+        "CREATE TABLE IF NOT EXISTS concept_relations_backup AS SELECT * FROM concept_relations WHERE 1=0"
+    ))
+    db.execute(text(
+        "CREATE TABLE IF NOT EXISTS concept_aliases_backup AS SELECT * FROM concept_aliases WHERE 1=0"
+    ))
+
+
+def _backup_course_graph_tables(db: Session, course_id: str) -> None:
+    """Create backup copies of graph tables for atomic rollback on failure."""
+    from sqlalchemy import text
+
+    _ensure_graph_backup_tables(db)
+    db.execute(text("DELETE FROM concepts_backup WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text("DELETE FROM concept_relations_backup WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text("DELETE FROM concept_aliases_backup WHERE concept_id IN (SELECT id FROM concepts WHERE course_id = :course_id)"), {"course_id": course_id})
+    db.execute(text(
+        "INSERT INTO concepts_backup SELECT * FROM concepts WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        "INSERT INTO concept_relations_backup SELECT * FROM concept_relations WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        "INSERT INTO concept_aliases_backup SELECT ca.* FROM concept_aliases ca JOIN concepts c ON ca.concept_id = c.id WHERE c.course_id = :course_id"
+    ), {"course_id": course_id})
+
+
+def _restore_course_graph_from_backup(db: Session, course_id: str) -> None:
+    """Restore graph tables from backup copies."""
+    from sqlalchemy import text
+
+    db.execute(text("DELETE FROM concept_relations WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text("DELETE FROM concept_aliases WHERE concept_id IN (SELECT id FROM concepts WHERE course_id = :course_id)"), {"course_id": course_id})
+    db.execute(text("DELETE FROM concepts WHERE course_id = :course_id"), {"course_id": course_id})
+    db.execute(text(
+        "INSERT INTO concepts SELECT * FROM concepts_backup WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        "INSERT INTO concept_relations SELECT * FROM concept_relations_backup WHERE course_id = :course_id"
+    ), {"course_id": course_id})
+    db.execute(text(
+        "INSERT INTO concept_aliases SELECT ca.* FROM concept_aliases_backup ca JOIN concepts_backup c ON ca.concept_id = c.id WHERE c.course_id = :course_id"
+    ), {"course_id": course_id})
+
+
+async def incremental_update_course_graph(
+    db: Session,
+    course_id: str,
+    changed_document_ids: list[str],
+    batch_id: str | None = None,
+) -> dict:
+    settings = get_settings()
+    course = db.get(Course, course_id)
+    if not changed_document_ids:
+        return {"graph_rebuilt": False, "reason": "no_changed_documents"}
+
+    sync_graph_chapter_labels(db, course_id)
+
+    # 1. Identify and prune concepts/relations sourced only from changed documents
+    all_concepts = db.scalars(select(Concept).where(Concept.course_id == course_id)).all()
+    all_relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
+
+    concepts_to_delete: set[str] = set()
+    concepts_to_retain: set[str] = set()
+    for concept in all_concepts:
+        sources = set(concept.source_document_ids or [])
+        if not sources:
+            concepts_to_delete.add(concept.id)
+        elif sources.issubset(set(changed_document_ids)):
+            concepts_to_delete.add(concept.id)
+        elif sources.intersection(set(changed_document_ids)):
+            # Remove changed doc ids from source list, keep concept
+            concept.source_document_ids = sorted(sources - set(changed_document_ids))
+            concepts_to_retain.add(concept.id)
+        else:
+            concepts_to_retain.add(concept.id)
+
+    relations_to_delete: set[str] = set()
+    for relation in all_relations:
+        sources = set(relation.source_document_ids or [])
+        if not sources:
+            relations_to_delete.add(relation.id)
+        elif sources.issubset(set(changed_document_ids)):
+            relations_to_delete.add(relation.id)
+        elif sources.intersection(set(changed_document_ids)):
+            relation.source_document_ids = sorted(sources - set(changed_document_ids))
+        # else: untouched
+
+    if concepts_to_delete:
+        db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(list(concepts_to_delete))).delete(synchronize_session=False)
+        db.query(ConceptRelation).filter(
+            or_(
+                ConceptRelation.source_concept_id.in_(list(concepts_to_delete)),
+                ConceptRelation.target_concept_id.in_(list(concepts_to_delete)),
+            )
+        ).delete(synchronize_session=False)
+        db.query(Concept).filter(Concept.id.in_(list(concepts_to_delete))).delete(synchronize_session=False)
+
+    if relations_to_delete:
+        db.query(ConceptRelation).filter(ConceptRelation.id.in_(list(relations_to_delete))).delete(synchronize_session=False)
+
+    db.flush()
+
+    # 2. Re-extract from changed documents' active chunks
+    active_documents = db.scalars(
+        select(Document).where(Document.id.in_(changed_document_ids), Document.is_active.is_(True))
+    ).all()
+    graph_documents = filter_graph_documents(course, active_documents)
+    graph_document_ids = {document.id for document in graph_documents}
+    chunks = db.scalars(
+        select(Chunk)
+        .where(Chunk.course_id == course_id, Chunk.is_active.is_(True), Chunk.document_id.in_(graph_document_ids))
+        .order_by(Chunk.created_at.asc())
+    ).all()
+
+    if not chunks:
+        return {"graph_rebuilt": False, "reason": "no_active_chunks_for_changed_documents"}
+
+    llm_chunk_ids = choose_llm_graph_chunks(chunks)
+    selected_llm_chunks = [chunk for chunk in chunks if chunk.id in llm_chunk_ids]
+
+    if batch_id:
+        emit_ingestion_log(
+            batch_id,
+            "batch_graph_incremental_selected",
+            f"增量图谱：从 {len(changed_document_ids)} 个变更文档中选取 {len(selected_llm_chunks)} 个片段",
+            changed_documents=len(changed_document_ids),
+            selected_llm_chunks=len(selected_llm_chunks),
+        )
+
+    probe_chunks = choose_graph_probe_chunks(selected_llm_chunks)
+    llm_payloads, llm_errors = await run_llm_graph_extraction(probe_chunks, batch_id=batch_id)
+    if probe_chunks and not llm_payloads:
+        sample_error = next(iter(llm_errors.values()), "model did not return graph extraction probe results")
+        raise RuntimeError(f"图谱抽取轻量预检失败：{sample_error}")
+    probe_ids = {chunk.id for chunk in probe_chunks}
+    remaining_chunks = [chunk for chunk in selected_llm_chunks if chunk.id not in probe_ids]
+    remaining_payloads, remaining_errors = await run_llm_graph_extraction(remaining_chunks, batch_id=batch_id)
+    llm_payloads = {**llm_payloads, **remaining_payloads}
+    llm_errors = {**llm_errors, **remaining_errors}
+
+    concept_count = 0
+    relation_count = 0
+    llm_success_chunks = 0
+    for chunk in chunks:
+        use_llm = chunk.id in llm_payloads
+        created, relations = await upsert_concepts_from_chunk(db, course_id, chunk, use_llm=use_llm, llm_payload=llm_payloads.get(chunk.id))
+        if use_llm:
+            llm_success_chunks += 1
+        concept_count += created
+        relation_count += relations
+
+    # 3. Enrich: run full algorithms but skip expensive LLM completion and Dijkstra for speed
+    from app.services.graph_algorithms import enrich_course_graph
+    graph_algorithm_stats = await enrich_course_graph(db, course_id, run_relation_completion=False, run_dijkstra=False)
+    db.commit()
+    graph = get_graph_payload(db, course_id)
+    return {
+        "graph_rebuilt": True,
+        "mode": "incremental",
+        "concepts": concept_count,
+        "relations": relation_count,
+        "graph_nodes": len(graph.get("nodes", [])),
+        "graph_edges": len(graph.get("edges", [])),
+        "graph_extraction_provider": graph_extraction_provider(),
+        "graph_llm_success_chunks": llm_success_chunks,
+        "graph_llm_failed_chunks": len(llm_errors),
+        "graph_total_active_chunks": len(chunks),
+        **graph_algorithm_stats,
     }
 
 

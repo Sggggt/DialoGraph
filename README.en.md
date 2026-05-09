@@ -15,21 +15,22 @@ The default runtime uses real PostgreSQL, Qdrant, Redis, and an OpenAI-compatibl
 | Area | Implementation |
 | --- | --- |
 | Runtime | Docker Compose, full-stack containers |
-| Backend | FastAPI, Pydantic, SQLAlchemy, NetworkX |
+| Backend | FastAPI, Pydantic, SQLAlchemy, NetworkX, LangGraph |
 | Frontend | Next.js 16.2.4, React 19, TypeScript, TanStack Query, ECharts |
 | Database | PostgreSQL 16 for courses, file versions, chunks, graphs, QA sessions, and traces |
 | Vector Store | Qdrant 1.17.1, collection `knowledge_chunks` |
 | Cache And Coordination | Redis 7 |
 | Model API | OpenAI-compatible Embedding / Chat API |
-| Retrieval | Child chunk dense + BM25 recall, fusion, rerank, then parent context assembly |
-| Graph | LLM candidates, chunk-vector semantic graph, graph algorithms for sparse construction, deduplication, communities, centrality, and hidden links |
+| Retrieval | Layered retrieval: Query-Type-aware Fast / Standard / Deep Graph three-tier recall, Redis cache, fusion, rerank, then parent context assembly |
+| Graph | LLM candidates, chunk-vector semantic graph, graph algorithms for sparse construction, deduplication, communities, centrality, and hidden links; supports incremental and full rebuild |
+| QA | Agentic RAG: Perception → Planning → Retrieval → EvidenceEvaluator → Generation, with cross-lingual retrieval and pre-generation evidence assessment |
 
 ## Technology Stack
 
 | Layer | Technology | Role |
 | --- | --- | --- |
 | Frontend | Next.js 16.2.4, React 19, TypeScript, TanStack Query, ECharts | Course management, upload and ingestion UI, search, QA, graph browsing, runtime settings |
-| API | FastAPI, Pydantic, SQLAlchemy | REST / SSE APIs, typed validation, transaction orchestration, ingestion, retrieval, and QA orchestration |
+| API | FastAPI, Pydantic, SQLAlchemy, LangGraph | REST / SSE APIs, typed validation, transaction orchestration, ingestion, retrieval, and QA orchestration |
 | Graph Algorithms | NetworkX, NumPy, SciPy | Sparse construction, connected components, Louvain, spectral clustering, centrality, Dijkstra hidden links |
 | Database | PostgreSQL 16 | Courses, file versions, chunks, graphs, QA sessions, traces, and compensation records |
 | Vector Search | Qdrant 1.17.1 | Parent / child chunk vectors, dense recall, vector health checks |
@@ -50,6 +51,7 @@ The default runtime uses real PostgreSQL, Qdrant, Redis, and an OpenAI-compatibl
 | Semantic chunking | Long text is split by structure, semantic boundaries, sentence boundaries, and length limits; embedding similarity can assist boundary selection |
 | Context-enriched vectors | Embedding input includes file metadata, chapter, parent summary, neighboring child summaries, keywords, table markers, and formula markers |
 | Hybrid retrieval | Qdrant child dense recall is fused with child BM25 recall before reranking |
+| Cross-lingual retrieval | LLM translates queries into bilingual sub-queries; DocumentGrader uses embedding similarity to bridge language barriers |
 | Graph enhancement | Graph relations must link back to evidence chunks; the graph expands retrieval signals instead of replacing evidence |
 | Graph-theoretic construction | Sparse graphs, communities, centrality, Dijkstra, and relation completion reduce noise and preserve key structure |
 | Observable QA | Retrieval audits, model-call audits, agent traces, citations, and failure reasons are stored |
@@ -66,13 +68,13 @@ flowchart TB
         API --> INGEST["Ingestion Pipeline<br/>parse -> parent/child chunk -> augment -> vector upsert"]
         API --> RETRIEVAL["Retrieval Pipeline<br/>dense/BM25 -> fusion -> rerank -> parent context"]
         API --> GRAPH["Graph Pipeline<br/>LLM candidates -> vector similarity graph -> sparse graph -> communities/centrality/inference"]
-        API --> QA["Observable QA<br/>route -> retrieve -> grade evidence -> answer -> citation check"]
+        API --> QA["Agentic QA<br/>Perception -> Planning -> Retrieval -> EvidenceEvaluator -> Generation"]
     end
 
     subgraph STORE["Storage And Runtime"]
         PG[("PostgreSQL<br/>metadata, chunks, sparse graph, audit records")]
         QD[("Qdrant<br/>chunk vectors and similarity recall")]
-        RD[("Redis<br/>runtime cache and task coordination")]
+        RD[("Redis<br/>runtime cache, embedding / retrieval cache, task coordination")]
         FS["data/<br/>course files, parser artifacts, local persistence"]
     end
 
@@ -111,6 +113,7 @@ sequenceDiagram
     API->>Model: Extract entity/relation candidates
     API->>API: Run sparse graph construction, communities, centrality, and inference
     API->>DB: Store concepts, relations, evidence, and graph-algorithm fields
+    API->>DB: Incremental update: recompute only subgraphs tied to changed documents
     API-->>Web: Stream logs, progress, retry, and failure state over SSE
 ```
 
@@ -182,13 +185,13 @@ $C_e$ is the set of active child chunks supporting entity $e$. The centroid is n
 Each concept dynamically chooses outgoing candidates from its evidence volume:
 
 $$
-K_i = \mathrm{clamp}(4 + \lfloor \log_2(1 + m_i) \rfloor, 4, 12)
+K_i = \mathrm{clamp}\bigl(4 + \lfloor \log_2(1 + m_i) \rfloor,\, 4,\, 12\bigr)
 $$
 
 Each concept dynamically limits accepted reciprocal candidates from chapter coverage:
 
 $$
-R_i = \mathrm{clamp}(2 + \lfloor \log_2(1 + r_i) \rfloor, 2, 8)
+R_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
 $$
 
 $m_i$ is evidence chunk count and $r_i$ is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reciprocal cap, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
@@ -198,10 +201,10 @@ $m_i$ is evidence chunk count and $r_i$ is chapter reference count. The system k
 Edge weight combines LLM confidence, semantic similarity, evidence support, and structural consistency:
 
 $$
-w_{ij}=0.45c_{ij}^{llm}+0.30s_{ij}^{sem}+0.15s_{ij}^{evidence}+0.10s_{ij}^{structure}
+w_{ij}=0.45\,c_{ij}^{\mathrm{llm}}+0.30\,s_{ij}^{\mathrm{sem}}+0.15\,s_{ij}^{\mathrm{evidence}}+0.10\,s_{ij}^{\mathrm{structure}}
 $$
 
-When no explicit LLM relation exists, $c_{ij}^{llm}=0$. The final $w_{ij}$ is clipped to $[0,1]$. The graph stage runs:
+When no explicit LLM relation exists, $c_{ij}^{\mathrm{llm}}=0$. The final $w_{ij}$ is clipped to $[0,1]$. The graph stage runs:
 
 - Connected-component ablation: removes isolated, low-evidence, low-importance noise while preserving enough course nodes.
 - Louvain community detection: primary community labels and frontend color groups.
@@ -214,7 +217,7 @@ When no explicit LLM relation exists, $c_{ij}^{llm}=0$. The final $w_{ij}$ is cl
 Dijkstra searches 2-3 hop hidden relations on a non-negative cost graph:
 
 $$
-cost_{ij}=\frac{1}{0.05+w_{ij}}
+\mathrm{cost}_{ij}=\frac{1}{0.05+w_{ij}}
 $$
 
 If endpoint semantic similarity is high and path cost is low, the system writes a `relates_to` edge with `relation_source="dijkstra_inferred"` and uses the path score to repair weak existing weights. The system then extracts evidence snippets from two-hop neighborhoods around high-centrality nodes and asks the LLM to complete only evidence-supported relations.
@@ -223,22 +226,150 @@ The frontend colors graph nodes by Louvain community, sizes nodes by centrality 
 
 ## Retrieval And QA
 
+DialoGraph's QA pipeline uses a **Perception → Planning → Retrieval → EvidenceEvaluator → Generation** five-stage agent architecture orchestrated by LangGraph. Every node writes to `agent_trace_events`, and the frontend renders the live trace via SSE.
+
 ```mermaid
 flowchart LR
-    Q["Question"] --> DENSE["child dense recall"]
-    Q --> BM25["child BM25 recall"]
-    DENSE --> FUSION["weighted fusion"]
-    BM25 --> FUSION
-    FUSION --> RERANK["rerank"]
-    RERANK --> PARENT["load parent_chunk_id"]
-    PARENT --> ANSWER["answer with citations"]
-    Q -. "multi-hop / relation intent" .-> GRAPH["graph-enhanced evidence expansion"]
-    GRAPH --> RERANK
+    Q["Question"] --> PER["Perception<br/>intent · entity extraction · graph concept matching"]
+    PER -->|"greeting / clarify"| AG["AnswerGenerator"]
+    PER -->|"needs retrieval"| PLAN["RetrievalPlanner<br/>strategy selection · cross-lingual translation"]
+    PLAN --> RET["RetrievalExecutor<br/>global_dense / local_graph / hybrid / community"]
+    RET --> GRADE["DocumentGrader<br/>0.4·overlap + 0.6·embedding_sim"]
+    GRADE --> EVAL["EvidenceEvaluator<br/>pre-generation sufficiency check"]
+    EVAL -->|"insufficient + retry<2"| PLAN
+    EVAL -->|"sufficient / insufficient+retry≥2"| CS["ContextSynthesizer"]
+    CS --> AG
+    AG --> CC["CitationChecker"]
+    CC --> CV["CitationVerifier"]
+    CV --> REFL["Reflection<br/>post-generation (default off)"]
+    REFL --> AC["AnswerCorrector"]
+    AC --> CS
 ```
 
-Retrieval recalls child chunks by default, avoiding parent/child competition inside one candidate pool. Final results attach parent context through `parent_chunk_id` and keep dense, BM25, fused, rerank, graph boost, and model audit metadata.
+### Perception
 
-Graph-enhanced retrieval does not replace text evidence. It starts from retrieved chunks, finds related concepts and relations, merges relation evidence chunks back into candidates, then reranks and cites through the same answer path.
+The Perception node understands user intent, extracts entities, and matches them against the course graph:
+
+1. **Fast-path**: greetings route to `direct_answer`; empty or anaphoric queries route to `clarify`.
+2. **LLM perception**: calls ChatProvider to classify intent (`definition` / `comparison` / `analysis` / `application` / `procedure`), extract entities, and generate sub-queries.
+3. **Graph concept matching**: matches extracted entities against `concepts` and `concept_aliases`, retrieving matched concept communities and one-hop neighbors.
+
+Perception outputs:
+- `intent`: question type
+- `entities` / `matched_concepts`: extracted entities and graph matches
+- `perceived_communities`: relevant community IDs
+- `suggested_strategy`: recommended strategy (`global_dense`, `local_graph`, `hybrid`, `community`)
+- `needs_graph`: whether graph enhancement is needed
+
+### RetrievalPlanner
+
+The planning layer selects a retrieval strategy based on Perception output and performs cross-lingual query translation:
+
+**Strategy selection:**
+
+| Intent | Condition | Strategy |
+|--------|-----------|----------|
+| `definition` | `needs_graph=false` | `global_dense` (pure dense + BM25) |
+| `comparison` or `needs_graph=true` | — | `hybrid` (layered hybrid retrieval) |
+| `application` / `procedure` | matched concepts exist | `local_graph` (local graph search) |
+| `analysis` | matched concepts ≥ 3 | `community` (community-scoped search) |
+
+**Cross-lingual query expansion:**
+
+The system detects query language (Chinese / English) and uses LLM to translate to the opposite language:
+
+$$
+Q_{\mathrm{bilingual}} = \{q_{\mathrm{original}},\; q_{\mathrm{translated}}\} \cup Q_{\mathrm{sub}}
+$$
+
+After deduplication, all sub-queries enter the RetrievalExecutor. This allows a Chinese query like "最大流" to also match English course materials via the translated sub-query "max flow".
+
+### RetrievalExecutor
+
+The execution layer dispatches to different retrieval backends based on strategy:
+
+| Strategy | Backend | Description |
+|----------|---------|-------------|
+| `global_dense` | `hybrid_search_chunks` | Pure dense + BM25 hybrid recall |
+| `local_graph` | `local_graph_search` | Uses Perception-matched concepts as seeds, recalls evidence chunks from seed concepts and their 1-hop neighbors, then merges with base dense recall |
+| `community` | `community_search_chunks` | Restricts to perceived Louvain communities, blends dense recall with community-concept evidence chunks, and applies a +0.15 score boost inside the community |
+| `hybrid` (default) | `layered_search_chunks` / `graph_enhanced_search` | Query-Type layer routing: Layer 1 Fast / Layer 2 Standard / Layer 3 Deep Graph |
+
+All strategies follow the **Small-to-Big** principle: only child chunks enter recall and reranking; parent context is assembled later via `parent_chunk_id`.
+
+### DocumentGrader
+
+Grades recalled documents for admission, fusing lexical overlap and vector semantic similarity:
+
+$$
+\mathrm{grade\_score} = 0.40 \cdot r_{\mathrm{overlap}} + 0.60 \cdot s_{\mathrm{embedding}}
+$$
+
+Where:
+- $r_{\mathrm{overlap}} = \dfrac{|T_q \cap T_d|}{|T_q|}$, with $T_q$ the query term set and $T_d$ the document title+snippet+content term set
+- $s_{\mathrm{embedding}}$ is the cosine similarity between query and document vectors; when the raw vector is unavailable, it falls back to the dense score recorded at retrieval time
+
+Admission rules (pass if any holds):
+
+$$
+\begin{cases}
+\mathrm{grade\_score} \ge 0.35 & \text{(primary gate)} \\
+s_{\mathrm{embedding}} \ge 0.45 & \text{(cross-lingual bridge gate)} \\
+r_{\mathrm{overlap}} \ge 0.25 \;\land\; \mathrm{original\_score} \ge 0.3 & \text{(auxiliary gate)}
+\end{cases}
+$$
+
+The cross-lingual bridge gate solves a critical problem: a Chinese query "最大流" and English material "max flow" share weak overlap in the `text-embedding-v4` vector space, but LLM-translated sub-queries can recall relevant chunks via dense search. In such cases $r_{\mathrm{overlap}}$ may be near zero while $s_{\mathrm{embedding}}$ remains high; the bridge gate prevents these valid cross-lingual results from being killed by monolingual term matching.
+
+### EvidenceEvaluator
+
+**Before answer generation**, the EvidenceEvaluator assesses whether retrieved evidence is sufficient. This is DialoGraph's **pre-generation reflection** mechanism:
+
+For each graded document, extract `grade_score` and compute:
+
+$$
+\bar{g} = \frac{1}{n}\sum_{i=1}^{n} g_i,\qquad g_{\max} = \max_i g_i
+$$
+
+Intent-dependent minimum evidence thresholds:
+
+$$
+\begin{cases}
+(n_{\min}, \bar{g}_{\min}) = (1,\, 0.25) & \text{if intent} \in \{\text{definition},\, \text{procedure}\} \\
+(n_{\min}, \bar{g}_{\min}) = (2,\, 0.20) & \text{if intent} \in \{\text{comparison},\, \text{analysis}\} \\
+(n_{\min}, \bar{g}_{\min}) = (1,\, 0.20) & \text{otherwise}
+\end{cases}
+$$
+
+Sufficiency condition:
+
+$$
+\mathrm{sufficient} \;\Leftrightarrow\; g_{\max} \ge 0.35 \;\land\; n \ge n_{\min} \;\land\; \bar{g} \ge \bar{g}_{\min}
+$$
+
+If only an anchor exists but quantity/score is marginal, the run is marked `marginal` and generation proceeds. If evidence is insufficient and `retry_count < 2`, the flow routes back to `RetrievalPlanner` with doubled `top_k`. If `retry_count >= 2`, `low_evidence=true` is set and generation proceeds with a disclaimer in the prompt and no forced citations.
+
+### Post-Generation Loop (Default Off)
+
+`ENABLE_POST_GENERATION_REFLECTION=false` by default. When enabled, post-generation nodes execute:
+
+- **CitationVerifier**: samples high-importance claims for NLI verification.
+- **Reflection**: LLM evaluates the answer for hallucination, insufficient coverage, or contradiction, returning `has_issue` / `issue_type` / `suggestion`.
+- **AnswerCorrector**: adjusts strategy based on reflection results (expand top_k, rewrite query, or regenerate from high-confidence documents).
+
+These nodes are observable in traces but do not participate in the main loop by default, avoiding extra latency and model call costs. The pre-generation `EvidenceEvaluator` already covers most insufficient-evidence scenarios.
+
+### Layered Retrieval
+
+The system automatically selects retrieval depth based on Query Type and routing:
+
+| Layer | Trigger | Description |
+|-------|---------|-------------|
+| Layer 1 Fast | definition / formula queries | Redis cache preferred, dense recall only, BM25 skipped |
+| Layer 2 Standard | example / procedure / default | Existing dense + BM25 hybrid, fused then reranked |
+| Layer 3 Deep Graph | comparison / multi-hop | Hybrid + graph v2 enhancement: centrality boost, community aggregation, Dijkstra path expansion |
+
+Embeddings and retrieval results are cached in Redis with TTL bound to embedding text version and the course's latest document version.
 
 ### Small-To-Big Retrieval
 
@@ -254,16 +385,6 @@ child dense recall + child BM25 recall
 
 This avoids both coarse recall from overly large chunks and missing context from tiny chunks. Retrieval results carry `retrieval_granularity=child_with_parent_context`, dense score, BM25 score, fused score, rerank score, graph boost, and model audit fields.
 
-### Agent QA
-
-The QA path is split into observable nodes:
-
-```text
-question analysis -> routing -> query rewriting -> retrieval -> evidence grading -> context synthesis -> answer generation -> citation check -> self-check
-```
-
-Each node writes `agent_trace_events`, including node name, status, input/output summaries, candidate documents, scores, duration, and error information. Answers must include real chunk citations; the graph only enhances evidence candidates and does not produce unsupported conclusions.
-
 ## Technical Advantages
 
 | Advantage | Detail |
@@ -276,6 +397,8 @@ Each node writes `agent_trace_events`, including node name, status, input/output
 | Recoverable | PostgreSQL stores lifecycle state; Qdrant / Redis can be repaired from durable records |
 | No silent degradation | Missing models, database, or Qdrant fail fast with actionable error context |
 | Extensible | Reranking, semantic chunking, graph enhancement, and model endpoints are isolated by configuration and service layers |
+| Clear agent architecture | Perception-Planning-Retrieval-EvidenceEvaluator-Generation separation; each stage independently observable and tunable |
+| Cross-lingual robustness | LLM translation query expansion + embedding similarity bridge + cross-lingual admission gate mitigates monolingual embedding alignment limitations |
 
 ## Data Model
 
@@ -335,6 +458,12 @@ Common variables:
 | `ENABLE_MODEL_FALLBACK` | Model fallback switch, default `false` |
 | `RERANKER_ENABLED` / `RERANKER_MODEL` / `RERANKER_MAX_LENGTH` | Cross-Encoder reranker settings |
 | `SEMANTIC_CHUNKING_ENABLED` / `SEMANTIC_CHUNKING_MIN_LENGTH` | Semantic chunking switch and minimum text length |
+| `RETRIEVAL_LAYER_ENABLED` | Retrieval layer switch, default `true` |
+| `RETRIEVAL_CACHE_TTL_SECONDS` | Redis retrieval cache TTL, default `300` |
+| `ENABLE_AGENTIC_REFLECTION` | Agentic reflection and correction master switch, default `true` |
+| `ENABLE_POST_GENERATION_REFLECTION` | Post-generation reflection switch (CitationVerifier/Reflection/AnswerCorrector), default `false` |
+| `CITATION_VERIFICATION_SAMPLE_MAX` | Citation verification sample size per answer, default `3` |
+| `REFLECTION_MAX_RETRIES` | Max reflection-triggered correction retries, default `2` |
 | `MODEL_BRIDGE_ENABLED` / `MODEL_BRIDGE_PORT` | Host model-bridge switch and port |
 
 Docker Compose overrides infrastructure URLs inside the API container:
@@ -426,7 +555,10 @@ Validation focus:
 | Database fallback | `ENABLE_DATABASE_FALLBACK=false`; database outages fail fast |
 | Vector health | Qdrant vector count matches active chunks and no zero vectors exist |
 | Retrieval quality | Child recall, parent context, rerank, and citation fields are complete |
-| Graph quality | Node count meets the retention floor, edge growth is near-linear, and community, centrality, and weight fields are populated |
+| Graph quality | Node count meets the retention floor, edge growth is near-linear, and community, centrality, and weight fields are populated; graph remains stable after incremental updates |
+| Layered retrieval | Different query types hit the correct layer; Redis cache hit/miss behaves correctly |
+| Agentic loop | Perception, RetrievalPlanner, EvidenceEvaluator nodes are observable in traces; post-generation Reflection is off by default; LLM errors are not silently swallowed when fallback is off |
+| Cross-lingual retrieval | Mixed Chinese-English queries hit materials in the opposite language; DocumentGrader bridge gate is active |
 | Log observability | Ingestion logs expose progress, retry, failure reason, and terminal event |
 
 ## Version Control Rules

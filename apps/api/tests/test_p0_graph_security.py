@@ -119,7 +119,7 @@ async def test_graph_enhanced_search_adds_one_hop_evidence_chunk(db_session, sam
 async def test_hybrid_retriever_uses_graph_search_only_for_multi_hop(db_session, sample_course, monkeypatch):
     from app.models import AgentRun
     from app.services import agent_graph
-    from app.services.agent_graph import HybridRetriever
+    from app.services.agent_graph import RetrievalExecutor as HybridRetriever
 
     run = AgentRun(course_id=sample_course.id, question="compare centralities", status="queued")
     db_session.add(run)
@@ -134,8 +134,13 @@ async def test_hybrid_retriever_uses_graph_search_only_for_multi_hop(db_session,
         calls["hybrid"] += 1
         return []
 
+    async def fake_layered(*args, **kwargs):
+        calls["hybrid"] += 1
+        return [], {"layer": 2}
+
     monkeypatch.setattr(agent_graph, "graph_enhanced_search", fake_graph)
     monkeypatch.setattr(agent_graph, "hybrid_search_chunks", fake_hybrid)
+    monkeypatch.setattr(agent_graph, "layered_search_chunks", fake_layered)
 
     await HybridRetriever()(
         {

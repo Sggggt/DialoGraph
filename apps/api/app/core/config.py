@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     semantic_chunking_min_length: int = Field(default=2000, ge=500, le=5000)
     model_cache_root: Path = Field(default=WORKSPACE_ROOT / "models" / "huggingface")
 
+    # Retrieval Layering & Agentic RAG
+    retrieval_layer_enabled: bool = True
+    retrieval_cache_ttl_seconds: int = 300
+    enable_agentic_reflection: bool = True
+    citation_verification_sample_max: int = 3
+    reflection_max_retries: int = 2
+    enable_post_generation_reflection: bool = False
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]

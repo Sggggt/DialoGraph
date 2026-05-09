@@ -201,6 +201,29 @@ def test_cleanup_stale_data_rejects_active_batch(db_session, sample_course):
         cleanup_stale_data(db_session, sample_course.id, sample_course.name)
 
 
+@pytest.mark.asyncio
+async def test_rebuild_graph_endpoint_accepts_mode_parameter(db_session, sample_course, monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from app.api import rebuild_graph_endpoint
+    from app.core.config import get_settings
+    from app.schemas import RebuildGraphRequest
+
+    monkeypatch.setenv("ENABLE_MODEL_FALLBACK", "false")
+    get_settings.cache_clear()
+
+    response = await rebuild_graph_endpoint(
+        BackgroundTasks(),
+        request=RebuildGraphRequest(mode="incremental"),
+        course_id=sample_course.id,
+        db=db_session,
+    )
+
+    assert response["mode"] == "incremental"
+    assert response["batch_id"]
+    assert response["state"] == "extracting_graph"
+
+
 def test_delete_course_data_removes_database_vectors_and_directory(db_session, sample_course, monkeypatch):
     from app.core.config import get_settings
     from app.models import (

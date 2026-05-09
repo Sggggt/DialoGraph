@@ -9,15 +9,20 @@ from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models import AgentRun, AgentTraceEvent, QASession
 from app.schemas import AgentRequest, SearchFilters
 from app.core.config import get_settings
-from app.services.embeddings import ChatProvider, is_degraded_mode
+from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode
 from app.services.ingestion import resolve_course
-from app.services.retrieval import graph_enhanced_search, hybrid_search_chunks
+from app.services.retrieval import (
+    cosine_similarity,
+    graph_enhanced_search,
+    hybrid_search_chunks,
+    layered_search_chunks,
+)
 
 
 AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
@@ -46,6 +51,15 @@ class AgentState(TypedDict, total=False):
     citations: list[dict]
     retry_count: int
     degraded_mode: bool
+    low_confidence_docs: list[dict]
+    reflection_result: dict
+    unverified_citations: list[int]
+    # New architecture fields
+    perception_result: dict
+    retrieval_strategy: str
+    retrieval_params: dict
+    evidence_evaluation: dict
+    low_evidence: bool
 
 
 class QueryAnalysis(BaseModel):
@@ -57,7 +71,9 @@ class QueryAnalysis(BaseModel):
 
 
 def _terms(text: str) -> set[str]:
-    return {term for term in re.findall(r"[a-zA-Z0-9_]+", text.lower()) if len(term) > 2}
+    from app.services.chinese_text import extract_terms
+
+    return extract_terms(text)
 
 
 def _summarize(text: str, limit: int = 280) -> str:
@@ -164,6 +180,251 @@ def trace_event_to_payload(event: AgentTraceEvent) -> dict:
     }
 
 
+class Perception:
+    """Perception layer: understand intent, extract entities, query graph for context."""
+
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = state["db"]
+        question = state["question"].strip()
+        course_id = state["course_id"]
+
+        # Fast-path: detect clarify / direct_answer before expensive LLM call
+        question_lower = question.lower()
+        tokens = _terms(question)
+        is_greeting = question_lower in {
+            "hello", "hi", "hey", "who are you", "help", "what can you do",
+            "你好", "您好", "嗨", "你是谁", "帮助", "你能做什么",
+        } or bool(tokens.intersection({"hello", "hey"}) or (tokens == {"hi"}))
+        needs_clarification = len(tokens) == 0 or question_lower in {"it", "this", "that", "explain it", "why", "这个", "那个", "解释一下", "为什么"}
+
+        if is_greeting:
+            route: AgentRoute = "direct_answer"
+        elif needs_clarification:
+            route = "clarify"
+        elif any(term in question_lower for term in ("compare", "relationship", "related to", "relation between", "difference between", "connect", "derive", "prove", "比较", "关系", "区别", "联系", "推导", "证明")):
+            route = "multi_hop_research"
+        elif any(term in question_lower for term in EXERCISE_MARKERS):
+            route = "retrieve_exercises"
+        elif any(term in question_lower for term in ("note", "slide", "definition", "concept", "chapter")):
+            route = "retrieve_notes"
+        else:
+            route = "retrieve_both"
+
+        # Skip expensive LLM + graph lookup for simple routes
+        if route in {"direct_answer", "clarify"}:
+            _set_run_state(db, state["run_id"], "running", current_node="perception", route=route)
+            _trace(
+                db,
+                state["run_id"],
+                "perception",
+                input_summary=question,
+                output_summary=f"fast_path route={route}",
+                duration_ms=int((time.perf_counter() - start) * 1000),
+            )
+            return {"perception_result": {"intent": "unknown", "entities": [], "sub_queries": [question], "needs_graph": False, "suggested_strategy": "global_dense"}, "route": route}
+
+        # 1. LLM perception (with graceful degradation)
+        llm_perception: dict[str, Any]
+        if is_degraded_mode():
+            llm_perception = {
+                "intent": "unknown",
+                "entities": [],
+                "sub_queries": [question],
+                "needs_graph": False,
+                "suggested_strategy": "hybrid",
+            }
+        else:
+            try:
+                llm_perception = await ChatProvider().perceive_question(question, state.get("history", []))
+            except Exception:
+                llm_perception = {
+                    "intent": "unknown",
+                    "entities": [],
+                    "sub_queries": [question],
+                    "needs_graph": False,
+                    "suggested_strategy": "hybrid",
+                }
+
+        # 2. Graph entity matching
+        matched_concepts: list[dict] = []
+        seed_concept_ids: set[str] = set()
+        perceived_communities: set[int | None] = set()
+        perceived_neighbors: list[dict] = []
+
+        entities = llm_perception.get("entities", [])
+        if entities:
+            from app.models import Concept, ConceptAlias, ConceptRelation
+            from app.services.concept_graph import normalize_concept_name
+
+            normalized_entities = [normalize_concept_name(e) for e in entities if isinstance(e, str)]
+            if normalized_entities:
+                # Match by normalized_name or alias
+                alias_matches = db.scalars(
+                    select(ConceptAlias).where(
+                        ConceptAlias.normalized_alias.in_(normalized_entities),
+                    )
+                ).all()
+                matched_ids = {a.concept_id for a in alias_matches}
+
+                name_matches = db.scalars(
+                    select(Concept).where(
+                        Concept.course_id == course_id,
+                        Concept.normalized_name.in_(normalized_entities),
+                    )
+                ).all()
+                matched_ids |= {c.id for c in name_matches}
+
+                if matched_ids:
+                    concepts = db.scalars(
+                        select(Concept).where(Concept.id.in_(list(matched_ids)), Concept.course_id == course_id)
+                    ).all()
+                    for concept in concepts:
+                        matched_concepts.append({
+                            "id": concept.id,
+                            "name": concept.canonical_name,
+                            "community": concept.community_louvain,
+                        })
+                        seed_concept_ids.add(concept.id)
+                        if concept.community_louvain is not None:
+                            perceived_communities.add(concept.community_louvain)
+
+                    # Fetch 1-hop neighbors
+                    if seed_concept_ids:
+                        neighbor_relations = db.scalars(
+                            select(ConceptRelation).where(
+                                ConceptRelation.course_id == course_id,
+                                or_(
+                                    ConceptRelation.source_concept_id.in_(seed_concept_ids),
+                                    ConceptRelation.target_concept_id.in_(seed_concept_ids),
+                                ),
+                            )
+                        ).all()
+                        for rel in neighbor_relations:
+                            neighbor_id = rel.target_concept_id if rel.source_concept_id in seed_concept_ids else rel.source_concept_id
+                            if neighbor_id and neighbor_id not in seed_concept_ids:
+                                perceived_neighbors.append({
+                                    "concept_id": neighbor_id,
+                                    "relation_type": rel.relation_type,
+                                    "via": rel.source_concept_id if rel.source_concept_id in seed_concept_ids else rel.target_concept_id,
+                                })
+
+        perception_result = {
+            "intent": llm_perception.get("intent", "unknown"),
+            "entities": entities,
+            "matched_concepts": matched_concepts,
+            "perceived_communities": sorted(perceived_communities) if perceived_communities else [],
+            "perceived_neighbors": perceived_neighbors,
+            "sub_queries": llm_perception.get("sub_queries", [question]),
+            "needs_graph": llm_perception.get("needs_graph", False),
+            "suggested_strategy": llm_perception.get("suggested_strategy", "hybrid"),
+        }
+
+        _set_run_state(db, state["run_id"], "running", current_node="perception", route=route)
+        _trace(
+            db,
+            state["run_id"],
+            "perception",
+            input_summary=question,
+            output_summary=(
+                f"intent={perception_result['intent']} "
+                f"entities={len(perception_result['entities'])} "
+                f"matched={len(matched_concepts)} "
+                f"strategy={perception_result['suggested_strategy']}"
+            ),
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return {"perception_result": perception_result, "route": route}
+
+
+async def _llm_translate_query(question: str, target_lang: str) -> str:
+    """Minimal LLM query translator for cross-lingual retrieval."""
+    chat = ChatProvider()
+    payload = {
+        "model": chat.settings.chat_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    f"You are a query translator for academic course search. "
+                    f"Translate the user query to {target_lang} accurately, "
+                    f"preserving all technical terminology. Output ONLY the translated query, no explanation."
+                ),
+            },
+            {"role": "user", "content": question},
+        ],
+        "temperature": 0.0,
+    }
+    try:
+        return await chat._post_chat_text(payload)
+    except Exception:
+        return question
+
+
+class RetrievalPlanner:
+    """Planning layer: choose retrieval strategy based on perception."""
+
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = state["db"]
+        perception = state.get("perception_result", {})
+        intent = perception.get("intent", "unknown")
+        suggested = perception.get("suggested_strategy", "hybrid")
+        needs_graph = perception.get("needs_graph", False)
+        matched_concepts = perception.get("matched_concepts", [])
+
+        # Override strategy based on intent + graph signals
+        strategy = suggested
+        if intent == "definition" and not needs_graph:
+            strategy = "global_dense"
+        elif intent == "comparison" or needs_graph:
+            strategy = "hybrid"
+        elif intent in {"application", "procedure"} and matched_concepts:
+            strategy = "local_graph"
+        elif intent == "analysis" and len(matched_concepts) >= 3:
+            strategy = "community"
+
+        top_k = state["top_k"]
+        # Increase recall for broader intents
+        if intent in {"comparison", "analysis"}:
+            top_k = max(top_k, 8)
+
+        seed_concept_ids = [c["id"] for c in matched_concepts]
+        original_sub_queries = perception.get("sub_queries", [state["question"]])
+
+        # Cross-lingual retrieval: translate the query so BM25 can match
+        # documents in the other language as well.
+        from app.services.chinese_text import contains_chinese
+        has_zh = contains_chinese(state["question"])
+        if has_zh:
+            translated = await _llm_translate_query(state["question"], "English")
+        else:
+            translated = await _llm_translate_query(state["question"], "Chinese")
+        sub_queries = list(dict.fromkeys([state["question"], translated] + original_sub_queries))
+
+        retrieval_params = {
+            "top_k": top_k,
+            "graph_seed_concept_ids": seed_concept_ids if needs_graph else [],
+            "community_ids": perception.get("perceived_communities", []),
+            "sub_queries": sub_queries,
+        }
+
+        _set_run_state(db, state["run_id"], "running", current_node="retrieval_planner")
+        _trace(
+            db,
+            state["run_id"],
+            "retrieval_planner",
+            input_summary=f"intent={intent} needs_graph={needs_graph}",
+            output_summary=f"strategy={strategy} top_k={top_k} queries={len(sub_queries)}",
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return {
+            "retrieval_strategy": strategy,
+            "retrieval_params": retrieval_params,
+            "rewritten_question": translated,
+        }
+
+
 class QueryAnalyzer:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
@@ -175,7 +436,7 @@ class QueryAnalyzer:
             normalized_question=question,
             token_count=len(tokens),
             likely_course_query=not any(term in lower for term in ("weather", "stock price", "joke", "movie ticket")),
-            needs_clarification=len(tokens) < 2 or lower in {"it", "this", "that", "explain it", "why"},
+            needs_clarification=len(tokens) == 0 or lower in {"it", "this", "that", "explain it", "why", "这个", "那个", "解释一下", "为什么"},
             is_multi_hop=any(term in lower for term in ("compare", "relationship", "difference between", "connect", "derive", "prove")),
         )
         _set_run_state(db, state["run_id"], "running", current_node="query_analyzer")
@@ -197,16 +458,19 @@ class Router:
         question = state["question"]
         lower = question.lower()
         terms = _terms(question)
-        is_greeting = lower in {"hello", "hi", "hey", "who are you", "help", "what can you do"} or bool(
+        is_greeting = lower in {
+            "hello", "hi", "hey", "who are you", "help", "what can you do",
+            "你好", "您好", "嗨", "你是谁", "帮助", "你能做什么",
+        } or bool(
             terms.intersection({"hello", "hey"}) or (terms == {"hi"})
         )
         if is_greeting:
             route: AgentRoute = "direct_answer"
-        elif len(terms) < 2 or lower in {"it", "this", "that", "explain it", "why"}:
+        elif len(terms) == 0 or lower in {"it", "this", "that", "explain it", "why", "这个", "那个", "解释一下", "为什么"}:
             route = "clarify"
         elif any(marker in lower for marker in EXERCISE_MARKERS):
             route = "retrieve_exercises"
-        elif any(term in lower for term in ("compare", "relationship", "related to", "relation between", "difference between", "connect", "derive", "prove")):
+        elif any(term in lower for term in ("compare", "relationship", "related to", "relation between", "difference between", "connect", "derive", "prove", "比较", "关系", "区别", "联系", "推导", "证明")):
             route = "multi_hop_research"
         elif any(term in lower for term in ("note", "slide", "definition", "concept", "chapter")):
             route = "retrieve_notes"
@@ -246,27 +510,128 @@ class QueryRewriter:
         return {"rewritten_question": rewritten, "sub_queries": sub_queries}
 
 
-class HybridRetriever:
+class RetrievalDecision:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
         db = state["db"]
-        queries = state.get("sub_queries") or [state.get("rewritten_question") or state["question"]]
+        settings = get_settings()
+        skip = False
+        reason = "default"
+        if not settings.enable_agentic_reflection or is_degraded_mode():
+            skip = False
+            reason = "disabled_or_degraded"
+        else:
+            history = state.get("history", [])
+            if not history:
+                skip = False
+                reason = "no_history"
+            else:
+                question = state["question"].strip().lower()
+                pronoun_hints = {"it", "this", "that", "the above", "the former", "the latter", "这个", "那个", "上述", "前者", "后者"}
+                import re
+                if any(re.search(rf"\b{re.escape(hint)}\b", question) for hint in pronoun_hints) and len(history) >= 2:
+                    skip = True
+                    reason = "pronoun_reference"
+                else:
+                    skip = False
+                    reason = "not_reference"
+        _set_run_state(db, state["run_id"], "running", current_node="retrieval_decision")
+        _trace(
+            db,
+            state["run_id"],
+            "retrieval_decision",
+            input_summary=state["question"],
+            output_summary=f"skip_retrieval={skip} reason={reason}",
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return {"skip_retrieval": skip}
+
+
+class RetrievalExecutor:
+    """Execute retrieval based on the planned strategy."""
+
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = state["db"]
+        strategy = state.get("retrieval_strategy", "hybrid")
+        params = state.get("retrieval_params", {})
+        course_id = state["course_id"]
+        filters = state["filters"]
+        top_k = params.get("top_k", state["top_k"])
+        queries = params.get("sub_queries", [state.get("rewritten_question") or state["question"]])
+        route = state.get("route", "retrieve_both")
+        settings = get_settings()
+
         all_results: dict[str, dict] = {}
-        for query in queries:
-            for filters in expand_route_filters(state["route"], state["filters"]):
-                search_fn = graph_enhanced_search if state["route"] == "multi_hop_research" else hybrid_search_chunks
-                results = await search_fn(db, state["course_id"], query, filters, max(state["top_k"] * 2, state["top_k"]))
+
+        if strategy == "local_graph" and params.get("graph_seed_concept_ids"):
+            # Local graph: seed from perceived concepts + dense recall
+            from app.services.retrieval import local_graph_search
+            for query in queries:
+                results = await local_graph_search(
+                    db, course_id, query, filters, top_k,
+                    seed_concept_ids=params["graph_seed_concept_ids"],
+                )
                 for result in results:
                     current = all_results.get(result["chunk_id"])
                     if current is None or result["score"] > current["score"]:
                         all_results[result["chunk_id"]] = result
-        documents = sorted(all_results.values(), key=lambda item: item["score"], reverse=True)[: max(state["top_k"] * 2, state["top_k"])]
+
+        elif strategy == "community" and params.get("community_ids"):
+            # Community scoped search
+            from app.services.retrieval import community_search_chunks
+            for query in queries:
+                results = await community_search_chunks(
+                    db, course_id, query, filters, top_k,
+                    community_ids=params["community_ids"],
+                )
+                for result in results:
+                    current = all_results.get(result["chunk_id"])
+                    if current is None or result["score"] > current["score"]:
+                        all_results[result["chunk_id"]] = result
+
+        elif strategy == "global_dense" or not settings.retrieval_layer_enabled:
+            # Pure dense + BM25 hybrid
+            for query in queries:
+                results = await hybrid_search_chunks(db, course_id, query, filters, max(top_k * 2, top_k))
+                for result in results:
+                    current = all_results.get(result["chunk_id"])
+                    if current is None or result["score"] > current["score"]:
+                        all_results[result["chunk_id"]] = result
+
+        else:
+            # hybrid (default): layered search or graph-enhanced based on route
+            if settings.retrieval_layer_enabled and route != "multi_hop_research":
+                tasks = []
+                for query in queries:
+                    for flt in expand_route_filters(route, filters):
+                        tasks.append(layered_search_chunks(db, course_id, query, flt, max(top_k * 2, top_k), route))
+                task_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in task_results:
+                    if isinstance(result, Exception):
+                        continue
+                    docs, _meta = result
+                    for doc in docs:
+                        current = all_results.get(doc["chunk_id"])
+                        if current is None or doc["score"] > current["score"]:
+                            all_results[doc["chunk_id"]] = doc
+            else:
+                for query in queries:
+                    for flt in expand_route_filters(route, filters):
+                        search_fn = graph_enhanced_search if route == "multi_hop_research" else hybrid_search_chunks
+                        results = await search_fn(db, course_id, query, flt, max(top_k * 2, top_k))
+                        for result in results:
+                            current = all_results.get(result["chunk_id"])
+                            if current is None or result["score"] > current["score"]:
+                                all_results[result["chunk_id"]] = result
+
+        documents = sorted(all_results.values(), key=lambda item: item["score"], reverse=True)[: max(top_k * 2, top_k)]
         _set_run_state(db, state["run_id"], "running", current_node="retrievers")
         _trace(
             db,
             state["run_id"],
             "retrievers",
-            input_summary=" | ".join(queries),
+            input_summary=f"strategy={strategy} | " + " | ".join(queries),
             output_summary=f"{len(documents)} candidate chunks",
             document_ids=[item["chunk_id"] for item in documents],
             scores={item["chunk_id"]: item.get("metadata", {}).get("scores", {}) for item in documents},
@@ -279,15 +644,66 @@ class DocumentGrader:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
         db = state["db"]
-        query_terms = _terms(state.get("rewritten_question") or state["question"])
+        question = state.get("rewritten_question") or state["question"]
+        query_terms = _terms(question)
         graded = []
+        low_confidence = []
+
+        # Compute query embedding once for similarity scoring
+        query_vector = None
+        settings = get_settings()
+        if settings.retrieval_layer_enabled and not is_degraded_mode():
+            try:
+                embedder = EmbeddingProvider()
+                query_vector = (await embedder.embed_texts([question], text_type="query"))[0]
+            except Exception:
+                query_vector = None
+
         for document in state.get("documents", []):
             haystack = f"{document.get('document_title', '')} {document.get('snippet', '')} {document.get('content', '')}"
             overlap = len(query_terms.intersection(_terms(haystack)))
+            overlap_ratio = overlap / max(len(query_terms), 1)
             scores = document.setdefault("metadata", {}).setdefault("scores", {})
             scores["grader_overlap"] = overlap
-            if overlap > 0 or document["score"] > 0.01:
+            scores["term_overlap_ratio"] = round(overlap_ratio, 4)
+
+            # Embedding similarity boost
+            embedding_sim = 0.0
+            if query_vector and document.get("metadata", {}).get("embedding_vector"):
+                try:
+                    embedding_sim = cosine_similarity(query_vector, document["metadata"]["embedding_vector"])
+                except Exception:
+                    embedding_sim = 0.0
+            if embedding_sim == 0.0:
+                # Fallback: the dense score from retrieval is already the
+                # query-vs-chunk embedding similarity computed by the vector
+                # store.  build_search_payload does not carry the raw vector,
+                # but it does carry the dense score in metadata.scores.dense.
+                dense_score = float(
+                    document.get("metadata", {}).get("scores", {}).get("dense") or 0.0
+                )
+                if dense_score > 0:
+                    embedding_sim = dense_score
+            scores["grader_embedding_sim"] = round(embedding_sim, 4)
+
+            grade_score = 0.4 * overlap_ratio + 0.6 * embedding_sim
+            scores["grade_score"] = round(grade_score, 4)
+
+            # Primary: composite grade score is high enough
+            primary_pass = grade_score >= 0.35
+            # Cross-language bridge: if embedding similarity is strong, the chunk is
+            # semantically related even when term overlap is zero (e.g. Chinese query
+            # vs. English course material).  This prevents multilingual dense recall
+            # from being killed by monolingual term-matching.
+            cross_lang_pass = embedding_sim >= 0.45
+            # Secondary: reasonable term overlap AND original retrieval score is not noise
+            secondary_pass = overlap_ratio >= 0.25 and document["score"] >= 0.3
+
+            if primary_pass or cross_lang_pass or secondary_pass:
                 graded.append(document)
+            else:
+                low_confidence.append(document)
+
         retry_count = state.get("retry_count", 0)
         _set_run_state(db, state["run_id"], "running", current_node="document_grader", retry_count=retry_count)
         _trace(
@@ -295,12 +711,100 @@ class DocumentGrader:
             state["run_id"],
             "document_grader",
             input_summary=f"{len(state.get('documents', []))} candidates",
-            output_summary=f"{len(graded)} accepted",
+            output_summary=f"{len(graded)} accepted, {len(low_confidence)} low-confidence",
             document_ids=[item["chunk_id"] for item in graded],
             scores={item["chunk_id"]: item.get("metadata", {}).get("scores", {}) for item in graded},
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
-        return {"graded_documents": graded[: state["top_k"]], "retry_count": retry_count}
+        return {"graded_documents": graded[: state["top_k"]], "retry_count": retry_count, "low_confidence_docs": low_confidence}
+
+
+class EvidenceEvaluator:
+    """Pre-generation evidence sufficiency evaluator.
+
+    Uses heuristics (document count, grade-score distribution, intent-based
+    thresholds) to decide whether retrieved evidence is sufficient to answer
+    the question. If insufficient and retry budget remains, routes back to the
+    retrieval planner with expanded parameters. Otherwise sets ``low_evidence``
+    so the generator can produce a cautious / graceful answer.
+    """
+
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = state["db"]
+        docs = state.get("graded_documents", [])
+        perception = state.get("perception_result", {})
+        retry_count = state.get("retry_count", 0)
+        top_k = state["top_k"]
+        intent = perception.get("intent", "analysis")
+
+        if not docs:
+            sufficient = False
+            score = 0.0
+            reason = "no_documents"
+        else:
+            grade_scores = [
+                float(d.get("metadata", {}).get("scores", {}).get("grade_score", 0))
+                for d in docs
+            ]
+            avg_score = sum(grade_scores) / len(grade_scores)
+            max_score = max(grade_scores)
+
+            # Intent-based thresholds
+            if intent in ("definition", "procedure"):
+                min_docs_needed = 1
+                min_avg_score = 0.25
+            elif intent in ("comparison", "analysis"):
+                min_docs_needed = 2
+                min_avg_score = 0.20
+            else:
+                min_docs_needed = 1
+                min_avg_score = 0.20
+
+            has_anchor = max_score >= 0.35
+            doc_count_ok = len(docs) >= min_docs_needed
+
+            if has_anchor and doc_count_ok and avg_score >= min_avg_score:
+                sufficient = True
+                score = avg_score
+                reason = "sufficient"
+            elif has_anchor and len(docs) >= 1:
+                # Anchor present but marginal quantity / score
+                sufficient = True
+                score = avg_score
+                reason = "marginal"
+            else:
+                sufficient = False
+                score = avg_score
+                reason = f"avg_score={avg_score:.2f} max_score={max_score:.2f} docs={len(docs)} needed={min_docs_needed}"
+
+        evaluation = {
+            "sufficient": sufficient,
+            "score": round(score, 4),
+            "reason": reason,
+            "retry_count": retry_count,
+        }
+
+        output: dict[str, Any] = {"evidence_evaluation": evaluation}
+
+        if not sufficient and retry_count < 2:
+            # Expand recall and retry through the planning layer.
+            output["retry_count"] = retry_count + 1
+            output["top_k"] = top_k * 2
+        elif not sufficient and retry_count >= 2:
+            output["low_evidence"] = True
+
+        _set_run_state(db, state["run_id"], "running", current_node="evidence_evaluator")
+        _trace(
+            db,
+            state["run_id"],
+            "evidence_evaluator",
+            input_summary=f"intent={intent} docs={len(docs)} retry={retry_count}",
+            output_summary=f"sufficient={sufficient} score={evaluation['score']} reason={reason}",
+            document_ids=[item["chunk_id"] for item in docs],
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return output
 
 
 class RetryPlanner:
@@ -325,18 +829,34 @@ class ContextSynthesizer:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
         db = state["db"]
-        context = "\n\n".join(
-            f"[{idx + 1}] {item['document_title']} / {item.get('chapter') or 'General'}\n{item['content'][:1800]}"
-            for idx, item in enumerate(state.get("graded_documents", []))
-        )
+        docs = state.get("graded_documents", [])
+        if not docs:
+            context = ""
+        else:
+            # Token budget allocation by rerank score
+            total_budget = 6000  # approximate token budget for context
+            scores = [float(item.get("score", 0.0)) for item in docs]
+            min_score = min(scores) if scores else 0
+            max_score = max(scores) if scores else 1
+            score_range = max_score - min_score if max_score != min_score else 1
+
+            parts = []
+            for idx, item in enumerate(docs):
+                normalized_score = (float(item.get("score", 0.0)) - min_score) / score_range
+                # Budget: base 800 + up to 1200 extra for highest score
+                char_budget = int(800 + normalized_score * 1200)
+                content = item.get("content", "")[:char_budget]
+                parts.append(f"[{idx + 1}] {item['document_title']} / {item.get('chapter') or 'General'}\n{content}")
+            context = "\n\n".join(parts)
+
         _set_run_state(db, state["run_id"], "running", current_node="context_synthesizer")
         _trace(
             db,
             state["run_id"],
             "context_synthesizer",
-            input_summary=f"{len(state.get('graded_documents', []))} graded chunks",
+            input_summary=f"{len(docs)} graded chunks",
             output_summary=_summarize(context),
-            document_ids=[item["chunk_id"] for item in state.get("graded_documents", [])],
+            document_ids=[item["chunk_id"] for item in docs],
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
         return {"context": context}
@@ -346,7 +866,7 @@ class AnswerGenerator:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
         db = state["db"]
-        route = state["route"]
+        route = state.get("route", "retrieve_both")
         if route == "direct_answer":
             answer = "I can answer questions about the indexed course materials, show citations, and explain how the retrieval agent reached its answer."
             citations: list[dict] = []
@@ -371,16 +891,43 @@ class AnswerGenerator:
             }
         else:
             used_chunks = state.get("graded_documents", [])
-            chat_result = await ChatProvider().answer_question_with_meta(state["question"], used_chunks, state.get("history", []))
-            answer = chat_result.answer
-            state["answer_model_audit"] = {
-                "provider": chat_result.provider,
-                "model": chat_result.model,
-                "external_called": chat_result.external_called,
-                "fallback_reason": chat_result.fallback_reason,
-                "skipped_reason": None,
-            }
-            citations = [citation for item in used_chunks for citation in item["citations"]]
+            retry_count = state.get("retry_count", 0)
+            # During reflection-correction retry, if no documents remain after correction,
+            # produce a graceful response instead of the generic no_contexts fallback.
+            if not used_chunks and retry_count > 0:
+                answer = (
+                    "课程材料中没有找到足够相关内容来回答这个问题。"
+                    "如果你希望我从已检索到的有限材料中尝试回答（可能包含推测），请告诉我。"
+                )
+                state["answer_model_audit"] = {
+                    "provider": "none",
+                    "model": get_settings().chat_model,
+                    "external_called": False,
+                    "fallback_reason": "correction_no_contexts",
+                    "skipped_reason": None,
+                }
+                citations = []
+            else:
+                low_evidence = state.get("low_evidence", False)
+                chat_result = await ChatProvider().answer_question_with_meta(
+                    state["question"],
+                    used_chunks,
+                    state.get("history", []),
+                    evidence_quality="low" if low_evidence else "normal",
+                )
+                answer = chat_result.answer
+                state["answer_model_audit"] = {
+                    "provider": chat_result.provider,
+                    "model": chat_result.model,
+                    "external_called": chat_result.external_called,
+                    "fallback_reason": chat_result.fallback_reason,
+                    "skipped_reason": None,
+                }
+                # When evidence is marked low, do not force citations from potentially irrelevant chunks.
+                if low_evidence:
+                    citations = []
+                else:
+                    citations = [citation for item in used_chunks for citation in item["citations"]]
         audit = state.get("answer_model_audit", {})
         _set_run_state(db, state["run_id"], "running", current_node="answer_generator")
         _trace(
@@ -405,7 +952,7 @@ class CitationChecker:
         db = state["db"]
         allowed = {item["chunk_id"] for item in state.get("graded_documents", [])}
         citations = [citation for citation in state.get("citations", []) if citation.get("chunk_id") in allowed]
-        if state["route"] in {"direct_answer", "clarify"}:
+        if state.get("route", "retrieve_both") in {"direct_answer", "clarify"}:
             citations = []
         _set_run_state(db, state["run_id"], "running", current_node="citation_checker")
         _trace(
@@ -420,11 +967,125 @@ class CitationChecker:
         return {"citations": citations}
 
 
+class CitationVerifier:
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = state["db"]
+        settings = get_settings()
+        citations = state.get("citations", [])
+        answer = state.get("answer", "")
+        graded = state.get("graded_documents", [])
+        unverified: list[int] = []
+
+        if settings.enable_agentic_reflection and answer and citations and graded and not is_degraded_mode():
+            try:
+                result = await ChatProvider().verify_citations(answer, citations, graded)
+                unverified = [int(i) for i in result.get("unverified_indices", []) if isinstance(i, (int, str))]
+            except Exception:
+                pass
+
+        _set_run_state(db, state["run_id"], "running", current_node="citation_verifier")
+        _trace(
+            db,
+            state["run_id"],
+            "citation_verifier",
+            input_summary=f"{len(citations)} citations",
+            output_summary=f"{len(unverified)} unverified",
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return {"unverified_citations": unverified}
+
+
+class Reflection:
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = state["db"]
+        settings = get_settings()
+        reflection_result = {"has_issue": False, "issue_type": "none", "suggestion": ""}
+
+        if settings.enable_agentic_reflection and state.get("answer") and state.get("graded_documents") and not is_degraded_mode():
+            try:
+                result = await ChatProvider().reflect_answer(
+                    state["question"],
+                    state["answer"],
+                    state["graded_documents"],
+                )
+                reflection_result = result
+            except Exception:
+                pass
+
+        _set_run_state(db, state["run_id"], "running", current_node="reflection")
+        _trace(
+            db,
+            state["run_id"],
+            "reflection",
+            input_summary=state.get("answer", "")[:200],
+            output_summary=f"has_issue={reflection_result.get('has_issue')} type={reflection_result.get('issue_type')}",
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return {"reflection_result": reflection_result}
+
+
+class AnswerCorrector:
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = state["db"]
+        reflection = state.get("reflection_result", {})
+        issue_type = reflection.get("issue_type", "none")
+        retry_count = state.get("retry_count", 0)
+
+        correction: dict = {}
+        if issue_type == "insufficient_coverage":
+            correction = {
+                "retry_count": retry_count + 1,
+                "top_k": state["top_k"] * 2,
+                "sub_queries": state.get("sub_queries") or [state.get("rewritten_question") or state["question"]],
+            }
+        elif issue_type == "hallucination":
+            # Hallucination is usually a generation problem, not a document quality problem.
+            # Removing documents often makes it worse (leads to no_contexts).
+            # Strategy: re-retrieve with expanded top_k to get more diverse evidence,
+            # but keep existing documents as fallback.
+            docs = state.get("graded_documents", [])
+            # If all docs have very low grade_score (< 0.2), treat as insufficient_coverage
+            if docs and all(float(d.get("metadata", {}).get("scores", {}).get("grade_score", 0)) < 0.2 for d in docs):
+                correction = {
+                    "retry_count": retry_count + 1,
+                    "top_k": state["top_k"] * 2,
+                    "sub_queries": state.get("sub_queries") or [state.get("rewritten_question") or state["question"]],
+                }
+            else:
+                correction = {
+                    "retry_count": retry_count + 1,
+                    "graded_documents": docs[: state["top_k"]],
+                }
+        elif issue_type == "contradiction":
+            rewritten = f"{state.get('rewritten_question') or state['question']} (consistent explanation)"
+            correction = {
+                "retry_count": retry_count + 1,
+                "rewritten_question": rewritten,
+                "sub_queries": [rewritten],
+            }
+        else:
+            correction = {"retry_count": retry_count}
+
+        _set_run_state(db, state["run_id"], "running", current_node="answer_corrector", retry_count=correction.get("retry_count", retry_count))
+        _trace(
+            db,
+            state["run_id"],
+            "answer_corrector",
+            input_summary=f"issue={issue_type}",
+            output_summary=f"retry={correction.get('retry_count', retry_count)}",
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return correction
+
+
 class SelfCheck:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
         db = state["db"]
-        if state["route"] == "clarify":
+        if state.get("route", "retrieve_both") == "clarify":
             status = "needs_clarification"
         else:
             status = "completed"
@@ -433,7 +1094,7 @@ class SelfCheck:
             db,
             state["run_id"],
             "self_check",
-            input_summary=state["route"],
+            input_summary=state.get("route", "retrieve_both"),
             output_summary=status,
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
@@ -446,10 +1107,9 @@ class Clarify:
 
 
 def split_multi_hop_query(question: str) -> list[str]:
-    parts = [part.strip(" ,.;") for part in re.split(r"\band\b|;|,", question, flags=re.IGNORECASE) if part.strip(" ,.;")]
-    if len(parts) >= 2:
-        return parts[:3]
-    return [question, f"background for {question}", f"relationships in {question}"]
+    from app.services.chinese_text import split_multi_hop_query as _cn_split
+
+    return _cn_split(question)
 
 
 def expand_route_filters(route: AgentRoute, filters: SearchFilters) -> list[SearchFilters]:
@@ -464,47 +1124,125 @@ def expand_route_filters(route: AgentRoute, filters: SearchFilters) -> list[Sear
     return [filters]
 
 
+def route_after_perception(state: AgentState) -> str:
+    """Route after perception: check if question needs clarification or is a greeting."""
+    question = state["question"].strip().lower()
+    tokens = _terms(question)
+    is_greeting = question in {
+        "hello", "hi", "hey", "who are you", "help", "what can you do",
+        "你好", "您好", "嗨", "你是谁", "帮助", "你能做什么",
+    } or bool(tokens.intersection({"hello", "hey"}) or (tokens == {"hi"}))
+    needs_clarification = len(tokens) == 0 or question in {"it", "this", "that", "explain it", "why", "这个", "那个", "解释一下", "为什么"}
+    if is_greeting:
+        return "direct_answer"
+    if needs_clarification:
+        return "clarify"
+    return "retrieval_planner"
+
+
 def route_after_router(state: AgentState) -> str:
-    route = state["route"]
+    route = state.get("route", "retrieve_both")
     if route in {"direct_answer", "clarify"}:
         return "answer_generator"
     return "query_rewriter"
 
 
+def route_after_retrieval_decision(state: AgentState) -> str:
+    if state.get("skip_retrieval"):
+        return "answer_generator"
+    return "retrievers"
+
+
 def route_after_grader(state: AgentState) -> str:
-    if state.get("graded_documents"):
+    # Always route to evidence evaluator for pre-generation sufficiency check.
+    # Evidence evaluator handles retry logic based on quality, not just presence.
+    return "evidence_evaluator"
+
+
+def route_after_reflection(state: AgentState) -> str:
+    reflection = state.get("reflection_result", {})
+    retry_count = state.get("retry_count", 0)
+    settings = get_settings()
+    if not settings.enable_agentic_reflection:
+        return "self_check"
+    if not settings.enable_post_generation_reflection:
+        return "self_check"
+    if reflection.get("has_issue") and retry_count < settings.reflection_max_retries:
+        return "answer_corrector"
+    return "self_check"
+
+
+def route_after_evidence_evaluator(state: AgentState) -> str:
+    evaluation = state.get("evidence_evaluation", {})
+    if evaluation.get("sufficient"):
         return "context_synthesizer"
     if state.get("retry_count", 0) < 2:
-        return "retry_planner"
+        return "retrieval_planner"
     return "context_synthesizer"
+
+
+def route_after_corrector(state: AgentState) -> str:
+    reflection = state.get("reflection_result", {})
+    issue_type = reflection.get("issue_type", "none")
+    # For hallucination, we already have updated graded_documents; regenerate answer directly.
+    # For insufficient_coverage or contradiction, we need to re-retrieve with updated params.
+    if issue_type == "hallucination":
+        return "context_synthesizer"
+    return "retrievers"
 
 
 def build_agent_graph():
     workflow = StateGraph(AgentState)
+    # New architecture nodes
+    workflow.add_node("perception", Perception())
+    workflow.add_node("retrieval_planner", RetrievalPlanner())
+    workflow.add_node("retrievers", RetrievalExecutor())
+    # Legacy nodes (kept for compatibility / phased migration)
     workflow.add_node("query_analyzer", QueryAnalyzer())
     workflow.add_node("router", Router())
     workflow.add_node("query_rewriter", QueryRewriter())
-    workflow.add_node("retrievers", HybridRetriever())
+    workflow.add_node("retrieval_decision", RetrievalDecision())
     workflow.add_node("document_grader", DocumentGrader())
+    workflow.add_node("evidence_evaluator", EvidenceEvaluator())
     workflow.add_node("retry_planner", RetryPlanner())
     workflow.add_node("context_synthesizer", ContextSynthesizer())
     workflow.add_node("answer_generator", AnswerGenerator())
     workflow.add_node("citation_checker", CitationChecker())
+    workflow.add_node("citation_verifier", CitationVerifier())
+    workflow.add_node("reflection", Reflection())
+    workflow.add_node("answer_corrector", AnswerCorrector())
     workflow.add_node("self_check", SelfCheck())
-    workflow.add_edge(START, "query_analyzer")
-    workflow.add_edge("query_analyzer", "router")
-    workflow.add_conditional_edges("router", route_after_router, {"answer_generator": "answer_generator", "query_rewriter": "query_rewriter"})
-    workflow.add_edge("query_rewriter", "retrievers")
+
+    # New architecture wiring: Perception -> [direct_answer/clarify?] -> Planning -> Retrieval -> Grader -> Context -> Generation
+    workflow.add_edge(START, "perception")
+    workflow.add_conditional_edges(
+        "perception",
+        route_after_perception,
+        {"direct_answer": "answer_generator", "clarify": "answer_generator", "retrieval_planner": "retrieval_planner"},
+    )
+    workflow.add_edge("retrieval_planner", "retrievers")
     workflow.add_edge("retrievers", "document_grader")
     workflow.add_conditional_edges(
         "document_grader",
         route_after_grader,
-        {"retry_planner": "retry_planner", "context_synthesizer": "context_synthesizer"},
+        {"evidence_evaluator": "evidence_evaluator"},
+    )
+    workflow.add_conditional_edges(
+        "evidence_evaluator",
+        route_after_evidence_evaluator,
+        {"retrieval_planner": "retrieval_planner", "context_synthesizer": "context_synthesizer"},
     )
     workflow.add_edge("retry_planner", "retrievers")
     workflow.add_edge("context_synthesizer", "answer_generator")
     workflow.add_edge("answer_generator", "citation_checker")
-    workflow.add_edge("citation_checker", "self_check")
+    workflow.add_edge("citation_checker", "citation_verifier")
+    workflow.add_edge("citation_verifier", "reflection")
+    workflow.add_conditional_edges("reflection", route_after_reflection, {"answer_corrector": "answer_corrector", "self_check": "self_check"})
+    workflow.add_conditional_edges(
+        "answer_corrector",
+        route_after_corrector,
+        {"context_synthesizer": "context_synthesizer", "retrievers": "retrievers"},
+    )
     workflow.add_edge("self_check", END)
     return workflow.compile()
 

@@ -40,6 +40,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
   const [isLocked, setIsLocked] = useState(false);
   const [chapterMenuOpen, setChapterMenuOpen] = useState(false);
   const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
+  const [rebuildMode, setRebuildMode] = useState<"incremental" | "full">("incremental");
   const [rebuildProgress, setRebuildProgress] = useState(0);
   const [rebuildBatchId, setRebuildBatchId] = useState<string | null>(null);
   const [rebuildFailureDialog, setRebuildFailureDialog] = useState<{ title: string; message: string; details?: string | null } | null>(null);
@@ -56,7 +57,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
   });
   const refetchGraph = graphQuery.refetch;
   const rebuildMutation = useMutation({
-    mutationFn: () => rebuildGraph(selectedCourseId),
+    mutationFn: () => rebuildGraph(selectedCourseId, rebuildMode),
     onMutate: () => {
       setRebuildProgress(0);
       setGraphLogRetryCount(0);
@@ -436,7 +437,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
         >
           <DialogHeader className="border-b border-white/8 px-6 py-5">
             <DialogTitle>确认重建图谱</DialogTitle>
-            <DialogDescription>重建将调用 LLM 重新抽取课程概念与关系，会消耗 token 并需要 1~2 分钟。</DialogDescription>
+            <DialogDescription>选择重建模式：增量更新仅处理变更文档，全量重建会重新抽取整门课程。</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 px-6 py-5">
             {rebuildMutation.isPending || rebuildBatchId ? (
@@ -462,9 +463,34 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
                 重建失败：{(rebuildMutation.error as Error)?.message || "未知错误"}
               </p>
             ) : (
-              <p className="rounded-2xl border border-white/10 bg-white/[0.035] px-4 py-3 text-sm leading-6 text-white/68">
-                确认后立即执行，期间请勿关闭页面。
-              </p>
+              <div className="space-y-3">
+                <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border p-4 transition ${rebuildMode === "incremental" ? "border-cyan-200/30 bg-cyan-300/[0.06]" : "border-white/10 bg-white/[0.035] hover:bg-white/[0.05]"}`}>
+                  <input
+                    type="radio"
+                    name="rebuild-mode"
+                    className="mt-1"
+                    checked={rebuildMode === "incremental"}
+                    onChange={() => setRebuildMode("incremental")}
+                  />
+                  <div>
+                    <p className="text-sm font-medium text-white">增量更新（推荐）</p>
+                    <p className="mt-1 text-xs leading-5 text-white/60">仅更新变更文档相关的图谱节点，速度快，不影响现有结构。</p>
+                  </div>
+                </label>
+                <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border p-4 transition ${rebuildMode === "full" ? "border-cyan-200/30 bg-cyan-300/[0.06]" : "border-white/10 bg-white/[0.035] hover:bg-white/[0.05]"}`}>
+                  <input
+                    type="radio"
+                    name="rebuild-mode"
+                    className="mt-1"
+                    checked={rebuildMode === "full"}
+                    onChange={() => setRebuildMode("full")}
+                  />
+                  <div>
+                    <p className="text-sm font-medium text-white">全量重建</p>
+                    <p className="mt-1 text-xs leading-5 text-white/60">完整重建整门课程的图谱，耗时较长，会自动保留备份。</p>
+                  </div>
+                </label>
+              </div>
             )}
             <div className="flex justify-end gap-2">
               <button

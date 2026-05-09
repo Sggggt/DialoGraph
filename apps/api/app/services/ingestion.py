@@ -15,7 +15,7 @@ from app.core.config import get_settings
 from app.core.utils import source_type_from_path
 from app.models import Chunk, Concept, Course, Document, DocumentVersion, IngestionBatch, IngestionCompensationLog, IngestionJob
 from app.services.chunking import CURRENT_EMBEDDING_TEXT_VERSION, chunk_sections_hierarchical_async, contextual_embedding_text, normalize_for_dedup
-from app.services.concept_graph import get_concept_cards, get_graph_payload, graph_extraction_provider, rebuild_course_graph
+from app.services.concept_graph import get_concept_cards, get_graph_payload, graph_extraction_provider, rebuild_course_graph, incremental_update_course_graph
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode, vector_norm
 from app.services.ingestion_logs import emit_ingestion_log
 from app.services.parsers import derive_chapter, parse_document, sections_to_json
@@ -213,8 +213,10 @@ async def recover_existing_graph_algorithm_metrics(session: Session, course_id: 
         }
 
 
-async def run_graph_rebuild(batch_id: str, course_id: str) -> dict:
+async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -> dict:
     from app.db import SessionLocal
+    from app.services.concept_graph import incremental_update_course_graph, _restore_course_graph_from_backup
+    from app.models import Document, IngestionBatch
 
     session = SessionLocal()
     try:
@@ -224,33 +226,77 @@ async def run_graph_rebuild(batch_id: str, course_id: str) -> dict:
         batch.status = "extracting_graph"
         batch.started_at = datetime.utcnow()
         session.commit()
-        emit_ingestion_log(batch_id, "batch_graph_started", "正在重建课程图谱")
 
-        try:
-            graph_stats = await rebuild_course_graph_for_batch(session, course_id, batch_id)
-        except Exception as exc:
-            session.rollback()
-            recovery_stats = await recover_existing_graph_algorithm_metrics(session, course_id)
-            batch = session.get(IngestionBatch, batch_id)
-            if batch is not None:
-                graph_stats = {
-                    "graph_rebuilt": False,
-                    "graph_nodes": 0,
-                    "graph_edges": 0,
-                    "concepts": 0,
-                    "relations": 0,
-                    "graph_extraction_provider": graph_extraction_provider(),
-                    "graph_error": exception_message(exc),
-                    **recovery_stats,
-                }
-                batch.stats = {**(batch.stats or {}), **graph_stats}
-                batch.status = "failed"
-                batch.last_error = exception_message(exc)
-                batch.completed_at = datetime.utcnow()
-                session.commit()
-            emit_ingestion_log(batch_id, "graph_failed", f"图谱重建失败：{exception_message(exc)}")
-            emit_ingestion_log(batch_id, "batch_failed", f"批次失败：{exception_message(exc)}")
-            raise
+        if mode == "incremental":
+            emit_ingestion_log(batch_id, "batch_graph_started", "正在增量更新课程图谱")
+            # Find documents updated since the last completed graph batch
+            last_graph_batch = session.scalar(
+                select(IngestionBatch)
+                .where(
+                    IngestionBatch.course_id == course_id,
+                    IngestionBatch.status == "completed",
+                    IngestionBatch.trigger_source == "rebuild_graph",
+                    IngestionBatch.id != batch_id,
+                )
+                .order_by(IngestionBatch.completed_at.desc())
+            )
+            last_completed_at = last_graph_batch.completed_at if last_graph_batch else None
+            if last_completed_at:
+                changed_documents = session.scalars(
+                    select(Document).where(
+                        Document.course_id == course_id,
+                        Document.is_active.is_(True),
+                        Document.updated_at > last_completed_at,
+                    )
+                ).all()
+            else:
+                # No previous graph batch; fall back to full rebuild
+                mode = "full"
+            if mode == "incremental" and changed_documents:
+                changed_document_ids = [doc.id for doc in changed_documents]
+                try:
+                    graph_stats = await incremental_update_course_graph(session, course_id, changed_document_ids, batch_id)
+                except Exception as exc:
+                    session.rollback()
+                    emit_ingestion_log(batch_id, "graph_incremental_failed", f"增量图谱更新失败，尝试全量重建：{exception_message(exc)}")
+                    mode = "full"
+            elif mode == "incremental":
+                emit_ingestion_log(batch_id, "graph_incremental_skipped", "没有检测到变更文档，跳过增量更新")
+                graph_stats = {"graph_rebuilt": False, "reason": "no_changed_documents"}
+        else:
+            emit_ingestion_log(batch_id, "batch_graph_started", "正在重建课程图谱")
+
+        if mode == "full":
+            try:
+                graph_stats = await rebuild_course_graph_for_batch(session, course_id, batch_id)
+            except Exception as exc:
+                session.rollback()
+                try:
+                    _restore_course_graph_from_backup(session, course_id)
+                    session.commit()
+                    recovery_stats = {"graph_restored_from_backup": True}
+                except Exception:
+                    recovery_stats = await recover_existing_graph_algorithm_metrics(session, course_id)
+                batch = session.get(IngestionBatch, batch_id)
+                if batch is not None:
+                    graph_stats = {
+                        "graph_rebuilt": False,
+                        "graph_nodes": 0,
+                        "graph_edges": 0,
+                        "concepts": 0,
+                        "relations": 0,
+                        "graph_extraction_provider": graph_extraction_provider(),
+                        "graph_error": exception_message(exc),
+                        **recovery_stats,
+                    }
+                    batch.stats = {**(batch.stats or {}), **graph_stats}
+                    batch.status = "failed"
+                    batch.last_error = exception_message(exc)
+                    batch.completed_at = datetime.utcnow()
+                    session.commit()
+                emit_ingestion_log(batch_id, "graph_failed", f"图谱重建失败：{exception_message(exc)}")
+                emit_ingestion_log(batch_id, "batch_failed", f"批次失败：{exception_message(exc)}")
+                raise
 
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
@@ -1221,10 +1267,12 @@ async def _ingest_file_locked(
             mark_vector_compensation_log(db, delete_log.id, "failed", str(exc))
 
     set_job_state(db, job, "extracting_graph", batch_id=batch_id)
-    graph_stats = (
-        await rebuild_course_graph(db, course.id)
-        if rebuild_graph
-        else {
+    if rebuild_graph and document:
+        graph_stats = await incremental_update_course_graph(db, course.id, [document.id], batch_id)
+    elif rebuild_graph:
+        graph_stats = await rebuild_course_graph(db, course.id)
+    else:
+        graph_stats = {
             "graph_rebuilt": False,
             "concepts": 0,
             "relations": 0,
@@ -1232,7 +1280,6 @@ async def _ingest_file_locked(
             "graph_edges": 0,
             "graph_extraction_provider": graph_extraction_provider(),
         }
-    )
 
     job.status = "completed"
     job.error_message = None

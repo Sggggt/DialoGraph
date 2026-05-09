@@ -49,13 +49,22 @@ const fallbackSuggestions = [
 ];
 
 const traceNodeLabels: Record<string, string> = {
+  perception: "感知",
+  retrieval_planner: "检索规划",
   query_analyzer: "问题分析",
   router: "路由判断",
   query_rewriter: "查询改写",
+  retrieval_decision: "检索决策",
   retrievers: "检索召回",
   document_grader: "证据筛选",
+  retry_planner: "重试规划",
+  context_synthesizer: "上下文合成",
   answer_generator: "答案生成",
   citation_checker: "引用校验",
+  citation_verifier: "引用验证",
+  reflection: "反思",
+  answer_corrector: "答案修正",
+  self_check: "自检",
   error: "错误",
 };
 
@@ -451,7 +460,7 @@ function SessionsDrawer({
 }
 
 function TraceTimeline({ trace, isRunning }: { trace: AgentTraceEventPayload[]; isRunning: boolean }) {
-  const fallbackSteps = ["query_analyzer", "router", "query_rewriter", "retrievers", "document_grader", "answer_generator", "citation_checker"];
+  const fallbackSteps = ["perception", "retrieval_planner", "retrievers", "document_grader", "evidence_evaluator", "context_synthesizer", "answer_generator", "citation_checker"];
   const steps: AgentTraceEventPayload[] = trace.length
     ? trace
     : fallbackSteps.map((node) => ({ node, status: "pending", document_ids: [], scores: {}, duration_ms: 0 }));

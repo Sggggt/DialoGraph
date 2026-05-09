@@ -658,7 +658,7 @@ def write_concept_metrics(
     return updated
 
 
-async def enrich_course_graph(db: Session, course_id: str, *, run_relation_completion: bool = True) -> dict[str, Any]:
+async def enrich_course_graph(db: Session, course_id: str, *, run_relation_completion: bool = True, run_dijkstra: bool = True) -> dict[str, Any]:
     from app.models import Concept, ConceptRelation, Course
 
     course = db.get(Course, course_id)
@@ -693,10 +693,12 @@ async def enrich_course_graph(db: Session, course_id: str, *, run_relation_compl
             edges = build_sparse_edges(signals, relation_signals)
             metrics, graph = analyze_graph(signals, edges)
 
-    inferred_edges = infer_dijkstra_edges(graph, signals, edges)
-    if inferred_edges:
-        edges = [*edges, *inferred_edges]
-        metrics, graph = analyze_graph(signals, edges)
+    inferred_edges: list[WeightedEdge] = []
+    if run_dijkstra:
+        inferred_edges = infer_dijkstra_edges(graph, signals, edges)
+        if inferred_edges:
+            edges = [*edges, *inferred_edges]
+            metrics, graph = analyze_graph(signals, edges)
     keep_ids = select_concepts_to_keep(signals, metrics, graph)
     edge_updates = upsert_weighted_edges(db, course_id, edges)
     concept_updates = write_concept_metrics(db, concepts, signals, metrics, keep_ids)

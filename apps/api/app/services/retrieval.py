@@ -13,6 +13,7 @@ from app.core.config import get_settings
 from app.models import Chunk, Concept, ConceptRelation, Course, Document, DocumentVersion, IngestionBatch, IngestionJob
 from app.schemas import Citation, SearchFilters
 from app.services.concept_graph import get_graph_payload
+from app.services.cache_manager import get_cache_manager
 from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode
 from app.services.parsers import derive_chapter, is_invalid_chapter_label
 from app.services.reranker import get_reranker
@@ -46,6 +47,21 @@ QUERY_TYPE_CONFIG = {
     "comparison": {"alpha": 0.75, "recall_k": 80},
     "procedure": {"alpha": 0.75, "recall_k": 60},
     "default": {"alpha": 0.72, "recall_k": 64},
+}
+RETRIEVAL_LAYER_CONFIG = {
+    ("definition", "retrieve_notes"): 1,
+    ("formula", "retrieve_notes"): 1,
+    ("definition", "retrieve_both"): 1,
+    ("formula", "retrieve_both"): 1,
+    ("example", "retrieve_notes"): 2,
+    ("example", "retrieve_both"): 2,
+    ("procedure", "retrieve_notes"): 2,
+    ("procedure", "retrieve_both"): 2,
+    ("comparison", "multi_hop_research"): 3,
+    ("default", "multi_hop_research"): 3,
+    ("comparison", "retrieve_both"): 3,
+    ("default", "retrieve_notes"): 2,
+    ("default", "retrieve_both"): 2,
 }
 PRIMARY_SCORE_KEYS = ("dense", "lexical", "fused", "rerank", "lightweight_rerank", "term_overlap_ratio")
 
@@ -85,11 +101,9 @@ def score_chunk_bonus(chunk: Chunk, document: Document, query: str) -> float:
 
 
 def tokenize_for_retrieval(text: str) -> list[str]:
-    tokens = re.findall(
-        r"[a-zA-Z][a-zA-Z0-9_\-]*|[0-9]+(?:\.[0-9]+)?|[α-ωΑ-Ω]+|[\u4e00-\u9fff]|[=<>+\-*/^()]+",
-        text.lower(),
-    )
-    return [token for token in tokens if token.strip() and (len(token) > 1 or re.match(r"[\u4e00-\u9fff=<>+\-*/^()]", token))]
+    from app.services.chinese_text import tokenize_for_retrieval as _cn_tokenize
+
+    return _cn_tokenize(text)
 
 
 def classify_query_type(query: str) -> str:
@@ -105,7 +119,7 @@ def classify_query_type(query: str) -> str:
         return "example"
     if any(marker in lower for marker in ("compare", "versus", "vs", "difference", "relationship", "relate", "区别", "比较", "关系")):
         return "comparison"
-    if any(marker in lower for marker in ("algorithm", "procedure", "steps", "how to", "流程", "步骤", "算法")):
+    if any(marker in lower for marker in ("algorithm", "procedure", "steps", "how to", "流程", "步骤", "算法", "如何")):
         return "procedure"
     return "default"
 
@@ -254,7 +268,15 @@ async def dense_search_chunks(db: Session, course_id: str, query: str, filters: 
     if course is None:
         return []
     embedder = EmbeddingProvider()
-    embedding_result = await embedder.embed_texts_with_meta([query], text_type="query")
+    cache = get_cache_manager()
+    embedding_version = "contextual_enriched_v2"
+    cached_vector = cache.get_embedding(course_id, query, embedding_version)
+    if cached_vector is not None:
+        embedding_result = type("obj", (object,), {"vectors": [cached_vector], "provider": "cache", "external_called": False, "fallback_reason": None})()
+    else:
+        embedding_result = await embedder.embed_texts_with_meta([query], text_type="query")
+        if embedding_result.vectors and embedding_result.external_called:
+            cache.set_embedding(course_id, query, embedding_version, embedding_result.vectors[0])
     if model_audit is not None:
         model_audit.update(
             {
@@ -512,6 +534,392 @@ async def graph_enhanced_search(db: Session, course_id: str, query: str, filters
             item["score"] = float(item["score"]) + float(scores["graph_boost"])
     ranked = sorted(merged.values(), key=lambda item: item["score"], reverse=True)[:top_k]
     return expand_results_with_parent_context(db, course_id, ranked)
+
+
+async def graph_enhanced_search_v2(
+    db: Session,
+    course_id: str,
+    query: str,
+    filters: SearchFilters,
+    top_k: int,
+    query_type: str = "default",
+) -> list[dict]:
+    """Graph-enhanced search with centrality boost, community aggregation, and Dijkstra path expansion."""
+    base_results = await hybrid_search_chunks(db, course_id, query, filters, top_k)
+    if not base_results:
+        return []
+    merged = {item["chunk_id"]: item for item in base_results}
+    base_chunk_ids = list(merged)
+
+    seed_relations = db.scalars(
+        select(ConceptRelation).where(
+            ConceptRelation.course_id == course_id,
+            ConceptRelation.evidence_chunk_id.in_(base_chunk_ids),
+        )
+    ).all()
+    seed_concept_ids = {
+        concept_id
+        for relation in seed_relations
+        for concept_id in (relation.source_concept_id, relation.target_concept_id)
+        if concept_id
+    }
+    if not seed_concept_ids:
+        return base_results
+
+    concepts = {
+        concept.id: concept
+        for concept in db.scalars(select(Concept).where(Concept.course_id == course_id)).all()
+    }
+    seed_concepts = {cid: concepts[cid] for cid in seed_concept_ids if cid in concepts}
+
+    # Determine relation type priority based on query
+    relation_priority: set[str] = set()
+    if query_type == "comparison":
+        relation_priority = {"compares", "relates_to", "contrasts_with"}
+    elif query_type == "definition":
+        relation_priority = {"defines", "example_of"}
+    elif query_type == "procedure":
+        relation_priority = {"solves", "extends", "prerequisite_of"}
+
+    neighbor_relations = db.scalars(
+        select(ConceptRelation).where(
+            ConceptRelation.course_id == course_id,
+            or_(
+                ConceptRelation.source_concept_id.in_(seed_concept_ids),
+                ConceptRelation.target_concept_id.in_(seed_concept_ids),
+            ),
+        )
+    ).all()
+
+    # Centrality and community boost
+    boost_by_chunk: dict[str, float] = {}
+    boost_by_concept: dict[str, float] = {}
+    for relation in neighbor_relations:
+        if not relation.evidence_chunk_id:
+            continue
+        source = concepts.get(relation.source_concept_id)
+        target = concepts.get(relation.target_concept_id or "")
+        source_imp = float(getattr(source, "importance_score", 0.0) or 0.0)
+        target_imp = float(getattr(target, "importance_score", 0.0) or 0.0)
+        source_cent = float((getattr(source, "centrality_json", {}) or {}).get("centrality_score", 0.0))
+        target_cent = float((getattr(target, "centrality_json", {}) or {}).get("centrality_score", 0.0))
+        importance = max(source_imp, target_imp)
+        centrality = max(source_cent, target_cent)
+
+        # Relation type boost
+        type_boost = 1.3 if relation_priority and relation.relation_type in relation_priority else 1.0
+
+        # Community aggregation: boost if source or target shares community with seed
+        community_boost = 1.0
+        seed_communities: set[int] = set()
+        for sc in seed_concepts.values():
+            if sc.community_louvain is not None:
+                seed_communities.add(sc.community_louvain)
+        if source and source.community_louvain in seed_communities:
+            community_boost = 1.15
+        if target and target.community_louvain in seed_communities:
+            community_boost = 1.15
+
+        boost = float(relation.confidence or 0.0) * importance * (1.0 + centrality) * type_boost * community_boost
+        boost_by_chunk[relation.evidence_chunk_id] = max(boost_by_chunk.get(relation.evidence_chunk_id, 0.0), boost)
+        for cid in (relation.source_concept_id, relation.target_concept_id):
+            if cid:
+                boost_by_concept[cid] = max(boost_by_concept.get(cid, 0.0), boost)
+
+    # Dijkstra path expansion for multi-hop (2-3 hops between seed concepts)
+    try:
+        import networkx as nx
+
+        G = nx.Graph()
+        all_relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
+        for rel in all_relations:
+            if rel.source_concept_id and rel.target_concept_id:
+                w = float(rel.weight or rel.confidence or 0.1)
+                G.add_edge(rel.source_concept_id, rel.target_concept_id, weight=1.0 / (0.05 + w))
+        for source_id in seed_concept_ids:
+            for target_id in seed_concept_ids:
+                if source_id >= target_id:
+                    continue
+                if nx.has_path(G, source_id, target_id):
+                    try:
+                        path = nx.shortest_path(G, source_id, target_id, weight="weight")
+                        if 3 <= len(path) <= 4:  # 2-3 hops
+                            path_boost = max(boost_by_concept.get(source_id, 0.5), boost_by_concept.get(target_id, 0.5)) * 0.6
+                            for node_id in path[1:-1]:
+                                # Add evidence chunks from path intermediates
+                                node_rels = db.scalars(
+                                    select(ConceptRelation).where(
+                                        ConceptRelation.course_id == course_id,
+                                        or_(
+                                            ConceptRelation.source_concept_id == node_id,
+                                            ConceptRelation.target_concept_id == node_id,
+                                        ),
+                                    )
+                                ).all()
+                                for nr in node_rels:
+                                    if nr.evidence_chunk_id and nr.evidence_chunk_id not in base_chunk_ids:
+                                        boost_by_chunk[nr.evidence_chunk_id] = max(
+                                            boost_by_chunk.get(nr.evidence_chunk_id, 0.0),
+                                            path_boost,
+                                        )
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        pass
+    except Exception:
+        pass
+
+    evidence_ids = {cid for cid in boost_by_chunk if cid not in base_chunk_ids}
+    if evidence_ids:
+        chunks = db.scalars(
+            select(Chunk).where(
+                Chunk.id.in_(evidence_ids),
+                Chunk.course_id == course_id,
+                Chunk.is_active.is_(True),
+            )
+        ).all()
+        for chunk in chunks:
+            document = db.get(Document, chunk.document_id)
+            if document is None or document.course_id != course_id or not document.is_active:
+                continue
+            if filters.chapter and chunk.chapter != filters.chapter:
+                continue
+            if filters.source_type and chunk.source_type != filters.source_type:
+                continue
+            if filters.tags and not set(filters.tags).intersection(set(document.tags or [])):
+                continue
+            graph_boost = boost_by_chunk.get(chunk.id, 0.0)
+            item = build_search_payload(chunk, document, query, graph_boost, {"graph_boost": graph_boost, "graph_expanded": True})
+            merged[chunk.id] = item
+
+    for item in merged.values():
+        scores = item.setdefault("metadata", {}).setdefault("scores", {})
+        if "graph_boost" in scores:
+            item["score"] = float(item["score"]) + float(scores["graph_boost"])
+    ranked = sorted(merged.values(), key=lambda item: item["score"], reverse=True)[:top_k]
+    return expand_results_with_parent_context(db, course_id, ranked)
+
+
+def select_retrieval_layer(query_type: str, route: str) -> int:
+    return RETRIEVAL_LAYER_CONFIG.get((query_type, route), 2)
+
+
+async def layered_search_chunks(
+    db: Session,
+    course_id: str,
+    query: str,
+    filters: SearchFilters,
+    top_k: int,
+    route: str = "retrieve_notes",
+    use_cache: bool = True,
+) -> tuple[list[dict], dict]:
+    """Layered retrieval entry point with caching and query-type-aware depth selection."""
+    config = query_type_config(query)
+    query_type = config["query_type"]
+    layer = select_retrieval_layer(query_type, route)
+    cache = get_cache_manager()
+    filters_hash = f"{filters.chapter or ''}:{filters.source_type or ''}:{','.join(filters.tags or [])}"
+    embedding_version = "contextual_enriched_v2"
+
+    if use_cache:
+        cached = cache.get_search_results(course_id, query, filters_hash, embedding_version)
+        if cached is not None:
+            return cached, {"cached": True, "layer": layer}
+
+    if layer == 1:
+        # Fast: dense only
+        model_audit = default_model_audit()
+        results = await dense_search_chunks(db, course_id, query, filters, top_k, model_audit)
+        results = expand_results_with_parent_context(db, course_id, results)
+        results = attach_model_audit(results, model_audit)
+    elif layer == 3:
+        # Deep graph: hybrid + graph v2
+        results = await graph_enhanced_search_v2(db, course_id, query, filters, top_k, query_type)
+    else:
+        # Standard hybrid
+        results, _ = await hybrid_search_chunks_with_audit(db, course_id, query, filters, top_k)
+
+    if use_cache and results:
+        cache.set_search_results(course_id, query, filters_hash, embedding_version, results)
+    return results, {"layer": layer, "query_type": query_type}
+
+
+async def local_graph_search(
+    db: Session,
+    course_id: str,
+    query: str,
+    filters: SearchFilters,
+    top_k: int,
+    seed_concept_ids: list[str],
+) -> list[dict]:
+    """Retrieve chunks centered around seed concepts and their 1-hop neighbors."""
+    from app.models import Concept, ConceptRelation
+
+    # 1. Get seed concept evidence chunks
+    seed_chunks = db.scalars(
+        select(Chunk)
+        .join(ConceptRelation, Chunk.id == ConceptRelation.evidence_chunk_id)
+        .where(
+            Chunk.course_id == course_id,
+            Chunk.is_active.is_(True),
+            or_(
+                ConceptRelation.source_concept_id.in_(seed_concept_ids),
+                ConceptRelation.target_concept_id.in_(seed_concept_ids),
+            ),
+        )
+        .distinct()
+    ).all()
+
+    # 2. Get neighbor concept evidence chunks
+    neighbor_relations = db.scalars(
+        select(ConceptRelation).where(
+            ConceptRelation.course_id == course_id,
+            or_(
+                ConceptRelation.source_concept_id.in_(seed_concept_ids),
+                ConceptRelation.target_concept_id.in_(seed_concept_ids),
+            ),
+        )
+    ).all()
+    neighbor_concept_ids = {
+        rel.target_concept_id if rel.source_concept_id in set(seed_concept_ids) else rel.source_concept_id
+        for rel in neighbor_relations
+        if rel.target_concept_id and rel.source_concept_id
+    }
+    neighbor_chunks = []
+    if neighbor_concept_ids:
+        neighbor_chunks = db.scalars(
+            select(Chunk)
+            .join(ConceptRelation, Chunk.id == ConceptRelation.evidence_chunk_id)
+            .where(
+                Chunk.course_id == course_id,
+                Chunk.is_active.is_(True),
+                or_(
+                    ConceptRelation.source_concept_id.in_(list(neighbor_concept_ids)),
+                    ConceptRelation.target_concept_id.in_(list(neighbor_concept_ids)),
+                ),
+            )
+            .distinct()
+        ).all()
+
+    # 3. Also do a base dense recall and merge
+    base_results, _ = await hybrid_search_chunks_with_audit(db, course_id, query, filters, top_k)
+    base_ids = {r["chunk_id"] for r in base_results}
+
+    # 4. Build result set: seed chunks get highest score, neighbor next, base dense fills remaining
+    result_map: dict[str, dict] = {}
+    for chunk in seed_chunks:
+        if not is_child_retrieval_candidate(chunk):
+            continue
+        result_map[str(chunk.id)] = chunk_to_result(chunk, score=1.0, source="local_graph_seed")
+    for chunk in neighbor_chunks:
+        if not is_child_retrieval_candidate(chunk):
+            continue
+        cid = str(chunk.id)
+        if cid not in result_map:
+            result_map[cid] = chunk_to_result(chunk, score=0.8, source="local_graph_neighbor")
+
+    # Add base dense results with lower priority
+    for result in base_results:
+        cid = result["chunk_id"]
+        if cid not in result_map:
+            result_map[cid] = {**result, "source": "local_graph_dense"}
+        else:
+            # Boost if also in dense results
+            existing = result_map[cid]
+            existing["score"] = max(existing.get("score", 0.0), result.get("score", 0.0)) + 0.1
+
+    results = sorted(result_map.values(), key=lambda x: x.get("score", 0.0), reverse=True)[:top_k]
+    return expand_results_with_parent_context(db, course_id, results)
+
+
+async def community_search_chunks(
+    db: Session,
+    course_id: str,
+    query: str,
+    filters: SearchFilters,
+    top_k: int,
+    community_ids: list[int],
+) -> list[dict]:
+    """Retrieve chunks from concepts within specified communities, blended with dense recall."""
+    from app.models import Concept
+
+    community_concepts = db.scalars(
+        select(Concept).where(
+            Concept.course_id == course_id,
+            Concept.community_louvain.in_(community_ids),
+        )
+    ).all()
+    concept_ids = {c.id for c in community_concepts}
+
+    # Get evidence chunks from community concepts
+    community_chunk_ids: set[str] = set()
+    if concept_ids:
+        from app.models import ConceptRelation
+        relations = db.scalars(
+            select(ConceptRelation).where(
+                ConceptRelation.course_id == course_id,
+                or_(
+                    ConceptRelation.source_concept_id.in_(concept_ids),
+                    ConceptRelation.target_concept_id.in_(concept_ids),
+                ),
+            )
+        ).all()
+        community_chunk_ids = {str(r.evidence_chunk_id) for r in relations if r.evidence_chunk_id}
+
+    # Base dense recall
+    base_results, _ = await hybrid_search_chunks_with_audit(db, course_id, query, filters, top_k)
+
+    # Boost community chunks
+    result_map: dict[str, dict] = {}
+    for result in base_results:
+        cid = result["chunk_id"]
+        score = result.get("score", 0.0)
+        if cid in community_chunk_ids:
+            score += 0.15
+        result_map[cid] = {**result, "score": score, "source": "community" if cid in community_chunk_ids else "dense"}
+
+    results = sorted(result_map.values(), key=lambda x: x.get("score", 0.0), reverse=True)[:top_k]
+    return expand_results_with_parent_context(db, course_id, results)
+
+
+def chunk_to_result(chunk, score: float = 0.0, source: str = "") -> dict:
+    from app.models import Document
+    document = chunk.document if hasattr(chunk, "document") and chunk.document else None
+    return {
+        "chunk_id": str(chunk.id),
+        "document_id": str(chunk.document_id),
+        "document_title": getattr(document, "title", "") if document else "",
+        "source_path": getattr(document, "source_path", "") if document else "",
+        "chapter": chunk.chapter or "General",
+        "section": chunk.section,
+        "page_number": chunk.page_number,
+        "snippet": chunk.snippet or "",
+        "content": chunk.content or "",
+        "source_type": chunk.source_type or "",
+        "citations": [{
+            "chunk_id": str(chunk.id),
+            "document_id": str(chunk.document_id),
+            "document_title": getattr(document, "title", "") if document else "",
+            "source_path": getattr(document, "source_path", "") if document else "",
+            "chapter": chunk.chapter or "General",
+            "section": chunk.section,
+            "page_number": chunk.page_number,
+            "snippet": chunk.snippet or "",
+        }],
+        "metadata": {"scores": {"dense": score}, "source": source},
+        "score": score,
+    }
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    import math
+
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 def lexical_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:

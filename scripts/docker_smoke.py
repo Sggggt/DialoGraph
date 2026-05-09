@@ -183,6 +183,50 @@ def main() -> None:
         require(qa.get("answer"), f"QA returned no answer: {qa}")
         require(qa.get("citations"), f"QA returned no citations: {qa}")
 
+        # ------------------------------------------------------------------
+        # Chinese-language smoke path (upload → search → QA)
+        # ------------------------------------------------------------------
+        upload_cn = client.upload_file(
+            "/files/upload",
+            course_id=created_course_id,
+            filename="centrality-chinese-smoke.md",
+            content=(
+                "# 度中心性\n\n"
+                "度中心性是图论和网络分析中的一个基本概念。"
+                "它通过计算与某个节点直接相连的边的数量来衡量该节点的重要性。"
+                "在社会网络中，度中心性高的个体通常拥有更多的直接联系。\n"
+            ).encode("utf-8"),
+        )
+        source_path_cn = str(upload_cn["source_path"])
+
+        batch_cn = client.request_json(
+            "POST",
+            "/ingestion/parse-uploaded-files",
+            params={"course_id": created_course_id},
+            payload={"file_paths": [source_path_cn], "force": True},
+        )
+        batch_status_cn = wait_for_batch(client, str(batch_cn["batch_id"]), args.timeout_seconds)
+        require(batch_status_cn.get("state") in {"completed", "partial_failed"}, f"Chinese ingestion failed: {batch_status_cn}")
+        require(int(batch_status_cn.get("success_count") or 0) >= 1, f"No Chinese file was ingested: {batch_status_cn}")
+
+        search_cn = client.request_json(
+            "POST",
+            "/search",
+            payload={"course_id": created_course_id, "query": "什么是度中心性", "top_k": 3},
+        )
+        require(search_cn.get("results"), f"Chinese search returned no results: {search_cn}")
+        audit_cn = search_cn.get("model_audit") or {}
+        require(audit_cn.get("embedding_external_called") is True, f"Chinese search did not report a real embedding call: {audit_cn}")
+        require(audit_cn.get("embedding_fallback_reason") is None, f"Chinese search used fallback: {audit_cn}")
+
+        qa_cn = client.request_json(
+            "POST",
+            "/qa",
+            payload={"course_id": created_course_id, "question": "什么是度中心性？", "top_k": 3},
+        )
+        require(qa_cn.get("answer"), f"Chinese QA returned no answer: {qa_cn}")
+        require(qa_cn.get("citations"), f"Chinese QA returned no citations: {qa_cn}")
+
         session_id = str(qa["session_id"])
         messages = client.request_json("GET", f"/sessions/{session_id}/messages")
         require(messages.get("messages"), f"Session messages are empty: {messages}")
@@ -196,6 +240,8 @@ def main() -> None:
                     "batch": batch_status,
                     "search_model_audit": audit,
                     "qa_run_id": qa.get("run_id"),
+                    "chinese_search_model_audit": audit_cn,
+                    "chinese_qa_run_id": qa_cn.get("run_id"),
                 },
                 ensure_ascii=False,
                 indent=2,

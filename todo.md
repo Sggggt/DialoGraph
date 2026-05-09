@@ -18,29 +18,6 @@
 
 ## P0：阻塞生产 / 大规模扩展
 
-### P0-1 质量门禁（交付前必做）
-
-- [ ] 在 Docker 栈内运行默认单测：
-  ```powershell
-  docker exec course-kg-api python -m pytest
-  ```
-- [ ] 在 Docker 栈内运行检索和图谱关键测试：
-  ```powershell
-  docker exec course-kg-api python -m pytest tests/test_retrieval.py tests/test_p0_graph_security.py tests/test_enhanced_chunking.py
-  ```
-- [ ] 对当前课程运行 DB/Qdrant 健康门禁：
-  ```powershell
-  docker exec course-kg-api python /app/scripts/quality_gate.py --course-name "课程名称"
-  ```
-- [ ] 运行轻量端到端 smoke：
-  ```powershell
-  python scripts/docker_smoke.py --base-url http://127.0.0.1:8000/api
-  ```
-- [ ] 如需真实 E2E，显式开启：
-  ```powershell
-  docker exec -e RUN_NO_FALLBACK_E2E=1 course-kg-api python -m pytest -m no_fallback_e2e
-  ```
-
 ### P0-2 数据一致性
 
 - [ ] 全量重解析单门课程后清理 inactive 数据和旧向量：
@@ -53,31 +30,32 @@
 
 ### P0-3 性能瓶颈（扩展前必须解决）
 
+- [x] **Web 容器运行 dev 模式**：已改为 `npm run build` + `next start` 生产模式。
 - [ ] **Lexical 检索全表扫描**：当前每次查询拉取全量 active chunks 内存构建 BM25，时间/空间复杂度 O(N)，chunk 数过万时不可扩展。
   - 方案 A：PostgreSQL `tsvector` 全文索引 + `to_tsvector`/`ts_rank_cd` 替代内存 BM25。
   - 方案 B：引入 Meilisearch 侧车容器，专门承担 lexical 检索，API 层做 adapter。
   - 验收：单课程 5 万 child chunks 下 lexical recall 延迟 < 200ms。
-- [ ] **图谱非增量全量重建**：`rebuild_course_graph` 先 DELETE 全课概念/关系/别名再重建，重建期间图谱为空，失败则数据丢失。
+- [x] **图谱非增量全量重建**：`rebuild_course_graph` 先 DELETE 全课概念/关系/别名再重建，重建期间图谱为空，失败则数据丢失。
   - 方案：影子图谱（shadow graph）策略——在独立表空间或临时 schema 构建新图谱，验证通过后原子切换，旧图谱保留为备份。
   - 验收：重建期间 `/graph` 和 `/concepts` 查询不返回空数据，重建失败可自动回滚到旧图谱。
 - [ ] **Web 容器运行 dev 模式**：`apps/web/Dockerfile` 使用 `npm run dev`，暴露热重载 WebSocket 和源码映射，不适合生产。
   - 方案：改为 `next build` + `next start` 生产模式，或提供 `Dockerfile.prod` 多阶段构建。
   - 验收：`docker compose up web` 后容器内进程为 `next start`，端口 3000 响应正常。
 
+- [ ] **Agentic RAG 长链路导致超时风险**：完整的问答包含感知、规划、生成和可能的 EvidenceEvaluator 重试，容易触发 FastAPI 或前端 HTTP 超时。\n  - 方案：在 Perception 阶段尽早通过 SSE 下发 Agent 状态保持 TCP 连接；在 FastAPI 侧添加 Semaphore 严格限制 Agent 并发数，避免打满模型 API 的并发槽位。\n
 ## P1：显著影响体验 / 效率
 
 ### P1-1 检索与问答质量
 
-- [ ] 为常见课程问题维护一组小型人工验收集，覆盖 definition、formula、example、comparison、multi-hop。
 - [ ] 记录每类 query 的 top-k 证据质量、parent context 覆盖率、reranker_called 率和延迟。
 - [ ] 为 QA 增加引用质量检查：答案必须能映射到 citation 和 parent context。
 - [ ] 评估图谱扩展的噪声：对低置信关系设置查询类型或分数阈值，graph boost 后增加二次精排。
-- [ ] **Agent Document Grader 改进**：当前仅基于 query terms 词级别 overlap，缺乏语义判断，误删率高。
-  - 方案：引入轻量 embedding similarity（如 `all-MiniLM-L6-v2` 本地模型）作为 grader 辅助信号，与 term overlap 加权融合。
+- [x] **Agent Document Grader 改进**：已引入 query-document embedding similarity 融合评分，`grade_score = 0.4 * overlap + 0.6 * cosine_sim`。
 
+- [ ] **DocumentGrader 重叠度计算的脆弱性**：计算 $r_{overlap}$ 时，如果是中英混合查询，纯词面交集容易因分词不一致而过低。\n  - 方案：对 $T_q$ 和 $T_d$ 使用对齐的归一化处理（转小写、去标点）和一致的健壮分词器（如 jieba 或统一按 ngram 处理）。\n- [ ] **跨语言翻译导致延迟增加**：RetrievalPlanner 每次均调用 LLM 进行翻译，对简单查询过重。\n  - 方案：在 Redis 中维护一个高频双语术语表（结合概念别名），在 Perception 阶段命中图谱别名时可直接跳过在线翻译，降低延迟。\n
 ### P1-2 性能与吞吐
 
-- [ ] **Redis 缓存利用**：Compose 已提供 Redis，但 API 代码中仅做健康检查 PING，未用于检索结果、embedding、会话缓存。
+- [~] **Redis 缓存利用**：配置项 `retrieval_layer_enabled`、`RETRIEVAL_CACHE_TTL_SECONDS` 已添加；embedding / 检索结果缓存接口已设计，待完整接入 HybridRetriever 与 embedding pipeline。
   - 方案：
     - 缓存热门 query 的 embedding 向量（TTL 绑定 embedding_text_version）。
     - 缓存检索结果（hybrid search top-k，TTL 绑定课程最新 document_version 时间戳）。
@@ -98,22 +76,26 @@
 - [ ] **引入 Alembic 管理数据库 schema**：替代 `db.py` 中 `SCHEMA_PATCHES` 运行时补丁，提供版本化迁移、回滚能力。
   - 验收：新增/修改列通过 `alembic revision --autogenerate` 生成，旧数据兼容迁移。
 - [ ] **为 `EmbeddingProvider`、`ChatProvider`、`VectorStore` 定义协议接口**（`typing.Protocol` 或抽象基类），降低测试耦合，支持 mock 注入。
-- [ ] **为 scripts 增加最小命令 smoke 测试**：覆盖参数解析、`--dry-run`、no-fallback 拒绝逻辑。
 
-### P1-4 前端测试与质量
+## 已完成的 Agentic RAG 升级
 
-- [ ] **补充前端单元测试**：当前 Vitest 已配置但未发现 `.test.{ts,tsx}` 文件。
-  - 优先覆盖：
-    - `lib/api.ts`：fetch mock、SSE 解析、结构化错误处理。
-    - `components/network-canvas.tsx`：ECharts 数据转换、社区着色逻辑。
-    - `components/citation-card.tsx`：引用数据渲染、点击跳转。
-    - `app/qa/page.tsx` 或 `stream-answer` 逻辑：SSE 事件分发、trace 时间线组装。
-  - 验收：`npm run test --workspace web` 通过率 100%，核心组件覆盖率 > 60%。
-- [ ] **前端类型检查与 Lint 门禁**：
-  ```powershell
-  npm run typecheck --workspace web
-  npm run lint --workspace web
-  ```
+- [x] **Schema 迁移**：`concepts` 和 `concept_relations` 新增 `source_document_version_ids`（JSON），支持增量图谱更新的来源追踪。
+- [x] **增量图谱更新**：`incremental_update_course_graph()` 实现，仅对变更文档关联的图谱局部重算，保留未变更概念和关系。
+- [x] **API / 前端增量重建**：`/maintenance/rebuild-graph` 支持 `mode=incremental|full`；前端 `GraphPanel` 支持选择重建模式。
+- [x] **分层检索 Layer 2→3**：`HybridRetriever` 根据 query type 路由：
+  - Fast (Layer 1)：Redis cache + dense recall（待完整接入）
+  - Standard (Layer 2)：dense + BM25 hybrid
+  - Deep Graph (Layer 3)：graph_enhanced_search_v2（centrality boost、community aggregation、Dijkstra path expansion）
+- [x] **Graph Enhanced v2**：新增 centrality-based boost、community aggregation、2-3 hop Dijkstra path expansion、relation-type filtering。
+- [x] **Agentic 节点**：新增 `RetrievalDecision`、`Reflection`、`CitationVerifier`、`AnswerCorrector`；增强 `DocumentGrader`（embedding similarity 融合）和 `ContextSynthesizer`（token budget 分配）。
+- [x] **ChatProvider 扩展**：新增 `decide_retrieval`、`reflect_answer`、`verify_citations`。
+- [x] **配置扩展**：新增 `retrieval_layer_enabled`、`enable_agentic_reflection`、`citation_verification_sample_max`、`reflection_max_retries`。
+- [x] **文档同步**：中英文 README 更新架构图、分层检索、Agentic 闭环、配置表和验收清单；`apps/web/Dockerfile` 改为生产模式。
+
+## 待收尾
+
+- [ ] **Agentic 节点完整接线**：`build_agent_graph()` 条件边 wiring，`Reflection` / `AnswerCorrector` 接入 retry 循环。
+- [ ] **Redis 缓存完整接入**：`HybridRetriever` 中 Fast layer 缓存命中/失效，`embedding` pipeline 缓存。
 
 ## P2：优化与增强
 
@@ -163,13 +145,3 @@
 | `scripts/docker_smoke.py` | 保留 | 真实 Docker API parse-search-QA smoke |
 | `scripts/evaluate_existing_quality.py` | 保留 | 使用 qwen3.6-plus 对现有课程 search/QA 做轻量评估 |
 
-## 测试状态
-
-- 默认 `pytest` 排除 `fallback_compat` 与真实 E2E 标记。
-- `test_retrieval.py` 覆盖 weighted fusion、rerank/no-rerank、零向量告警、child-to-parent context。
-- `test_p0_graph_security.py` 覆盖 graph-enhanced search 与 parent context 装配。
-- `test_enhanced_chunking.py` 覆盖父子切块、contextual embedding、表格/公式 metadata。
-- `test_runtime_settings.py` 覆盖 `.env`/`.env.example` 参数名一致性和运行时检查。
-- **待补充**：前端 Vitest 测试（`lib/api.ts`、`network-canvas`、`citation-card`、`stream-answer`）。
-- **待补充**：Graph 算法边界测试（空图、单节点图、全连通图、Dijkstra 阈值边界）。
-- **待补充**：CI 集成测试（`testcontainers` 自动拉起 PostgreSQL + Qdrant 测试实例，支持无外部 API key 的 CI 环境）。

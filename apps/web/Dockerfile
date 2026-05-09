@@ -19,6 +19,8 @@ WORKDIR /app/apps/web
 
 ENV NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000/api
 
+RUN npm run build
+
 EXPOSE 3000
 
-CMD ["npm", "run", "dev", "--", "--hostname", "0.0.0.0", "--port", "3000"]
+CMD ["npm", "run", "start", "--", "--hostname", "0.0.0.0", "--port", "3000"]

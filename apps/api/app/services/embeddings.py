@@ -184,7 +184,7 @@ class ChatProvider:
     async def answer_question(self, question: str, contexts: list[dict], history: list[dict] | None = None) -> str:
         return (await self.answer_question_with_meta(question, contexts, history)).answer
 
-    async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None) -> ChatCallResult:
+    async def answer_question_with_meta(self, question: str, contexts: list[dict], history: list[dict] | None = None, evidence_quality: str = "normal") -> ChatCallResult:
         if not contexts:
             return ChatCallResult(
                 answer="I could not find enough reliable course context to answer this question with citations.",
@@ -204,7 +204,7 @@ class ChatProvider:
                 fallback_reason="missing_openai_api_key",
             )
         try:
-            answer = await self._openai_compatible_chat(question, contexts, history or [])
+            answer = await self._openai_compatible_chat(question, contexts, history or [], evidence_quality=evidence_quality)
             return ChatCallResult(
                 answer=answer,
                 provider="openai_compatible_chat",
@@ -305,7 +305,166 @@ class ChatProvider:
                 raise
             return question
 
-    async def _openai_compatible_chat(self, question: str, contexts: list[dict], history: list[dict]) -> str:
+    async def reflect_answer(self, question: str, answer: str, contexts: list[dict]) -> dict[str, Any]:
+        if not self.settings.openai_api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+            return {"has_issue": False, "issue_type": "none", "suggestion": ""}
+        context_text = "\n\n".join(
+            f"[{i+1}] {ctx.get('document_title', '')}\n{ctx.get('content', '')[:600]}"
+            for i, ctx in enumerate(contexts)
+        )
+        system_prompt = (
+            "You are a strict quality reviewer for a course knowledge-base assistant. "
+            "Evaluate whether the assistant's answer is fully supported by the provided course excerpts. "
+            "Return ONLY a JSON object with keys: has_issue (boolean), issue_type (one of: none, hallucination, insufficient_coverage, contradiction), suggestion (string)."
+        )
+        user_prompt = (
+            f"Question: {question}\n\n"
+            f"Answer: {answer}\n\n"
+            f"Course excerpts:\n{context_text}\n\n"
+            "Check: 1) Does the answer contain claims not found in the excerpts? 2) Is the question fully answered? 3) Are there contradictions between the answer and excerpts?"
+        )
+        payload = {
+            "model": self.settings.chat_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            result = await self._post_chat_json_with_response_format_fallback(payload)
+            return {
+                "has_issue": bool(result.get("has_issue")),
+                "issue_type": str(result.get("issue_type", "none")),
+                "suggestion": str(result.get("suggestion", "")),
+            }
+        except Exception:
+            if not self.settings.enable_model_fallback:
+                raise
+            return {"has_issue": False, "issue_type": "none", "suggestion": ""}
+
+    async def verify_citations(self, answer: str, citations: list[dict], contexts: list[dict]) -> dict[str, Any]:
+        if not self.settings.openai_api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+            return {"verified": True, "unverified_indices": []}
+        if not citations or not contexts:
+            return {"verified": True, "unverified_indices": []}
+        context_map = {ctx.get("chunk_id"): ctx for ctx in contexts}
+        claims: list[str] = []
+        for sentence in re.split(r'(?<=[.!?。！？])\s+', answer):
+            if any(str(c.get("index", idx+1)) in sentence for idx, c in enumerate(citations)):
+                claims.append(sentence.strip())
+        if not claims:
+            return {"verified": True, "unverified_indices": []}
+        # Sample at most N claims
+        sample = claims[: self.settings.citation_verification_sample_max]
+        context_text = "\n\n".join(
+            f"[{c.get('index', i+1)}] {context_map.get(c.get('chunk_id'), {}).get('document_title', '')}\n{context_map.get(c.get('chunk_id'), {}).get('content', '')[:400]}"
+            for i, c in enumerate(citations)
+            if c.get("chunk_id") in context_map
+        )
+        system_prompt = (
+            "You verify whether specific claims in an answer are supported by cited course excerpts. "
+            "Return ONLY a JSON object with keys: verified (boolean), unverified_indices (list of citation numbers that are NOT supported)."
+        )
+        user_prompt = (
+            f"Claims to verify:\n" + "\n".join(f"- {claim}" for claim in sample) + "\n\n"
+            f"Cited excerpts:\n{context_text}\n\n"
+            "For each claim, check if it is directly supported by the cited excerpt. List unsupported citation numbers."
+        )
+        payload = {
+            "model": self.settings.chat_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            result = await self._post_chat_json_with_response_format_fallback(payload)
+            return {
+                "verified": bool(result.get("verified", True)),
+                "unverified_indices": list(result.get("unverified_indices", [])),
+            }
+        except Exception:
+            if not self.settings.enable_model_fallback:
+                raise
+            return {"verified": True, "unverified_indices": []}
+
+    async def perceive_question(self, question: str, history: list[dict] | None = None) -> dict[str, Any]:
+        """Perceive user intent, extract entities, and decompose the question.
+
+        Returns a dict with keys:
+        - intent: one of definition, comparison, application, procedure, analysis, unknown
+        - entities: list of concept-like terms found in the question
+        - sub_queries: list of sub-questions if multi-hop
+        - needs_graph: whether graph search is likely helpful
+        - suggested_strategy: one of global_dense, local_graph, hybrid, community
+        """
+        if not self.settings.openai_api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+            return {
+                "intent": "unknown",
+                "entities": [],
+                "sub_queries": [question],
+                "needs_graph": False,
+                "suggested_strategy": "hybrid",
+            }
+        history_text = "\n".join(f"{item.get('role')}: {item.get('content')}" for item in (history or [])[-4:])
+        system_prompt = (
+            "You are a perception module for a course knowledge-base agent. "
+            "Analyze the user's question and return ONLY a JSON object with these exact keys:\n"
+            "- intent: one of [definition, comparison, application, procedure, analysis, unknown]\n"
+            "- entities: list of course-concept-like terms explicitly mentioned or implied in the question\n"
+            "- sub_queries: list of simpler sub-questions if the original is complex/multi-hop; otherwise [original_question]\n"
+            "- needs_graph: boolean, true if the question asks about relationships, comparisons, connections, or derivations between concepts\n"
+            "- suggested_strategy: one of [global_dense, local_graph, hybrid, community]\n"
+            "  * global_dense: simple definition, formula, or single-fact lookup\n"
+            "  * local_graph: question centers around specific concepts and their relationships\n"
+            "  * hybrid: multi-aspect or comparison questions\n"
+            "  * community: broad summary or overview questions\n"
+        )
+        user_prompt = (
+            f"History:\n{history_text}\n\nQuestion:\n{question}\n\n"
+            "Analyze this question and output the JSON perception result."
+        )
+        payload: dict[str, Any] = {
+            "model": self.settings.chat_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        default_result = {
+            "intent": "unknown",
+            "entities": [],
+            "sub_queries": [question],
+            "needs_graph": False,
+            "suggested_strategy": "hybrid",
+        }
+        try:
+            result = await self._post_chat_json_with_response_format_fallback(payload)
+            return {
+                "intent": str(result.get("intent", "unknown")).lower(),
+                "entities": list(result.get("entities", [])),
+                "sub_queries": list(result.get("sub_queries", [question])),
+                "needs_graph": bool(result.get("needs_graph", False)),
+                "suggested_strategy": str(result.get("suggested_strategy", "hybrid")).lower(),
+            }
+        except Exception:
+            if not self.settings.enable_model_fallback:
+                raise
+            return default_result
+
+    async def _openai_compatible_chat(self, question: str, contexts: list[dict], history: list[dict], evidence_quality: str = "normal") -> str:
         citations = "\n\n".join(
             f"[{idx + 1}] {item['document_title']} / {item.get('chapter') or 'General'}\n{item['content']}"
             for idx, item in enumerate(contexts)
@@ -317,6 +476,8 @@ class ChatProvider:
                     "You are a course knowledge-base assistant. "
                     "Answer only from the supplied course excerpts and do not invent unsupported facts. "
                     "Keep the answer direct, concise, and say when the evidence is insufficient. "
+                    "You may answer in Chinese or English depending on the user's question language. "
+                    "请根据用户的提问语言选择中文或英文回答。"
                     "Format the answer as clean GitHub-flavored Markdown. "
                     "When writing mathematical notation, use valid LaTeX only: inline variables and short expressions "
                     "must be wrapped in single dollar delimiters like $k_i$ and $n - 1$; important equations must be "
@@ -325,7 +486,17 @@ class ChatProvider:
                     "Use LaTeX commands and braces for fractions, superscripts, subscripts, and named variants, for example "
                     "$$C_D(i) = \\frac{k_i}{n - 1}$$, $k_i^{\\text{in}}$, and $k_i^{\\text{out}}$. "
                     "Do not repeat the same formula in both prose and math form; write the equation once, then explain "
-                    "each symbol in separate bullets or sentences."
+                    "each symbol in separate bullets or sentences. "
+                    + (
+                        "IMPORTANT: The retrieved excerpts may have low relevance to the question. "
+                        "If they do not contain information that directly answers the question, clearly state that the course materials "
+                        "do not cover this topic, and do NOT force citations from irrelevant excerpts. "
+                        "You may provide a brief conceptual answer based on general knowledge, but explicitly note that it is not "
+                        "supported by the indexed course materials."
+                        if evidence_quality == "low"
+                        else "If the supplied excerpts do not contain information that directly answers the question, "
+                        "clearly state that the course materials do not cover this topic and do NOT force citations."
+                    )
                 ),
             },
             *history,
@@ -335,7 +506,14 @@ class ChatProvider:
                     f"Question: {question}\n\n"
                     "Course excerpts:\n"
                     f"{citations}\n\n"
-                    "Before finalizing, check that every formula is either inline LaTeX or display LaTeX, "
+                    + (
+                        "Note: the above excerpts have been assessed as potentially irrelevant. "
+                        "Only cite them if they truly support a specific claim in your answer. "
+                        "If none are relevant, answer without citations and note the lack of course coverage.\n\n"
+                        if evidence_quality == "low"
+                        else ""
+                    )
+                    + "Before finalizing, check that every formula is either inline LaTeX or display LaTeX, "
                     "and that variables are not attached to neighboring words."
                 ),
             },

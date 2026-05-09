@@ -37,6 +37,7 @@ from app.schemas import (
     ParseUploadedFilesRequest,
     QARequest,
     QAResponse,
+    RebuildGraphRequest,
     RefreshResponse,
     RuntimeCheckResponse,
     SearchRequest,
@@ -46,7 +47,7 @@ from app.schemas import (
     TaskStatusResponse,
     UploadFileResponse,
 )
-from app.services.concept_graph import get_concept_cards, get_graph_node_detail, get_graph_payload, rebuild_course_graph
+from app.services.concept_graph import get_concept_cards, get_graph_node_detail, get_graph_payload, rebuild_course_graph, incremental_update_course_graph
 from app.services.embeddings import is_degraded_mode
 from app.services.agent_graph import run_agent, run_to_task_status, stream_agent_events
 from app.services.ingestion import (
@@ -186,7 +187,12 @@ def cleanup_course_stale_graph(course_id: str | None = None, db: Session = Depen
 
 
 @router.post("/maintenance/rebuild-graph", response_model=RebuildGraphResponse)
-async def rebuild_graph_endpoint(background_tasks: BackgroundTasks, course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+async def rebuild_graph_endpoint(
+    background_tasks: BackgroundTasks,
+    request: RebuildGraphRequest = RebuildGraphRequest(),
+    course_id: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
     from app.services.ingestion import active_batch_for_course
 
     course = get_requested_course(db, course_id)
@@ -202,8 +208,8 @@ async def rebuild_graph_endpoint(background_tasks: BackgroundTasks, course_id: s
     db.add(batch)
     db.commit()
     db.refresh(batch)
-    background_tasks.add_task(run_graph_rebuild, batch.id, course.id)
-    return {"batch_id": batch.id, "state": "extracting_graph"}
+    background_tasks.add_task(run_graph_rebuild, batch.id, course.id, request.mode)
+    return {"batch_id": batch.id, "state": "extracting_graph", "mode": request.mode}
 
 
 @router.get("/courses/current/graph", response_model=GraphResponse)
