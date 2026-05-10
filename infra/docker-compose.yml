@@ -91,44 +91,5 @@ services:
     volumes:
       - qdrant-data:/qdrant/storage
 
-  experiment:
-    profiles: ["experiment"]
-    image: ${EXPERIMENT_IMAGE:-course-kg-experiment:local}
-    build:
-      context: ..
-      dockerfile: comparative_experiment/Dockerfile
-    env_file:
-      - ../.env
-    environment:
-      PROJECT_ROOT: /workspace
-      DATA_ROOT: /workspace/data
-      REPORT_OUTPUT_DIR: /workspace/comparative_experiment/data/reports
-      RAW_RESULTS_DIR: /workspace/comparative_experiment/data/raw_results
-      PREPARED_CORPUS_DIR: /workspace/comparative_experiment/data/prepared_corpus
-      API_BASE_URL: http://api:8000/api
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/course_kg
-      QDRANT_URL: http://qdrant:6333
-      REDIS_URL: redis://redis:6379/0
-      ENABLE_MODEL_FALLBACK: "false"
-      ENABLE_DATABASE_FALLBACK: "false"
-      EXPERIMENT_MODE: small
-      EXPERIMENT_SYSTEMS: S1,S2,S3,S4
-      JUDGE_MODEL: qwen3.6-plus
-      JUDGE_REPETITIONS: "1"
-    volumes:
-      - ../:/workspace
-      - ../.env:/workspace/.env:ro
-      - ../.env.example:/workspace/.env.example:ro
-      - ../data:/workspace/data
-    depends_on:
-      api:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_started
-      qdrant:
-        condition: service_started
-
 volumes:
   qdrant-data:
