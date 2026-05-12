@@ -13,8 +13,10 @@ services:
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
       DATA_ROOT: /app/data
-      OPENAI_BASE_URL: ${API_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-https://api.openai.com/v1}}
-      OPENAI_RESOLVE_IP: ${API_OPENAI_RESOLVE_IP:-${OPENAI_RESOLVE_IP:-}}
+      CHAT_BASE_URL: ${API_CHAT_BASE_URL:-${CHAT_BASE_URL:-https://api.openai.com/v1}}
+      CHAT_RESOLVE_IP: ${API_CHAT_RESOLVE_IP:-${CHAT_RESOLVE_IP:-}}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+      EMBEDDING_RESOLVE_IP: ${EMBEDDING_RESOLVE_IP:-}
       ENABLE_MODEL_FALLBACK: "false"
       ENABLE_DATABASE_FALLBACK: "false"
     ports:

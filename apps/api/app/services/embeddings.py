@@ -47,7 +47,7 @@ def validate_embedding_vectors(vectors: list[list[float]], *, expected_count: in
 
 def is_degraded_mode() -> bool:
     settings = get_settings()
-    return not settings.openai_api_key
+    return not settings.openai_api_key or not settings.embedding_api_key or not settings.embedding_base_url
 
 
 def _exception_message(exc: Exception) -> str:
@@ -88,14 +88,23 @@ class EmbeddingProvider:
     async def embed_texts_with_meta(self, texts: list[str], text_type: str = "document") -> "EmbeddingCallResult":
         if not texts:
             return EmbeddingCallResult(vectors=[], provider="none", external_called=False, fallback_reason=None)
-        if not self.settings.openai_api_key:
+        if not self.settings.embedding_base_url:
             if not self.settings.enable_model_fallback:
-                raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+                raise FallbackDisabledError("EMBEDDING_BASE_URL is required because ENABLE_MODEL_FALLBACK is false")
             return EmbeddingCallResult(
                 vectors=[self._fake_embedding(text) for text in texts],
                 provider="fake",
                 external_called=False,
-                fallback_reason="missing_openai_api_key",
+                fallback_reason="missing_embedding_base_url",
+            )
+        if not self.settings.embedding_api_key:
+            if not self.settings.enable_model_fallback:
+                raise FallbackDisabledError("EMBEDDING_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+            return EmbeddingCallResult(
+                vectors=[self._fake_embedding(text) for text in texts],
+                provider="fake",
+                external_called=False,
+                fallback_reason="missing_embedding_api_key",
             )
         try:
             vectors = await self._openai_compatible_embeddings(texts, text_type=text_type)
@@ -125,28 +134,30 @@ class EmbeddingProvider:
             "encoding_format": "float",
             "dimensions": self.settings.embedding_dimensions,
         }
+        base_url = self.settings.embedding_base_url.rstrip("/")
+        api_key = self.settings.embedding_api_key
         headers = {
-            "Authorization": f"Bearer {self.settings.openai_api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         try:
             data = await post_openai_compatible_json(
-                f"{self.settings.openai_base_url.rstrip('/')}/embeddings",
+                f"{base_url}/embeddings",
                 payload,
                 headers,
                 timeout=60.0,
-                resolve_ip=self.settings.openai_resolve_ip,
+                resolve_ip=self.settings.embedding_resolve_ip,
             )
         except Exception as exc:
             if not _is_unsupported_parameter_error(exc, "dimensions"):
                 raise
             payload.pop("dimensions", None)
             data = await post_openai_compatible_json(
-                f"{self.settings.openai_base_url.rstrip('/')}/embeddings",
+                f"{base_url}/embeddings",
                 payload,
                 headers,
                 timeout=60.0,
-                resolve_ip=self.settings.openai_resolve_ip,
+                resolve_ip=self.settings.embedding_resolve_ip,
             )
         return [item["embedding"] for item in data["data"]]
 
@@ -527,11 +538,11 @@ class ChatProvider:
             "Content-Type": "application/json",
         }
         data = await post_openai_compatible_json(
-            f"{self.settings.openai_base_url.rstrip('/')}/chat/completions",
+            f"{self.settings.chat_base_url.rstrip('/')}/chat/completions",
             payload,
             headers,
             timeout=180.0,
-            resolve_ip=self.settings.openai_resolve_ip,
+            resolve_ip=self.settings.chat_resolve_ip,
         )
         return self._normalize_chat_content(data)
 
@@ -816,7 +827,7 @@ def _post_json_with_curl_resolve(
             config_path = config_file.name
         curl_binary = shutil.which("curl.exe") or shutil.which("curl")
         if not curl_binary:
-            raise RuntimeError("curl is required for OPENAI_RESOLVE_IP requests but was not found")
+            raise RuntimeError("curl is required for model RESOLVE_IP requests but was not found")
         result = subprocess.run(
             [curl_binary, "-sS", "-K", config_path],
             capture_output=True,

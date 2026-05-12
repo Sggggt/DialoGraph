@@ -36,8 +36,11 @@ class Settings(BaseSettings):
     ingestion_root: Path | None = None
 
     openai_api_key: str | None = None
-    openai_base_url: str = "https://api.openai.com/v1"
-    openai_resolve_ip: str | None = None
+    chat_base_url: str = "https://api.openai.com/v1"
+    chat_resolve_ip: str | None = None
+    embedding_base_url: str = ""
+    embedding_resolve_ip: str | None = None
+    embedding_api_key: str | None = None
     model_bridge_enabled: bool = False
     model_bridge_port: int = 8765
     embedding_model: str = "text-embedding-v4"
@@ -111,8 +114,8 @@ def get_settings() -> Settings:
             key, value = raw_line.split("=", 1)
             env_entries[key.strip().lstrip("\ufeff").upper()] = value
 
-    api_base_url = os.getenv("API_OPENAI_BASE_URL")
-    api_resolve_ip = os.getenv("API_OPENAI_RESOLVE_IP")
+    api_chat_base_url = os.getenv("API_CHAT_BASE_URL")
+    api_chat_resolve_ip = os.getenv("API_CHAT_RESOLVE_IP")
     model_bridge_enabled = str(os.getenv("MODEL_BRIDGE_ENABLED") or env_entries.get("MODEL_BRIDGE_ENABLED", "")).lower() in {
         "true",
         "1",
@@ -126,19 +129,48 @@ def get_settings() -> Settings:
         except ValueError:
             pass
     settings.model_bridge_enabled = model_bridge_enabled
-    if api_base_url:
-        settings.openai_base_url = api_base_url
+    if api_chat_base_url:
+        settings.chat_base_url = api_chat_base_url
     elif model_bridge_enabled:
-        settings.openai_base_url = f"http://host.docker.internal:{settings.model_bridge_port}"
-        settings.openai_resolve_ip = "__none__"
-    elif settings.openai_base_url == "https://api.openai.com/v1" and env_entries.get("OPENAI_BASE_URL"):
-        settings.openai_base_url = env_entries["OPENAI_BASE_URL"]
-    if api_resolve_ip is not None:
-        settings.openai_resolve_ip = api_resolve_ip
+        settings.chat_base_url = f"http://host.docker.internal:{settings.model_bridge_port}"
+        settings.chat_resolve_ip = "__none__"
+    elif env_entries.get("CHAT_BASE_URL"):
+        settings.chat_base_url = env_entries["CHAT_BASE_URL"]
+    elif "CHAT_BASE_URL" in os.environ:
+        settings.chat_base_url = os.getenv("CHAT_BASE_URL", "")
+    if api_chat_resolve_ip is not None:
+        settings.chat_resolve_ip = api_chat_resolve_ip
     elif model_bridge_enabled:
-        settings.openai_resolve_ip = "__none__"
-    elif env_entries.get("OPENAI_RESOLVE_IP") is not None:
-        settings.openai_resolve_ip = env_entries.get("OPENAI_RESOLVE_IP")
+        settings.chat_resolve_ip = "__none__"
+    elif os.getenv("CHAT_RESOLVE_IP"):
+        settings.chat_resolve_ip = os.getenv("CHAT_RESOLVE_IP")
+    elif env_entries.get("CHAT_RESOLVE_IP") is not None:
+        settings.chat_resolve_ip = env_entries.get("CHAT_RESOLVE_IP")
+    elif "CHAT_RESOLVE_IP" in os.environ:
+        settings.chat_resolve_ip = os.getenv("CHAT_RESOLVE_IP")
+
+    # Embedding-specific overrides (no fallback to chat model settings)
+    embedding_base_url = os.getenv("EMBEDDING_BASE_URL")
+    if embedding_base_url:
+        settings.embedding_base_url = embedding_base_url
+    elif env_entries.get("EMBEDDING_BASE_URL"):
+        settings.embedding_base_url = env_entries["EMBEDDING_BASE_URL"]
+    elif "EMBEDDING_BASE_URL" in os.environ:
+        settings.embedding_base_url = ""
+
+    embedding_resolve_ip = os.getenv("EMBEDDING_RESOLVE_IP")
+    if embedding_resolve_ip:
+        settings.embedding_resolve_ip = embedding_resolve_ip
+    elif env_entries.get("EMBEDDING_RESOLVE_IP") is not None:
+        settings.embedding_resolve_ip = env_entries.get("EMBEDDING_RESOLVE_IP")
+    elif "EMBEDDING_RESOLVE_IP" in os.environ:
+        settings.embedding_resolve_ip = ""
+
+    embedding_api_key = os.getenv("EMBEDDING_API_KEY")
+    if embedding_api_key:
+        settings.embedding_api_key = embedding_api_key
+    elif env_entries.get("EMBEDDING_API_KEY"):
+        settings.embedding_api_key = env_entries["EMBEDDING_API_KEY"]
 
     settings.data_root.mkdir(parents=True, exist_ok=True)
     settings.course_data_root_path.mkdir(parents=True, exist_ok=True)

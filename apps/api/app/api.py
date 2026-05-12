@@ -109,7 +109,7 @@ def get_model_settings() -> dict:
 @router.put("/settings/model", response_model=ModelSettingsResponse)
 def save_model_settings(request: ModelSettingsUpdate) -> dict:
     normalize_env_file()
-    return update_model_settings(request.model_dump())
+    return update_model_settings(request.model_dump(exclude_unset=True))
 
 
 @router.get("/settings/runtime-check", response_model=RuntimeCheckResponse)
@@ -470,7 +470,7 @@ async def search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
                         "title": "Embedding API is unreachable from the API container",
                         "message": message,
                         "fix_commands": [
-                            "Check OPENAI_BASE_URL and OPENAI_RESOLVE_IP in .env.",
+                            "Check EMBEDDING_BASE_URL and EMBEDDING_RESOLVE_IP in .env.",
                             "Verify the API container can reach the embedding endpoint.",
                         ],
                     }

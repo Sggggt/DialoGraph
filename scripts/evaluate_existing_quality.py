@@ -11,11 +11,13 @@ import httpx
 
 API_BASE = "http://127.0.0.1:8000/api"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+CHAT_BASE_URL = os.getenv("CHAT_BASE_URL")
 if os.getenv("ENABLE_MODEL_FALLBACK", "false").lower() != "false" or os.getenv("ENABLE_DATABASE_FALLBACK", "false").lower() != "false":
     raise RuntimeError("Quality evaluation must run with model and database fallback disabled")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set in the container environment")
+if not CHAT_BASE_URL:
+    raise RuntimeError("CHAT_BASE_URL not set in the container environment")
 
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../apps/api")))
@@ -24,9 +26,9 @@ from app.services.embeddings import post_openai_compatible_json
 class Judge:
     def __init__(self):
         self.api_key = OPENAI_API_KEY
-        self.base_url = OPENAI_BASE_URL.rstrip("/")
+        self.base_url = (CHAT_BASE_URL or "").rstrip("/")
         self.model = "qwen3.6-plus"
-        self.resolve_ip = os.getenv("OPENAI_RESOLVE_IP", "")
+        self.resolve_ip = os.getenv("CHAT_RESOLVE_IP", "")
 
     async def evaluate(self, system_prompt: str, user_prompt: str) -> dict:
         payload = {

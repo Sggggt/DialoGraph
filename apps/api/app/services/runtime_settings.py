@@ -42,13 +42,13 @@ def read_env_int(key: str, default: int = 0) -> int:
 def model_settings_payload() -> dict:
     settings = get_settings()
     env_entries = _env_entries(ENV_PATH)
-    real_base_url = env_entries.get("OPENAI_BASE_URL", settings.openai_base_url)
+    chat_base_url = env_entries.get("CHAT_BASE_URL", settings.chat_base_url)
     model_bridge_enabled = env_entries.get("MODEL_BRIDGE_ENABLED", "false").lower() == "true"
     return {
         "provider": "openai_compatible",
-        "base_url": real_base_url,
+        "chat_base_url": chat_base_url,
         "model_bridge_enabled": model_bridge_enabled,
-        "resolve_ip": settings.openai_resolve_ip,
+        "chat_resolve_ip": settings.chat_resolve_ip,
         "embedding_model": settings.embedding_model,
         "chat_model": settings.chat_model,
         "embedding_dimensions": settings.embedding_dimensions,
@@ -62,7 +62,10 @@ def model_settings_payload() -> dict:
         "semantic_chunking_enabled": settings.semantic_chunking_enabled,
         "semantic_chunking_min_length": settings.semantic_chunking_min_length,
         "has_api_key": bool(settings.openai_api_key),
-        "degraded_mode": not settings.openai_api_key,
+        "degraded_mode": not settings.openai_api_key or not settings.embedding_api_key or not settings.embedding_base_url,
+        "embedding_base_url": settings.embedding_base_url,
+        "embedding_resolve_ip": settings.embedding_resolve_ip,
+        "has_embedding_api_key": bool(settings.embedding_api_key),
     }
 
 
@@ -226,11 +229,11 @@ def _check_redis() -> bool:
 
 def _check_model_bridge() -> bool | None:
     settings = get_settings()
-    parsed = urlparse(settings.openai_base_url)
+    parsed = urlparse(settings.chat_base_url)
     if (parsed.hostname or "").lower() != "host.docker.internal":
         return None
     with suppress(Exception):
-        response = httpx.get(f"{settings.openai_base_url.rstrip('/')}/health", timeout=3.0)
+        response = httpx.get(f"{settings.chat_base_url.rstrip('/')}/health", timeout=3.0)
         return response.status_code == 200
     return False
 
@@ -294,9 +297,11 @@ def update_model_settings(payload: dict) -> dict:
     normalize_env_file()
     updates: dict[str, str | int | bool | None] = {}
     key_map = {
-        "base_url": "openai_base_url",
+        "chat_base_url": "chat_base_url",
+        "embedding_base_url": "embedding_base_url",
         "model_bridge_enabled": "model_bridge_enabled",
-        "resolve_ip": "openai_resolve_ip",
+        "chat_resolve_ip": "chat_resolve_ip",
+        "embedding_resolve_ip": "embedding_resolve_ip",
         "embedding_model": "embedding_model",
         "chat_model": "chat_model",
         "embedding_dimensions": "embedding_dimensions",
@@ -309,18 +314,25 @@ def update_model_settings(payload: dict) -> dict:
         "semantic_chunking_min_length": "semantic_chunking_min_length",
     }
     for key, env_key in key_map.items():
+        if key not in payload:
+            continue
         value = payload.get(key)
-        if value is not None:
-            if key == "resolve_ip" and isinstance(value, str) and not value.strip():
-                updates[env_key] = None
-            else:
-                updates[env_key] = value.strip() if isinstance(value, str) else value
+        if key in {"chat_resolve_ip", "embedding_resolve_ip"} and (value is None or (isinstance(value, str) and not value.strip())):
+            updates[env_key] = None
+        elif value is not None:
+            updates[env_key] = value.strip() if isinstance(value, str) else value
 
     api_key = payload.get("api_key")
     if payload.get("clear_api_key"):
         updates["openai_api_key"] = None
     elif isinstance(api_key, str) and api_key.strip():
         updates["openai_api_key"] = api_key.strip()
+
+    embedding_api_key = payload.get("embedding_api_key")
+    if payload.get("clear_embedding_api_key"):
+        updates["embedding_api_key"] = None
+    elif isinstance(embedding_api_key, str) and embedding_api_key.strip():
+        updates["embedding_api_key"] = embedding_api_key.strip()
 
     if updates:
         _update_env_file(updates)

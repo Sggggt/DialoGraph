@@ -270,8 +270,10 @@ export interface RefreshResponse {
 
 export interface ModelSettingsResponse {
   provider: "openai_compatible";
-  base_url: string;
-  resolve_ip?: string | null;
+  chat_base_url: string;
+  embedding_base_url: string;
+  chat_resolve_ip?: string | null;
+  embedding_resolve_ip?: string | null;
   embedding_model: string;
   chat_model: string;
   embedding_dimensions: number;
@@ -286,14 +288,17 @@ export interface ModelSettingsResponse {
   semantic_chunking_min_length: number;
   model_bridge_enabled: boolean;
   has_api_key: boolean;
+  has_embedding_api_key: boolean;
   degraded_mode: boolean;
 }
 
 export interface ModelSettingsUpdate {
   api_key?: string | null;
   clear_api_key?: boolean;
-  base_url?: string | null;
-  resolve_ip?: string | null;
+  chat_base_url?: string | null;
+  embedding_base_url?: string | null;
+  chat_resolve_ip?: string | null;
+  embedding_resolve_ip?: string | null;
   embedding_model?: string | null;
   chat_model?: string | null;
   embedding_dimensions?: number | null;
@@ -306,6 +311,8 @@ export interface ModelSettingsUpdate {
   semantic_chunking_enabled?: boolean | null;
   semantic_chunking_min_length?: number | null;
   model_bridge_enabled?: boolean | null;
+  embedding_api_key?: string | null;
+  clear_embedding_api_key?: boolean;
 }
 
 export interface RuntimeIssue {

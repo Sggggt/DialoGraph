@@ -32,6 +32,20 @@ async def test_openai_compatible_embeddings_are_batched(no_fallback_env, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_embedding_base_url_is_required_without_fallback(no_fallback_env, monkeypatch):
+    from app.core.config import get_settings
+    import app.core.config as config
+    from app.services.embeddings import EmbeddingProvider, FallbackDisabledError
+
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", no_fallback_env.parent)
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "")
+    get_settings.cache_clear()
+
+    with pytest.raises(FallbackDisabledError, match="EMBEDDING_BASE_URL"):
+        await EmbeddingProvider().embed_texts_with_meta(["text"])
+
+
+@pytest.mark.asyncio
 async def test_openai_compatible_embeddings_reject_zero_vectors(no_fallback_env, monkeypatch):
     from app.core.config import get_settings
     from app.services import embeddings

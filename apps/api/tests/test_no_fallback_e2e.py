@@ -24,6 +24,9 @@ async def test_parse_search_and_qa_without_fallback(tmp_path, monkeypatch):
     get_settings.cache_clear()
     settings = get_settings()
     assert settings.openai_api_key, "OPENAI_API_KEY is required for no-fallback E2E"
+    assert settings.chat_base_url, "CHAT_BASE_URL is required for no-fallback E2E"
+    assert settings.embedding_api_key, "EMBEDDING_API_KEY is required for no-fallback E2E"
+    assert settings.embedding_base_url, "EMBEDDING_BASE_URL is required for no-fallback E2E"
     assert settings.enable_model_fallback is False
     assert settings.enable_database_fallback is False
 

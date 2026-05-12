@@ -12,6 +12,10 @@ def no_fallback_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("DATA_ROOT", str(data_root))
     monkeypatch.setenv("COURSE_NAME", "Unit Test Course")
     monkeypatch.setenv("OPENAI_API_KEY", "unit-test-key")
+    monkeypatch.setenv("CHAT_BASE_URL", "https://api.openai.test/v1")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "unit-test-embedding-key")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "https://embedding.openai.test/v1")
+    monkeypatch.setenv("ENABLE_AGENTIC_REFLECTION", "true")
     monkeypatch.setenv("ENABLE_MODEL_FALLBACK", "false")
     monkeypatch.setenv("ENABLE_DATABASE_FALLBACK", "false")
     from app.core.config import get_settings

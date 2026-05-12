@@ -125,8 +125,8 @@ if (-not (Test-Path $InfraComposeFile)) {
 
 $modelBridgeEnabled = Get-DotEnvBool -Key "MODEL_BRIDGE_ENABLED" -DefaultValue $false
 $modelBridgePortRaw = Get-DotEnvValue -Key "MODEL_BRIDGE_PORT" -DefaultValue "8765"
-$openAiBaseUrl = Get-DotEnvValue -Key "OPENAI_BASE_URL" -DefaultValue "https://api.openai.com/v1"
-$openAiResolveIp = Get-DotEnvValue -Key "OPENAI_RESOLVE_IP" -DefaultValue ""
+$chatBaseUrl = Get-DotEnvValue -Key "CHAT_BASE_URL" -DefaultValue "https://api.openai.com/v1"
+$chatResolveIp = Get-DotEnvValue -Key "CHAT_RESOLVE_IP" -DefaultValue ""
 try {
   $modelBridgePort = [int]$modelBridgePortRaw
 } catch {
@@ -140,8 +140,8 @@ $BackendUrl = "http://127.0.0.1:$BackendPort/api/health"
 $FrontendUrl = "http://127.0.0.1:$FrontendPort$OpenPath"
 $env:API_HOST_PORT = [string]$BackendPort
 $env:WEB_HOST_PORT = [string]$FrontendPort
-$env:OPENAI_BASE_URL = $openAiBaseUrl
-$env:OPENAI_RESOLVE_IP = $openAiResolveIp
+$env:CHAT_BASE_URL = $chatBaseUrl
+$env:CHAT_RESOLVE_IP = $chatResolveIp
 
 if ($modelBridgeEnabled) {
   $BridgeScript = Join-Path $Root "infra\model-bridge\model_bridge.py"
@@ -162,20 +162,20 @@ if ($modelBridgeEnabled) {
       $BridgeScript,
       "--host", "127.0.0.1",
       "--port", [string]$modelBridgePort,
-      "--target-base-url", $openAiBaseUrl
+      "--target-base-url", $chatBaseUrl
     )
-    if ($openAiResolveIp -and $openAiResolveIp -ne "__none__") {
-      $bridgeArgs += @("--resolve-ip", $openAiResolveIp)
+    if ($chatResolveIp -and $chatResolveIp -ne "__none__") {
+      $bridgeArgs += @("--resolve-ip", $chatResolveIp)
     }
     Start-Process -WindowStyle Hidden -FilePath $pythonCommand.Source -ArgumentList $bridgeArgs
     Wait-Url -Url $BridgeHealthUrl -Name "Model bridge" -TimeoutSeconds 20
   }
 
-  $env:API_OPENAI_BASE_URL = "http://host.docker.internal:$modelBridgePort"
-  $env:API_OPENAI_RESOLVE_IP = "__none__"
+  $env:API_CHAT_BASE_URL = "http://host.docker.internal:$modelBridgePort"
+  $env:API_CHAT_RESOLVE_IP = "__none__"
 } else {
-  $env:API_OPENAI_BASE_URL = $openAiBaseUrl
-  $env:API_OPENAI_RESOLVE_IP = $openAiResolveIp
+  $env:API_CHAT_BASE_URL = $chatBaseUrl
+  $env:API_CHAT_RESOLVE_IP = $chatResolveIp
 }
 
 Write-Host "Course Knowledge Base Docker launcher" -ForegroundColor Cyan

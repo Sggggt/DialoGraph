@@ -6,9 +6,9 @@
 
 <h1 align="center">DialoGraph</h1>
 
-DialoGraph 是面向本地课程资料的 Docker 化知识基础设施。系统把 PDF、课件、文档、网页、Notebook、图片和 Markdown 解析为可检索文本块、Qdrant 向量、PostgreSQL 稀疏知识图谱和带引用问答结果。
+DialoGraph 是专为课程资料打造的智能知识助手。上传课件、教材、笔记等各类文档后，系统自动解析内容、梳理知识点之间的关联，并支持用自然语言提问——每个回答都会标注来源出处，让你"知其然，更知其出处"。
 
-默认运行依赖真实 PostgreSQL、Qdrant、Redis 和 OpenAI 兼容模型接口。模型 fallback 与数据库 fallback 默认关闭；生产质量验证不使用零向量、fake embedding、本地 JSON 检索或抽取式替代回答。
+无论你的资料是中文还是英文，系统都能统一检索；所有数据留在本地，无需上传第三方。
 
 ## 快速概览
 
@@ -470,8 +470,10 @@ Copy-Item .env.example .env
 | `REDIS_URL`                                                               | Redis 地址                                                                    |
 | `COURSE_NAME`                                                             | 默认课程名                                                                    |
 | `DATA_ROOT`                                                               | 本地数据根目录                                                                |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL`                                    | OpenAI 兼容模型接口                                                           |
-| `OPENAI_RESOLVE_IP`                                                       | 需要固定解析模型域名时使用的目标 IP                                           |
+| `OPENAI_API_KEY` / `CHAT_BASE_URL`                                      | OpenAI 兼容 chat / 图谱抽取模型接口                                           |
+| `CHAT_RESOLVE_IP`                                                         | 需要固定解析 chat 模型域名时使用的目标 IP                                     |
+| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL`                                | OpenAI 兼容 embedding 模型接口，独立于 chat endpoint                          |
+| `EMBEDDING_RESOLVE_IP`                                                    | 需要固定解析 embedding 模型域名时使用的目标 IP                                |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE`   | 向量模型、维度和批大小                                                        |
 | `CHAT_MODEL`                                                              | 对话与图谱抽取模型                                                            |
 | `GRAPH_EXTRACTION_CHUNK_LIMIT` / `GRAPH_EXTRACTION_CHUNKS_PER_DOCUMENT` | 图谱抽取 chunk 上限和单文档采样上限                                           |
@@ -502,7 +504,8 @@ REDIS_URL=redis://redis:6379/0
 
 ```env
 OPENAI_API_KEY=...
-OPENAI_BASE_URL=https://api.openai.com/v1
+CHAT_BASE_URL=https://api.openai.com/v1
+EMBEDDING_BASE_URL=https://api.openai.com/v1
 EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
 ENABLE_MODEL_FALLBACK=false

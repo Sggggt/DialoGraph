@@ -52,7 +52,7 @@ def test_runtime_check_skips_reranker_when_disabled(tmp_path, monkeypatch):
         reranker_url = "http://reranker:8080/rerank"
         qdrant_url = "http://qdrant:6333"
         redis_url = "redis://redis:6379/0"
-        openai_base_url = "https://api.openai.com/v1"
+        chat_base_url = "https://api.openai.com/v1"
 
     monkeypatch.setattr(runtime_settings, "get_settings", lambda: Settings())
     monkeypatch.setattr(runtime_settings, "env_sync_status", lambda: {"synced": True, "missing_keys": [], "extra_keys": [], "bom_keys": []})
@@ -86,7 +86,7 @@ def test_runtime_check_reports_reranker_status(tmp_path, monkeypatch):
         reranker_max_length = 512
         qdrant_url = "http://qdrant:6333"
         redis_url = "redis://redis:6379/0"
-        openai_base_url = "https://api.openai.com/v1"
+        chat_base_url = "https://api.openai.com/v1"
 
     monkeypatch.setattr(runtime_settings, "get_settings", lambda: Settings())
     monkeypatch.setattr(runtime_settings, "env_sync_status", lambda: {"synced": True, "missing_keys": [], "extra_keys": [], "bom_keys": []})
@@ -117,7 +117,7 @@ def test_runtime_check_reports_model_bridge_when_configured(monkeypatch):
         reranker_url = "http://reranker:8080/rerank"
         qdrant_url = "http://qdrant:6333"
         redis_url = "redis://redis:6379/0"
-        openai_base_url = "http://host.docker.internal:8765"
+        chat_base_url = "http://host.docker.internal:8765"
 
     class Response:
         status_code = 200
@@ -142,17 +142,61 @@ def test_settings_routes_compose_model_calls_through_bridge(monkeypatch, tmp_pat
     monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "true")
     monkeypatch.setenv("MODEL_BRIDGE_PORT", "8766")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    monkeypatch.setenv("OPENAI_RESOLVE_IP", "1.2.3.4")
-    monkeypatch.delenv("API_OPENAI_BASE_URL", raising=False)
-    monkeypatch.delenv("API_OPENAI_RESOLVE_IP", raising=False)
+    monkeypatch.setenv("CHAT_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    monkeypatch.setenv("CHAT_RESOLVE_IP", "1.2.3.4")
+    monkeypatch.delenv("API_CHAT_BASE_URL", raising=False)
+    monkeypatch.delenv("API_CHAT_RESOLVE_IP", raising=False)
     get_settings.cache_clear()
 
     settings = get_settings()
 
-    assert settings.openai_base_url == "http://host.docker.internal:8766"
-    assert settings.openai_resolve_ip == "__none__"
+    assert settings.chat_base_url == "http://host.docker.internal:8766"
+    assert settings.chat_resolve_ip == "__none__"
     assert settings.model_bridge_enabled is True
+
+    get_settings.cache_clear()
+
+
+def test_model_settings_payload_uses_split_model_urls(monkeypatch, tmp_path):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "OPENAI_API_KEY=unit-chat-key",
+                "CHAT_BASE_URL=https://chat.example/v1",
+                "CHAT_RESOLVE_IP=1.2.3.4",
+                "EMBEDDING_API_KEY=unit-embedding-key",
+                "EMBEDDING_BASE_URL=https://embedding.example/v1",
+                "EMBEDDING_RESOLVE_IP=5.6.7.8",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("OPENAI_API_KEY", "unit-chat-key")
+    monkeypatch.setenv("MODEL_BRIDGE_ENABLED", "false")
+    monkeypatch.delenv("API_CHAT_BASE_URL", raising=False)
+    monkeypatch.delenv("API_CHAT_RESOLVE_IP", raising=False)
+    monkeypatch.setenv("CHAT_BASE_URL", "https://chat.example/v1")
+    monkeypatch.setenv("CHAT_RESOLVE_IP", "1.2.3.4")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "unit-embedding-key")
+    monkeypatch.setenv("EMBEDDING_BASE_URL", "https://embedding.example/v1")
+    monkeypatch.setenv("EMBEDDING_RESOLVE_IP", "5.6.7.8")
+    get_settings.cache_clear()
+
+    payload = runtime_settings.model_settings_payload()
+
+    assert payload["chat_base_url"] == "https://chat.example/v1"
+    assert payload["embedding_base_url"] == "https://embedding.example/v1"
+    assert payload["chat_resolve_ip"] == "1.2.3.4"
+    assert payload["embedding_resolve_ip"] == "5.6.7.8"
+    assert payload["degraded_mode"] is False
 
     get_settings.cache_clear()
 

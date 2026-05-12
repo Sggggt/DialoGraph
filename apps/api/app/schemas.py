@@ -306,9 +306,11 @@ class RefreshResponse(BaseModel):
 
 class ModelSettingsResponse(BaseModel):
     provider: Literal["openai_compatible"] = "openai_compatible"
-    base_url: str
+    chat_base_url: str
+    embedding_base_url: str
     model_bridge_enabled: bool = False
-    resolve_ip: str | None = None
+    chat_resolve_ip: str | None = None
+    embedding_resolve_ip: str | None = None
     embedding_model: str
     chat_model: str
     embedding_dimensions: int
@@ -322,15 +324,18 @@ class ModelSettingsResponse(BaseModel):
     semantic_chunking_enabled: bool = True
     semantic_chunking_min_length: int = 2000
     has_api_key: bool
+    has_embedding_api_key: bool
     degraded_mode: bool
 
 
 class ModelSettingsUpdate(BaseModel):
     api_key: str | None = None
     clear_api_key: bool = False
-    base_url: str | None = None
+    chat_base_url: str | None = None
+    embedding_base_url: str | None = None
     model_bridge_enabled: bool | None = None
-    resolve_ip: str | None = None
+    chat_resolve_ip: str | None = None
+    embedding_resolve_ip: str | None = None
     embedding_model: str | None = None
     chat_model: str | None = None
     embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
@@ -342,6 +347,8 @@ class ModelSettingsUpdate(BaseModel):
     reranker_device: str | None = None
     semantic_chunking_enabled: bool | None = None
     semantic_chunking_min_length: int | None = Field(default=None, ge=500, le=5000)
+    embedding_api_key: str | None = None
+    clear_embedding_api_key: bool = False
 
 
 class RuntimeIssue(BaseModel):

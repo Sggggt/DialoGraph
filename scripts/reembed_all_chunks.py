@@ -51,7 +51,7 @@ async def main() -> None:
         raise SystemExit("OPENAI_API_KEY is required for real no-fallback re-embedding.")
     print(f"Embedding model: {settings.embedding_model}")
     print(f"Embedding dimensions: {settings.embedding_dimensions}")
-    print(f"Base URL: {settings.openai_base_url}")
+    print(f"Embedding base URL: {settings.embedding_base_url}")
     print(f"Has API key: {bool(settings.openai_api_key)}")
     print()
 

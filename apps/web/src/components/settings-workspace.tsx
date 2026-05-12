@@ -30,8 +30,10 @@ import { Input } from "@/components/ui/input";
 import { fetchModelSettings, fetchRuntimeCheck, updateModelSettings } from "@/lib/api";
 
 type SettingsForm = {
-  base_url: string;
-  resolve_ip: string;
+  chat_base_url: string;
+  embedding_base_url: string;
+  chat_resolve_ip: string;
+  embedding_resolve_ip: string;
   embedding_model: string;
   chat_model: string;
   embedding_dimensions: string;
@@ -39,6 +41,8 @@ type SettingsForm = {
   graph_extraction_chunks_per_document: string;
   api_key: string;
   clear_api_key: boolean;
+  embedding_api_key: string;
+  clear_embedding_api_key: boolean;
   model_bridge_enabled: boolean;
   reranker_enabled: boolean;
   reranker_max_length: string;
@@ -138,6 +142,7 @@ export function SettingsWorkspace() {
   const [form, setForm] = useState<SettingsForm | null>(null);
   const [savedMessage, setSavedMessage] = useState<string | null>(null);
   const [apiKeyEditing, setApiKeyEditing] = useState(false);
+  const [embeddingApiKeyEditing, setEmbeddingApiKeyEditing] = useState(false);
   const [errorDialog, setErrorDialog] = useState<ErrorDialogState | null>(null);
 
   useEffect(() => {
@@ -146,8 +151,10 @@ export function SettingsWorkspace() {
     }
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setForm({
-      base_url: settingsQuery.data.base_url,
-      resolve_ip: settingsQuery.data.resolve_ip ?? "",
+      chat_base_url: settingsQuery.data.chat_base_url,
+      embedding_base_url: settingsQuery.data.embedding_base_url ?? "",
+      chat_resolve_ip: settingsQuery.data.chat_resolve_ip ?? "",
+      embedding_resolve_ip: settingsQuery.data.embedding_resolve_ip ?? "",
       embedding_model: settingsQuery.data.embedding_model,
       chat_model: settingsQuery.data.chat_model,
       embedding_dimensions: String(settingsQuery.data.embedding_dimensions),
@@ -155,6 +162,8 @@ export function SettingsWorkspace() {
       graph_extraction_chunks_per_document: String(settingsQuery.data.graph_extraction_chunks_per_document ?? 2),
       api_key: "",
       clear_api_key: false,
+      embedding_api_key: "",
+      clear_embedding_api_key: false,
       model_bridge_enabled: settingsQuery.data.model_bridge_enabled ?? false,
       reranker_enabled: settingsQuery.data.reranker_enabled ?? false,
       reranker_max_length: String(settingsQuery.data.reranker_max_length ?? 512),
@@ -162,6 +171,7 @@ export function SettingsWorkspace() {
       semantic_chunking_min_length: String(settingsQuery.data.semantic_chunking_min_length ?? 2000),
     });
     setApiKeyEditing(false);
+    setEmbeddingApiKeyEditing(false);
   }, [settingsQuery.data]);
 
   const saveMutation = useMutation({
@@ -181,8 +191,7 @@ export function SettingsWorkspace() {
 
   const settings = settingsQuery.data;
   const showApiKeyMask = Boolean(settings?.has_api_key && !apiKeyEditing && !form?.clear_api_key);
-
-
+  const showEmbeddingApiKeyMask = Boolean(settings?.has_embedding_api_key && !embeddingApiKeyEditing && !form?.clear_embedding_api_key);
 
   if (settingsQuery.isLoading || !form) {
     return <LoadingBlock rows={4} />;
@@ -202,8 +211,10 @@ export function SettingsWorkspace() {
     const rerankerMaxLength = Number.parseInt(form.reranker_max_length, 10);
     const semanticMinLength = Number.parseInt(form.semantic_chunking_min_length, 10);
     return {
-      base_url: form.base_url.trim(),
-      resolve_ip: form.resolve_ip.trim() || null,
+      chat_base_url: form.chat_base_url.trim(),
+      embedding_base_url: form.embedding_base_url.trim(),
+      chat_resolve_ip: form.chat_resolve_ip.trim() || null,
+      embedding_resolve_ip: form.embedding_resolve_ip.trim() || null,
       embedding_model: form.embedding_model.trim(),
       chat_model: form.chat_model.trim(),
       embedding_dimensions: Number.isFinite(dimensions) ? dimensions : undefined,
@@ -211,6 +222,8 @@ export function SettingsWorkspace() {
       graph_extraction_chunks_per_document: Number.isFinite(graphChunksPerDocument) ? graphChunksPerDocument : undefined,
       api_key: form.api_key.trim() || null,
       clear_api_key: form.clear_api_key,
+      embedding_api_key: form.embedding_api_key.trim() || null,
+      clear_embedding_api_key: form.clear_embedding_api_key,
       model_bridge_enabled: form.model_bridge_enabled,
       reranker_enabled: form.reranker_enabled,
       reranker_max_length: Number.isFinite(rerankerMaxLength) ? rerankerMaxLength : undefined,
@@ -259,7 +272,11 @@ export function SettingsWorkspace() {
                 <p className="text-xs uppercase tracking-[0.26em] text-white/42">模型 API</p>
                 <p className="mt-2 flex items-center gap-2 text-sm text-white/68">
                   {settings?.has_api_key ? <CheckCircle2 className="size-4 text-emerald-200" /> : <ShieldAlert className="size-4 text-amber-200" />}
-                  {settings?.has_api_key ? "API Key 已配置" : "API Key 未配置"}
+                  {settings?.has_api_key ? "Chat API Key 已配置" : "Chat API Key 未配置"}
+                </p>
+                <p className="mt-1 flex items-center gap-2 text-sm text-white/68">
+                  {settings?.has_embedding_api_key ? <CheckCircle2 className="size-4 text-emerald-200" /> : <ShieldAlert className="size-4 text-amber-200" />}
+                  {settings?.has_embedding_api_key ? "Embedding API Key 已配置" : "Embedding API Key 未配置"}
                 </p>
               </div>
               <div className="border-l border-white/10 px-4 py-3">
@@ -371,13 +388,23 @@ export function SettingsWorkspace() {
               </div>
 
               <label className="flex flex-col gap-2 md:col-span-2">
-                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Base URL</span>
-                <Input value={form.base_url} onChange={(event) => updateForm("base_url", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Chat Base URL</span>
+                <Input value={form.chat_base_url} onChange={(event) => updateForm("chat_base_url", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
               <label className="flex flex-col gap-2 md:col-span-2">
-                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">DNS Override IP</span>
-                <Input value={form.resolve_ip} onChange={(event) => updateForm("resolve_ip", event.target.value)} placeholder="可选；留空使用系统 DNS" className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white placeholder:text-white/28" />
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Embedding Base URL</span>
+                <Input value={form.embedding_base_url} onChange={(event) => updateForm("embedding_base_url", event.target.value)} placeholder="输入 Embedding Base URL" className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white placeholder:text-white/28" />
+              </label>
+
+              <label className="flex flex-col gap-2">
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Chat DNS Override IP</span>
+                <Input value={form.chat_resolve_ip} onChange={(event) => updateForm("chat_resolve_ip", event.target.value)} placeholder="可选；留空使用系统 DNS" className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white placeholder:text-white/28" />
+              </label>
+
+              <label className="flex flex-col gap-2">
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Embedding DNS Override IP</span>
+                <Input value={form.embedding_resolve_ip} onChange={(event) => updateForm("embedding_resolve_ip", event.target.value)} placeholder="可选；留空使用系统 DNS" className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white placeholder:text-white/28" />
               </label>
 
               <label className="flex flex-col gap-2">
@@ -406,7 +433,7 @@ export function SettingsWorkspace() {
               </label>
 
               <label className="flex flex-col gap-2">
-                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">API Key</span>
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Chat API Key</span>
                 <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.04] px-4">
                   <KeyRound className="size-4 text-cyan-100/58" />
                   <input
@@ -428,23 +455,64 @@ export function SettingsWorkspace() {
                   <EyeOff className="size-4 text-white/32" />
                 </div>
               </label>
+
+              <label className="flex flex-col gap-2">
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">Embedding API Key</span>
+                <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.04] px-4">
+                  <KeyRound className="size-4 text-cyan-100/58" />
+                  <input
+                    type="password"
+                    value={showEmbeddingApiKeyMask ? "••••••••••••••••" : form.embedding_api_key}
+                    readOnly={showEmbeddingApiKeyMask}
+                    disabled={form.clear_embedding_api_key}
+                    onChange={(event) => updateForm("embedding_api_key", event.target.value)}
+                    placeholder={settings?.has_embedding_api_key ? "留空则保留当前 key" : "输入 Embedding API key"}
+                    className="h-12 min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/30"
+                    autoComplete="off"
+                  />
+                  {showEmbeddingApiKeyMask ? (
+                    <button type="button" onClick={() => setEmbeddingApiKeyEditing(true)} className="inline-flex items-center gap-1 rounded-full border border-white/8 px-2.5 py-1 text-xs text-white/55 transition hover:border-cyan-200/24 hover:text-cyan-100">
+                      <PencilLine className="size-3.5" />
+                      修改
+                    </button>
+                  ) : null}
+                  <EyeOff className="size-4 text-white/32" />
+                </div>
+              </label>
             </div>
 
-            <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
-              <input
-                type="checkbox"
-                checked={form.clear_api_key}
-                onChange={(event) => {
-                  updateForm("clear_api_key", event.target.checked);
-                  if (event.target.checked) {
-                    setApiKeyEditing(false);
-                    updateForm("api_key", "");
-                  }
-                }}
-                className="size-4 accent-rose-300"
-              />
-              清除当前 API key
-            </label>
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
+                <input
+                  type="checkbox"
+                  checked={form.clear_api_key}
+                  onChange={(event) => {
+                    updateForm("clear_api_key", event.target.checked);
+                    if (event.target.checked) {
+                      setApiKeyEditing(false);
+                      updateForm("api_key", "");
+                    }
+                  }}
+                  className="size-4 accent-rose-300"
+                />
+                清除当前 Chat API key
+              </label>
+              <label className="flex items-center gap-3 border-l border-white/10 px-4 py-3 text-sm text-white/70">
+                <input
+                  type="checkbox"
+                  checked={form.clear_embedding_api_key}
+                  onChange={(event) => {
+                    updateForm("clear_embedding_api_key", event.target.checked);
+                    if (event.target.checked) {
+                      setEmbeddingApiKeyEditing(false);
+                      updateForm("embedding_api_key", "");
+                    }
+                  }}
+                  className="size-4 accent-rose-300"
+                />
+                清除当前 Embedding API key
+              </label>
+            </div>
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-5">
               <p className="text-xs leading-6 text-white/42">

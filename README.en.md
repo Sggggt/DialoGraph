@@ -6,9 +6,9 @@
 
 <h1 align="center">DialoGraph</h1>
 
-DialoGraph is a Dockerized knowledge infrastructure system for local course materials. It parses PDFs, slides, documents, web pages, notebooks, images, and Markdown into searchable text chunks, Qdrant vectors, PostgreSQL sparse knowledge graphs, and citation-backed answers.
+DialoGraph is an AI knowledge assistant purpose-built for course materials. Drop in your slides, textbooks, and notes, and it automatically parses content, maps out how concepts connect, and answers natural-language questions—every response cites its source, so you know exactly where the answer comes from.
 
-The default runtime uses real PostgreSQL, Qdrant, Redis, and an OpenAI-compatible model API. Model fallback and database fallback are disabled by default; production-quality validation does not use zero vectors, fake embeddings, local JSON retrieval, or extractive substitute answers.
+Bilingual Chinese/English search, fully local deployment, and complete data ownership.
 
 ## At A Glance
 
@@ -470,8 +470,10 @@ Common variables:
 | `REDIS_URL`                                                               | Redis URL                                                                                          |
 | `COURSE_NAME`                                                             | Default course name                                                                                |
 | `DATA_ROOT`                                                               | Local data root                                                                                    |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL`                                    | OpenAI-compatible model endpoint                                                                   |
-| `OPENAI_RESOLVE_IP`                                                       | Target IP when model-domain resolution must be pinned                                              |
+| `OPENAI_API_KEY` / `CHAT_BASE_URL`                                      | OpenAI-compatible chat / graph extraction model endpoint                                           |
+| `CHAT_RESOLVE_IP`                                                         | Target IP when chat model-domain resolution must be pinned                                         |
+| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL`                                | OpenAI-compatible embedding model endpoint, independent from the chat endpoint                     |
+| `EMBEDDING_RESOLVE_IP`                                                    | Target IP when embedding model-domain resolution must be pinned                                    |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` / `EMBEDDING_BATCH_SIZE`   | Embedding model, dimensions, and batch size                                                        |
 | `CHAT_MODEL`                                                              | Chat and graph extraction model                                                                    |
 | `GRAPH_EXTRACTION_CHUNK_LIMIT` / `GRAPH_EXTRACTION_CHUNKS_PER_DOCUMENT` | Graph extraction chunk cap and per-document sampling cap                                           |
@@ -502,7 +504,8 @@ If the host can reach a model provider but container networking to that provider
 
 ```env
 OPENAI_API_KEY=...
-OPENAI_BASE_URL=https://api.openai.com/v1
+CHAT_BASE_URL=https://api.openai.com/v1
+EMBEDDING_BASE_URL=https://api.openai.com/v1
 EMBEDDING_MODEL=text-embedding-v4
 CHAT_MODEL=qwen-plus
 ENABLE_MODEL_FALLBACK=false
