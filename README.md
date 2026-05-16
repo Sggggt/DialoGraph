@@ -203,19 +203,19 @@ flowchart LR
 
 Chunk 质量得分公式：
 
-$$S_{\text{chunk}} = 0.30 \cdot \min\!\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\!\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)$$
+$$S_{\text{chunk}} = 0.30 \cdot \min\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)$$
 
 其中 *L*<sub>norm</sub> 为规范化长度，*D*<sub>term</sub> 为术语密度，*R*<sub>unique</sub> 为唯一词比率，*D*<sub>def</sub> 为定义得分，*R*<sub>mojibake</sub> 为乱码比率。
 
 **ConceptQualityPolicy** 决策空间为 `accept` / `reject`：
 
-$$S_{\text{concept}} = \max\!\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}$$
+$$S_{\text{concept}} = \max\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}$$
 
 准入条件：无硬拒绝理由（过短、乱码、路径名、结构容器、低特异性、证据不足），且得分 *S*<sub>concept</sub> ≥ 0.45。
 
 **RelationQualityPolicy** 决策空间为 `accept` / `candidate_only`：
 
-$$S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\!\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)$$
+$$S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)$$
 
 其中 *c* 为 LLM 置信度，**1**<sub>src</sub> / **1**<sub>tgt</sub> 为证据文本中是否出现源/目标概念。`inferred` 或 `related_to` 类型关系强制降级为 `candidate_only`。
 
