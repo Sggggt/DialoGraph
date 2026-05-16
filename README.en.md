@@ -203,43 +203,19 @@ The policy layer maps signals into discrete routing decisions:
 
 Chunk quality score formula:
 
-$$
-\begin{aligned}
-S_{\text{chunk}} =&\; 0.30 \cdot \min\!
-\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr)
-+ 0.25 \cdot D_{\text{term}}
-+ 0.20 \cdot R_{\text{unique}} \\
-&+ 0.15 \cdot D_{\text{def}}
-+ 0.05 \cdot \mathbf{1}_{\text{formula}}
-+ 0.05 \cdot \mathbf{1}_{\text{table}}
-- 0.35 \cdot \mathbf{1}_{\text{toc}}
-- 0.40 \cdot \min\!
-\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)
-\end{aligned}
-$$
+$$S_{\text{chunk}} = 0.30 \cdot \min\!\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\!\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)$$
 
 Where $L_{\text{norm}}$ is normalized length, $D_{\text{term}}$ is term density, $R_{\text{unique}}$ is unique token ratio, $D_{\text{def}}$ is definition score, and $R_{\text{mojibake}}$ is mojibake ratio.
 
 **ConceptQualityPolicy** decision space is `accept` / `reject`:
 
-$$
-S_{\text{concept}} = \max\!
-\Bigl(
-S_{\text{specificity}},\;
-0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}
-\Bigr)
-- 0.35 S_{\text{structural}}
-- 0.25 G_{\text{genericity}}
-$$
+$$S_{\text{concept}} = \max\!\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}$$
 
 Admission requires no hard-rejection reasons (too short, mojibake, path/filename, structural container, low specificity, insufficient evidence) and score $S_{\text{concept}} \ge 0.45$.
 
 **RelationQualityPolicy** decision space is `accept` / `candidate_only`:
 
-$$
-S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\!
-\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)
-$$
+$$S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\!\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)$$
 
 Where $c$ is LLM confidence, $\mathbf{1}_{\text{src}}$ / $\mathbf{1}_{\text{tgt}}$ indicate whether the source/target concept appears in the evidence text. `inferred` or `related_to` relations are forced to `candidate_only`.
 
