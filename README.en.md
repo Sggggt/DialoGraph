@@ -205,19 +205,19 @@ Chunk quality score formula:
 
 $$S_{\text{chunk}} = 0.30 \cdot \min\!\Bigl(1, \frac{L_{\text{norm}}}{600}\Bigr) + 0.25 \cdot D_{\text{term}} + 0.20 \cdot R_{\text{unique}} + 0.15 \cdot D_{\text{def}} + 0.05 \cdot \mathbf{1}_{\text{formula}} + 0.05 \cdot \mathbf{1}_{\text{table}} - 0.35 \cdot \mathbf{1}_{\text{toc}} - 0.40 \cdot \min\!\Bigl(1, 20 \cdot R_{\text{mojibake}}\Bigr)$$
 
-Where $L_{\text{norm}}$ is normalized length, $D_{\text{term}}$ is term density, $R_{\text{unique}}$ is unique token ratio, $D_{\text{def}}$ is definition score, and $R_{\text{mojibake}}$ is mojibake ratio.
+Where *L*<sub>norm</sub> is normalized length, *D*<sub>term</sub> is term density, *R*<sub>unique</sub> is unique token ratio, *D*<sub>def</sub> is definition score, and *R*<sub>mojibake</sub> is mojibake ratio.
 
 **ConceptQualityPolicy** decision space is `accept` / `reject`:
 
 $$S_{\text{concept}} = \max\!\Bigl(S_{\text{specificity}},\; 0.35 D_{\text{def}} + 0.25 D_{\text{term}} + 0.20 D_{\text{entity}}\Bigr) - 0.35 S_{\text{structural}} - 0.25 G_{\text{genericity}}$$
 
-Admission requires no hard-rejection reasons (too short, mojibake, path/filename, structural container, low specificity, insufficient evidence) and score $S_{\text{concept}} \ge 0.45$.
+Admission requires no hard-rejection reasons (too short, mojibake, path/filename, structural container, low specificity, insufficient evidence) and score *S*<sub>concept</sub> ≥ 0.45.
 
 **RelationQualityPolicy** decision space is `accept` / `candidate_only`:
 
 $$S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25 \cdot \mathbf{1}_{\text{tgt}} + 0.10 \cdot \min\!\Bigl(1, \frac{n_{\text{support}}}{3}\Bigr)$$
 
-Where $c$ is LLM confidence, $\mathbf{1}_{\text{src}}$ / $\mathbf{1}_{\text{tgt}}$ indicate whether the source/target concept appears in the evidence text. `inferred` or `related_to` relations are forced to `candidate_only`.
+Where *c* is LLM confidence, **1**<sub>src</sub> / **1**<sub>tgt</sub> indicate whether the source/target concept appears in the evidence text. `inferred` or `related_to` relations are forced to `candidate_only`.
 
 > **Design Intent (Why we do this)**: Traditional RAG/GraphRAG systems often apply only coarse-grained filtering before graph construction, allowing TOC pages, garbled text, and repeated extraction noise to pollute the vector store and knowledge graph. DialoGraph's tiered quality routing sends different content types to their proper destinations—noise is discarded, structural labels are summary-only, high-semantic-density blocks join the graph, and ordinary blocks handle retrieval—guaranteeing downstream quality from the data source.
 
@@ -273,7 +273,7 @@ $$
 \mathbf{v}_e = \frac{1}{|C_e|}\sum_{c \in C_e}\mathbf{v}_c
 $$
 
-$C_e$ is the set of active child chunks supporting entity $e$. The centroid is normalized before semantic graph construction.
+*C*<sub>e</sub> is the set of active child chunks supporting entity *e*. The centroid is normalized before semantic graph construction.
 
 > **Design Intent (Why we do this)**: Traditional GraphRAG directly embeds the extracted concept name, which biases the vector space toward the LLM's generic pre-training data. Calculating the centroid of all supporting underlying child chunk vectors ensures the graph remains perfectly faithful to the specific local context of the knowledge base, eliminating concept drift.
 
@@ -291,7 +291,7 @@ $$
 R_i = \mathrm{clamp}\bigl(2 + \lfloor \log_2(1 + r_i) \rfloor,\, 2,\, 8\bigr)
 $$
 
-$m_i$ is evidence chunk count and $r_i$ is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reciprocal cap, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
+*m*<sub>i</sub> is evidence chunk count and *r*<sub>i</sub> is chapter reference count. The system keeps mutual nearest neighbors, candidates accepted by the reciprocal cap, and high-confidence explicit LLM relations, keeping edge count close to linear in node count.
 
 > **Design Intent (Why we do this)**: If high-frequency words (e.g., "algorithm", "data") accept edges without limits, the graph quickly collapses into a useless giant hub (the Hubness Problem). A dynamic bidirectional limit algorithm based on evidence volume and chapter coverage mathematically squeezes out low-quality edges, guaranteeing the graph remains clear, sparse, and focused.
 
@@ -303,7 +303,7 @@ $$
 w_{ij}=0.45\,c_{ij}^{\mathrm{llm}}+0.30\,s_{ij}^{\mathrm{sem}}+0.15\,s_{ij}^{\mathrm{evidence}}+0.10\,s_{ij}^{\mathrm{structure}}
 $$
 
-When no explicit LLM relation exists, $c_{ij}^{\mathrm{llm}}=0$. The final $w_{ij}$ is clipped to $[0,1]$. The graph stage runs:
+When no explicit LLM relation exists, *c*<sub>ij</sub><sup>llm</sup>=0. The final *w*<sub>ij</sub> is clipped to [0,1]. The graph stage runs:
 
 - Connected-component ablation: removes isolated, low-evidence, low-importance noise while preserving enough knowledge-base nodes.
 - Louvain community detection: primary community labels and frontend color groups.
@@ -418,8 +418,8 @@ $$
 
 Where:
 
-- $r_{\mathrm{overlap}} = \dfrac{|T_q \cap T_d|}{|T_q|}$, with $T_q$ the query term set and $T_d$ the document title+snippet+content term set
-- $s_{\mathrm{embedding}}$ is the cosine similarity between query and document vectors; when the raw vector is unavailable, it falls back to the dense score recorded at retrieval time
+- *r*<sub>overlap</sub> = |*T*<sub>q</sub> ∩ *T*<sub>d</sub>| / |*T*<sub>q</sub>|, with *T*<sub>q</sub> the query term set and *T*<sub>d</sub> the document title+snippet+content term set
+- *s*<sub>embedding</sub> is the cosine similarity between query and document vectors; when the raw vector is unavailable, it falls back to the dense score recorded at retrieval time
 
 Admission rules (pass if any holds):
 
@@ -431,9 +431,9 @@ r_{\mathrm{overlap}} \ge 0.25 \;\land\; \mathrm{original\_score} \ge 0.3 & \text
 \end{cases}
 $$
 
-The cross-lingual bridge gate solves a critical problem: a Chinese query "最大流" and English material "max flow" share weak overlap in the `text-embedding-v4` vector space, but LLM-translated sub-queries can recall relevant chunks via dense search. In such cases $r_{\mathrm{overlap}}$ may be near zero while $s_{\mathrm{embedding}}$ remains high; the bridge gate prevents these valid cross-lingual results from being killed by monolingual term matching.
+The cross-lingual bridge gate solves a critical problem: a Chinese query "最大流" and English material "max flow" share weak overlap in the `text-embedding-v4` vector space, but LLM-translated sub-queries can recall relevant chunks via dense search. In such cases *r*<sub>overlap</sub> may be near zero while *s*<sub>embedding</sub> remains high; the bridge gate prevents these valid cross-lingual results from being killed by monolingual term matching.
 
-> **Design Intent (Why we do this)**: This is a funnel specifically designed to break the "cross-lingual wall". A Chinese query and English material often share zero literal overlap but high semantic relevance. The $s_{\mathrm{embedding}} \ge 0.45$ cross-lingual bridge gate acts as an exemption channel, elegantly preventing purely lexical (BM25) mismatch from killing valid cross-lingual results.
+> **Design Intent (Why we do this)**: This is a funnel specifically designed to break the "cross-lingual wall". A Chinese query and English material often share zero literal overlap but high semantic relevance. The *s*<sub>embedding</sub> ≥ 0.45 cross-lingual bridge gate acts as an exemption channel, elegantly preventing purely lexical (BM25) mismatch from killing valid cross-lingual results.
 
 ### EvidenceEvaluator
 
@@ -708,13 +708,13 @@ DialoGraph's core innovations in the general GraphRAG direction can be summarize
 Unlike traditional systems with single-threshold filtering, DialoGraph establishes a signal-policy-profile-judge four-tier quality system. Chunks are no longer limited to "keep/discard" binary fates; instead, they are routed to one of six downstream paths (`discard`, `summary_only`, `evidence_only`, `retrieval_candidate`, `graph_candidate`, `embed_only`). Concepts and relations undergo differentiated policy filtering as well. Domain quality profiles give each knowledge base an adaptive quality baseline rather than relying on global fixed thresholds.
 
 **2. Concept Vector Centroidization and Dynamic Sparse Graph Construction**
-Concept vectors are generated as centroids of their supporting chunk vectors, not by embedding the LLM-extracted concept name directly, fundamentally eliminating concept drift. The dynamic R-NN + K-NN sparse graph algorithm applies bidirectional send/receive limits based on evidence volume $m_i$ and chapter coverage $r_i$, guaranteeing near-linear edge growth with node count and naturally suppressing the Hubness Problem.
+Concept vectors are generated as centroids of their supporting chunk vectors, not by embedding the LLM-extracted concept name directly, fundamentally eliminating concept drift. The dynamic R-NN + K-NN sparse graph algorithm applies bidirectional send/receive limits based on evidence volume *m*<sub>i</sub> and chapter coverage *r*<sub>i</sub>, guaranteeing near-linear edge growth with node count and naturally suppressing the Hubness Problem.
 
 **3. Evidence-first Agentic RAG**
 The QA pipeline is not a simple "retrieve then generate" but a full Agent workflow: Perception → RetrievalPlanner → BaseRetrieval → EvidenceAnchorSelector → EvidenceChainPlanner → ControlledGraphEnhancer → EvidenceAssembler → DocumentGrader → EvidenceEvaluator → Generation. The pre-generation `EvidenceEvaluator` gives the system the ability to "know what it doesn't know", intercepting low-quality retrievals before generation.
 
 **4. Triple-Mechanism Cross-lingual Robust Retrieval**
-LLM explicit translation expansion produces bilingual sub-queries, embedding similarity bridges language barriers, and the DocumentGrader $s_{\text{embedding}} \ge 0.45$ cross-lingual bridge gate exempts lexical false kills—three mechanisms together build a robust retrieval system that does not rely on the alignment quality of a single multilingual embedding model.
+LLM explicit translation expansion produces bilingual sub-queries, embedding similarity bridges language barriers, and the DocumentGrader *s*<sub>embedding</sub> ≥ 0.45 cross-lingual bridge gate exempts lexical false kills—three mechanisms together build a robust retrieval system that does not rely on the alignment quality of a single multilingual embedding model.
 
 **5. Small-to-Big Context Assembly with Parent-Child Decoupling**
 At retrieval time, only the finest-grained units (child chunks) enter dense/BM25/recall/rerank, preventing parents and children from competing in the candidate pool; at generation time, full parent context is assembled via `parent_chunk_id`. This completely decouples the "recall unit" from the "generation unit", achieving both precision and contextual completeness.
