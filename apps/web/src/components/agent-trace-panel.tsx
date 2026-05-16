@@ -7,34 +7,10 @@ import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { traceAuditSummary, traceNodeLabel } from "@/lib/agent-trace";
 
 interface AgentTracePanelProps {
   trace: AgentTraceEventPayload[];
-}
-
-const traceNodeLabels: Record<string, string> = {
-  perception: "感知",
-  retrieval_planner: "检索规划",
-  query_analyzer: "问题分析",
-  router: "路由判断",
-  query_rewriter: "查询改写",
-  retrieval_decision: "检索决策",
-  retrievers: "检索召回",
-  document_grader: "证据筛选",
-  evidence_evaluator: "证据评估",
-  retry_planner: "重试规划",
-  context_synthesizer: "上下文合成",
-  answer_generator: "答案生成",
-  citation_checker: "引用校验",
-  citation_verifier: "引用验证",
-  reflection: "反思",
-  answer_corrector: "答案修正",
-  self_check: "自检",
-  error: "错误",
-};
-
-function traceNodeLabel(node: string): string {
-  return traceNodeLabels[node] ?? node;
 }
 
 function traceBadgeVariant(node: string, output: string | null, status: string): "default" | "secondary" | "destructive" | "outline" {
@@ -65,6 +41,7 @@ export function AgentTracePanel({ trace }: AgentTracePanelProps) {
               trace.map((event, index) => {
                 const Icon = event.status === "failed" ? XCircle : event.duration_ms > 0 ? CheckCircle2 : Activity;
                 const badgeVariant = traceBadgeVariant(event.node, event.output_summary ?? null, event.status);
+                const auditSummary = traceAuditSummary(event.scores);
                 return (
                   <div key={event.id ?? `${event.node}-${index}`} className="rounded-lg border border-white/10 bg-black/10 p-4">
                     <div className="flex items-start justify-between gap-3">
@@ -84,6 +61,15 @@ export function AgentTracePanel({ trace }: AgentTracePanelProps) {
                       </Badge>
                     </div>
                     {event.output_summary ? <MarkdownRenderer content={event.output_summary} compact className="mt-3 text-white/62" /> : null}
+                    {auditSummary.length ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {auditSummary.map((item) => (
+                          <Badge key={item} variant="outline" className="text-[10px] text-white/58">
+                            {item}
+                          </Badge>
+                        ))}
+                      </div>
+                    ) : null}
                     {event.document_ids.length > 0 ? (
                       <p className="mt-2 text-xs text-white/38">触达 {event.document_ids.length} 个片段</p>
                     ) : null}

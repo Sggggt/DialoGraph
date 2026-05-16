@@ -12,16 +12,19 @@ from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from app.db import SessionLocal
 from app.models import AgentRun, AgentTraceEvent, QASession
 from app.schemas import AgentRequest, SearchFilters
 from app.core.config import get_settings
-from app.services.embeddings import ChatProvider, EmbeddingProvider, is_degraded_mode
+from app.services.embeddings import ChatProvider, EmbeddingProvider, FallbackDisabledError, is_degraded_mode
 from app.services.ingestion import resolve_course
 from app.services.retrieval import (
+    assemble_evidence_documents,
+    controlled_graph_enhancement,
     cosine_similarity,
-    graph_enhanced_search,
     hybrid_search_chunks,
-    layered_search_chunks,
+    plan_evidence_chains,
+    select_evidence_anchors,
 )
 
 
@@ -32,7 +35,6 @@ _TRACE_SUBSCRIBERS: dict[str, set[asyncio.Queue[dict]]] = {}
 
 
 class AgentState(TypedDict, total=False):
-    db: Session
     run_id: str
     session_id: str
     course_id: str
@@ -60,6 +62,12 @@ class AgentState(TypedDict, total=False):
     retrieval_params: dict
     evidence_evaluation: dict
     low_evidence: bool
+    base_documents: list[dict]
+    evidence_anchors: list[dict]
+    evidence_chain_plan: list[dict]
+    graph_enhanced_documents: list[dict]
+    evidence_assembly: dict
+    graph_navigation_audit: dict
 
 
 class QueryAnalysis(BaseModel):
@@ -81,7 +89,7 @@ def _summarize(text: str, limit: int = 280) -> str:
     return compact[:limit]
 
 
-def _set_run_state(
+def _set_run_state_sync(
     db: Session,
     run_id: str,
     state: str,
@@ -112,7 +120,26 @@ def _set_run_state(
     db.commit()
 
 
-def _trace(
+async def _set_run_state(
+    run_id: str,
+    state: str,
+    *,
+    current_node: str | None = None,
+    route: str | None = None,
+    retry_count: int | None = None,
+    answer: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Async variant that creates its own Session to avoid blocking the event loop and leaking Session across LangGraph nodes."""
+
+    def _sync() -> None:
+        with SessionLocal() as db:
+            _set_run_state_sync(db, run_id, state, current_node=current_node, route=route, retry_count=retry_count, answer=answer, error=error)
+
+    await asyncio.to_thread(_sync)
+
+
+def _trace_sync(
     db: Session,
     run_id: str,
     node: str,
@@ -142,6 +169,27 @@ def _trace(
     payload = trace_event_to_payload(event)
     _publish_trace_event(run_id, payload)
     return payload
+
+
+async def _trace(
+    run_id: str,
+    node: str,
+    *,
+    input_summary: str | None = None,
+    output_summary: str | None = None,
+    document_ids: list[str] | None = None,
+    scores: dict | None = None,
+    duration_ms: int = 0,
+    status: str = "completed",
+    error: str | None = None,
+) -> dict:
+    """Async variant that creates its own Session to avoid blocking the event loop and leaking Session across LangGraph nodes."""
+
+    def _sync() -> dict:
+        with SessionLocal() as db:
+            return _trace_sync(db, run_id, node, input_summary=input_summary, output_summary=output_summary, document_ids=document_ids, scores=scores, duration_ms=duration_ms, status=status, error=error)
+
+    return await asyncio.to_thread(_sync)
 
 
 def _subscribe_trace(run_id: str) -> asyncio.Queue[dict]:
@@ -185,7 +233,7 @@ class Perception:
 
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         question = state["question"].strip()
         course_id = state["course_id"]
 
@@ -213,37 +261,42 @@ class Perception:
 
         # Skip expensive LLM + graph lookup for simple routes
         if route in {"direct_answer", "clarify"}:
-            _set_run_state(db, state["run_id"], "running", current_node="perception", route=route)
-            _trace(
-                db,
-                state["run_id"],
+            await _set_run_state( state["run_id"], "running", current_node="perception", route=route)
+            await _trace(
+                                state["run_id"],
                 "perception",
                 input_summary=question,
                 output_summary=f"fast_path route={route}",
                 duration_ms=int((time.perf_counter() - start) * 1000),
             )
-            return {"perception_result": {"intent": "unknown", "entities": [], "sub_queries": [question], "needs_graph": False, "suggested_strategy": "global_dense"}, "route": route}
+            return {"perception_result": {"intent": "unknown", "entities": [], "sub_queries": [question], "needs_graph": False, "suggested_strategy": "base_retrieval"}, "route": route}
 
-        # 1. LLM perception (with graceful degradation)
+        # 1. LLM perception
         llm_perception: dict[str, Any]
         if is_degraded_mode():
+            settings = get_settings()
+            if not settings.enable_model_fallback:
+                raise FallbackDisabledError("Perception requires configured model credentials because ENABLE_MODEL_FALLBACK is false")
             llm_perception = {
                 "intent": "unknown",
                 "entities": [],
                 "sub_queries": [question],
                 "needs_graph": False,
-                "suggested_strategy": "hybrid",
+                "suggested_strategy": "base_retrieval",
             }
         else:
             try:
                 llm_perception = await ChatProvider().perceive_question(question, state.get("history", []))
             except Exception:
+                settings = get_settings()
+                if not settings.enable_model_fallback:
+                    raise
                 llm_perception = {
                     "intent": "unknown",
                     "entities": [],
                     "sub_queries": [question],
                     "needs_graph": False,
-                    "suggested_strategy": "hybrid",
+                    "suggested_strategy": "base_retrieval",
                 }
 
         # 2. Graph entity matching
@@ -317,13 +370,12 @@ class Perception:
             "perceived_neighbors": perceived_neighbors,
             "sub_queries": llm_perception.get("sub_queries", [question]),
             "needs_graph": llm_perception.get("needs_graph", False),
-            "suggested_strategy": llm_perception.get("suggested_strategy", "hybrid"),
+            "suggested_strategy": llm_perception.get("suggested_strategy", "base_retrieval"),
         }
 
-        _set_run_state(db, state["run_id"], "running", current_node="perception", route=route)
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="perception", route=route)
+        await _trace(
+                        state["run_id"],
             "perception",
             input_summary=question,
             output_summary=(
@@ -366,23 +418,15 @@ class RetrievalPlanner:
 
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         perception = state.get("perception_result", {})
         intent = perception.get("intent", "unknown")
-        suggested = perception.get("suggested_strategy", "hybrid")
         needs_graph = perception.get("needs_graph", False)
         matched_concepts = perception.get("matched_concepts", [])
 
-        # Override strategy based on intent + graph signals
-        strategy = suggested
-        if intent == "definition" and not needs_graph:
-            strategy = "global_dense"
-        elif intent == "comparison" or needs_graph:
-            strategy = "hybrid"
-        elif intent in {"application", "procedure"} and matched_concepts:
-            strategy = "local_graph"
-        elif intent == "analysis" and len(matched_concepts) >= 3:
-            strategy = "community"
+        strategy = "evidence_first"
+        use_graph = bool(needs_graph or intent in {"comparison", "procedure"} or state.get("route") == "multi_hop_research")
+        use_community = bool(intent == "analysis" or perception.get("suggested_strategy") == "community")
 
         top_k = state["top_k"]
         # Increase recall for broader intents
@@ -404,18 +448,19 @@ class RetrievalPlanner:
 
         retrieval_params = {
             "top_k": top_k,
-            "graph_seed_concept_ids": seed_concept_ids if needs_graph else [],
+            "graph_seed_concept_ids": seed_concept_ids if use_graph else [],
             "community_ids": perception.get("perceived_communities", []),
             "sub_queries": sub_queries,
+            "use_graph": use_graph,
+            "use_community": use_community,
         }
 
-        _set_run_state(db, state["run_id"], "running", current_node="retrieval_planner")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="retrieval_planner")
+        await _trace(
+                        state["run_id"],
             "retrieval_planner",
             input_summary=f"intent={intent} needs_graph={needs_graph}",
-            output_summary=f"strategy={strategy} top_k={top_k} queries={len(sub_queries)}",
+            output_summary=f"strategy={strategy} top_k={top_k} queries={len(sub_queries)} graph={use_graph} community={use_community}",
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
         return {
@@ -428,7 +473,7 @@ class RetrievalPlanner:
 class QueryAnalyzer:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         question = state["question"].strip()
         tokens = _terms(question)
         lower = question.lower()
@@ -439,10 +484,9 @@ class QueryAnalyzer:
             needs_clarification=len(tokens) == 0 or lower in {"it", "this", "that", "explain it", "why", "这个", "那个", "解释一下", "为什么"},
             is_multi_hop=any(term in lower for term in ("compare", "relationship", "difference between", "connect", "derive", "prove")),
         )
-        _set_run_state(db, state["run_id"], "running", current_node="query_analyzer")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="query_analyzer")
+        await _trace(
+                        state["run_id"],
             "query_analyzer",
             input_summary=question,
             output_summary=analysis.model_dump_json(),
@@ -454,7 +498,7 @@ class QueryAnalyzer:
 class Router:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         question = state["question"]
         lower = question.lower()
         terms = _terms(question)
@@ -476,10 +520,9 @@ class Router:
             route = "retrieve_notes"
         else:
             route = "retrieve_both"
-        _set_run_state(db, state["run_id"], "running", current_node="router", route=route)
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="router", route=route)
+        await _trace(
+                        state["run_id"],
             "router",
             input_summary=question,
             output_summary=f"route={route}",
@@ -491,17 +534,16 @@ class Router:
 class QueryRewriter:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         chat = ChatProvider()
         rewritten = await chat.rewrite_question(state["question"], state.get("history", []))
         if state.get("route") == "multi_hop_research":
             sub_queries = split_multi_hop_query(rewritten)
         else:
             sub_queries = [rewritten]
-        _set_run_state(db, state["run_id"], "running", current_node="query_rewriter")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="query_rewriter")
+        await _trace(
+                        state["run_id"],
             "query_rewriter",
             input_summary=state["question"],
             output_summary=" | ".join(sub_queries),
@@ -513,7 +555,7 @@ class QueryRewriter:
 class RetrievalDecision:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         settings = get_settings()
         skip = False
         reason = "default"
@@ -535,10 +577,9 @@ class RetrievalDecision:
                 else:
                     skip = False
                     reason = "not_reference"
-        _set_run_state(db, state["run_id"], "running", current_node="retrieval_decision")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="retrieval_decision")
+        await _trace(
+                        state["run_id"],
             "retrieval_decision",
             input_summary=state["question"],
             output_summary=f"skip_retrieval={skip} reason={reason}",
@@ -547,103 +588,162 @@ class RetrievalDecision:
         return {"skip_retrieval": skip}
 
 
-class RetrievalExecutor:
-    """Execute retrieval based on the planned strategy."""
+class BaseRetrieval:
+    """Run base evidence recall without graph expansion."""
 
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
-        strategy = state.get("retrieval_strategy", "hybrid")
+        db = SessionLocal()
         params = state.get("retrieval_params", {})
         course_id = state["course_id"]
         filters = state["filters"]
         top_k = params.get("top_k", state["top_k"])
         queries = params.get("sub_queries", [state.get("rewritten_question") or state["question"]])
         route = state.get("route", "retrieve_both")
-        settings = get_settings()
 
         all_results: dict[str, dict] = {}
-
-        if strategy == "local_graph" and params.get("graph_seed_concept_ids"):
-            # Local graph: seed from perceived concepts + dense recall
-            from app.services.retrieval import local_graph_search
-            for query in queries:
-                results = await local_graph_search(
-                    db, course_id, query, filters, top_k,
-                    seed_concept_ids=params["graph_seed_concept_ids"],
-                )
+        for query in queries:
+            for flt in expand_route_filters(route, filters):
+                results = await hybrid_search_chunks(db, course_id, query, flt, max(top_k * 3, top_k))
                 for result in results:
+                    result.setdefault("metadata", {})["retrieval_stage"] = "base_retrieval"
+                    result.setdefault("metadata", {})["evidence_role"] = "base_candidate"
+                    result.setdefault("metadata", {})["graph_verified"] = False
                     current = all_results.get(result["chunk_id"])
                     if current is None or result["score"] > current["score"]:
                         all_results[result["chunk_id"]] = result
-
-        elif strategy == "community" and params.get("community_ids"):
-            # Community scoped search
-            from app.services.retrieval import community_search_chunks
-            for query in queries:
-                results = await community_search_chunks(
-                    db, course_id, query, filters, top_k,
-                    community_ids=params["community_ids"],
-                )
-                for result in results:
-                    current = all_results.get(result["chunk_id"])
-                    if current is None or result["score"] > current["score"]:
-                        all_results[result["chunk_id"]] = result
-
-        elif strategy == "global_dense" or not settings.retrieval_layer_enabled:
-            # Pure dense + BM25 hybrid
-            for query in queries:
-                results = await hybrid_search_chunks(db, course_id, query, filters, max(top_k * 2, top_k))
-                for result in results:
-                    current = all_results.get(result["chunk_id"])
-                    if current is None or result["score"] > current["score"]:
-                        all_results[result["chunk_id"]] = result
-
-        else:
-            # hybrid (default): layered search or graph-enhanced based on route
-            if settings.retrieval_layer_enabled and route != "multi_hop_research":
-                tasks = []
-                for query in queries:
-                    for flt in expand_route_filters(route, filters):
-                        tasks.append(layered_search_chunks(db, course_id, query, flt, max(top_k * 2, top_k), route))
-                task_results = await asyncio.gather(*tasks, return_exceptions=True)
-                for result in task_results:
-                    if isinstance(result, Exception):
-                        continue
-                    docs, _meta = result
-                    for doc in docs:
-                        current = all_results.get(doc["chunk_id"])
-                        if current is None or doc["score"] > current["score"]:
-                            all_results[doc["chunk_id"]] = doc
-            else:
-                for query in queries:
-                    for flt in expand_route_filters(route, filters):
-                        search_fn = graph_enhanced_search if route == "multi_hop_research" else hybrid_search_chunks
-                        results = await search_fn(db, course_id, query, flt, max(top_k * 2, top_k))
-                        for result in results:
-                            current = all_results.get(result["chunk_id"])
-                            if current is None or result["score"] > current["score"]:
-                                all_results[result["chunk_id"]] = result
 
         documents = sorted(all_results.values(), key=lambda item: item["score"], reverse=True)[: max(top_k * 2, top_k)]
-        _set_run_state(db, state["run_id"], "running", current_node="retrievers")
-        _trace(
-            db,
-            state["run_id"],
-            "retrievers",
-            input_summary=f"strategy={strategy} | " + " | ".join(queries),
-            output_summary=f"{len(documents)} candidate chunks",
+        await _set_run_state( state["run_id"], "running", current_node="base_retrieval")
+        await _trace(
+                        state["run_id"],
+            "base_retrieval",
+            input_summary=f"route={route} | " + " | ".join(queries),
+            output_summary=f"base_candidates={len(documents)}",
             document_ids=[item["chunk_id"] for item in documents],
             scores={item["chunk_id"]: item.get("metadata", {}).get("scores", {}) for item in documents},
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
-        return {"documents": documents}
+        return {"base_documents": documents, "documents": documents}
+
+
+class EvidenceAnchorSelector:
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = SessionLocal()
+        anchors, audit = select_evidence_anchors(db, state["course_id"], state.get("base_documents", []))
+        await _set_run_state( state["run_id"], "running", current_node="evidence_anchor_selector")
+        await _trace(
+                        state["run_id"],
+            "evidence_anchor_selector",
+            input_summary=f"{len(state.get('base_documents', []))} base candidates",
+            output_summary=(
+                f"anchors={audit.get('anchor_count', 0)} "
+                f"verified_anchor_relations={audit.get('verified_anchor_relations', 0)}"
+            ),
+            document_ids=[item["chunk_id"] for item in anchors],
+            scores={item["chunk_id"]: {"anchor_score": item.get("metadata", {}).get("anchor_score")} for item in anchors},
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return {"evidence_anchors": anchors, "graph_navigation_audit": {"anchors": audit}}
+
+
+class EvidenceChainPlanner:
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = SessionLocal()
+        params = state.get("retrieval_params", {})
+        perception = state.get("perception_result", {})
+        query_type = perception.get("intent") or "default"
+        use_graph = bool(params.get("use_graph") or state.get("route") == "multi_hop_research")
+        use_community = bool(params.get("use_community"))
+        paths: list[dict] = []
+        audit = {"planned_paths": 0, "verified_edges": 0, "skipped_reason": "simple_query"}
+        if use_graph or use_community:
+            paths, audit = plan_evidence_chains(
+                db,
+                state["course_id"],
+                state.get("evidence_anchors", []),
+                query_type=query_type,
+                community_ids=params.get("community_ids") if use_community else [],
+            )
+        previous_audit = dict(state.get("graph_navigation_audit", {}))
+        previous_audit["paths"] = audit
+        await _set_run_state( state["run_id"], "running", current_node="evidence_chain_planner")
+        await _trace(
+                        state["run_id"],
+            "evidence_chain_planner",
+            input_summary=f"use_graph={use_graph} use_community={use_community}",
+            output_summary=(
+                f"planned_paths={audit.get('planned_paths', 0)} "
+                f"verified_edges={audit.get('verified_edges', 0)} "
+                f"community_summaries={audit.get('community_summaries', 0)}"
+            ),
+            scores={"audit": audit},
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return {"evidence_chain_plan": paths, "graph_navigation_audit": previous_audit}
+
+
+class ControlledGraphEnhancer:
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = SessionLocal()
+        params = state.get("retrieval_params", {})
+        top_query = (params.get("sub_queries") or [state.get("rewritten_question") or state["question"]])[0]
+        docs, audit = controlled_graph_enhancement(
+            db,
+            state["course_id"],
+            top_query,
+            state["filters"],
+            {str(item["chunk_id"]) for item in state.get("base_documents", [])},
+            state.get("evidence_chain_plan", []),
+        )
+        previous_audit = dict(state.get("graph_navigation_audit", {}))
+        previous_audit["graph"] = audit
+        await _set_run_state( state["run_id"], "running", current_node="controlled_graph_enhancer")
+        await _trace(
+                        state["run_id"],
+            "controlled_graph_enhancer",
+            input_summary=f"{len(state.get('evidence_chain_plan', []))} planned paths",
+            output_summary=(
+                f"graph_enhanced_chunks={audit.get('graph_enhanced_chunks', 0)} "
+                f"path_evidence_chunks={audit.get('path_evidence_chunks', 0)}"
+            ),
+            document_ids=[item["chunk_id"] for item in docs],
+            scores={"audit": audit},
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return {"graph_enhanced_documents": docs, "graph_navigation_audit": previous_audit}
+
+
+class EvidenceAssembler:
+    async def __call__(self, state: AgentState) -> dict:
+        start = time.perf_counter()
+        db = SessionLocal()
+        docs, audit = assemble_evidence_documents(
+            state.get("base_documents", []),
+            state.get("evidence_anchors", []),
+            state.get("graph_enhanced_documents", []),
+            state["top_k"],
+        )
+        await _set_run_state( state["run_id"], "running", current_node="evidence_assembler")
+        await _trace(
+                        state["run_id"],
+            "evidence_assembler",
+            input_summary=f"base={audit.get('base_documents', 0)} graph={audit.get('graph_documents', 0)}",
+            output_summary=f"assembled_documents={audit.get('assembled_documents', 0)} anchor_documents={audit.get('anchor_documents', 0)}",
+            document_ids=[item["chunk_id"] for item in docs],
+            scores={"audit": audit},
+            duration_ms=int((time.perf_counter() - start) * 1000),
+        )
+        return {"documents": docs, "evidence_assembly": audit}
 
 
 class DocumentGrader:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         question = state.get("rewritten_question") or state["question"]
         query_terms = _terms(question)
         graded = []
@@ -705,10 +805,9 @@ class DocumentGrader:
                 low_confidence.append(document)
 
         retry_count = state.get("retry_count", 0)
-        _set_run_state(db, state["run_id"], "running", current_node="document_grader", retry_count=retry_count)
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="document_grader", retry_count=retry_count)
+        await _trace(
+                        state["run_id"],
             "document_grader",
             input_summary=f"{len(state.get('documents', []))} candidates",
             output_summary=f"{len(graded)} accepted, {len(low_confidence)} low-confidence",
@@ -731,7 +830,7 @@ class EvidenceEvaluator:
 
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         docs = state.get("graded_documents", [])
         perception = state.get("perception_result", {})
         retry_count = state.get("retry_count", 0)
@@ -783,6 +882,9 @@ class EvidenceEvaluator:
             "score": round(score, 4),
             "reason": reason,
             "retry_count": retry_count,
+            "anchor_count": len(state.get("evidence_anchors", [])),
+            "planned_paths": len(state.get("evidence_chain_plan", [])),
+            "graph_enhanced_chunks": len(state.get("graph_enhanced_documents", [])),
         }
 
         output: dict[str, Any] = {"evidence_evaluation": evaluation}
@@ -794,14 +896,14 @@ class EvidenceEvaluator:
         elif not sufficient and retry_count >= 2:
             output["low_evidence"] = True
 
-        _set_run_state(db, state["run_id"], "running", current_node="evidence_evaluator")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="evidence_evaluator")
+        await _trace(
+                        state["run_id"],
             "evidence_evaluator",
             input_summary=f"intent={intent} docs={len(docs)} retry={retry_count}",
             output_summary=f"sufficient={sufficient} score={evaluation['score']} reason={reason}",
             document_ids=[item["chunk_id"] for item in docs],
+            scores={"audit": evaluation},
             duration_ms=int((time.perf_counter() - start) * 1000),
         )
         return output
@@ -810,13 +912,12 @@ class EvidenceEvaluator:
 class RetryPlanner:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         retry_count = state.get("retry_count", 0) + 1
         next_question = f"{state.get('rewritten_question') or state['question']} course lecture notes examples"
-        _set_run_state(db, state["run_id"], "running", current_node="retry_planner", retry_count=retry_count)
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="retry_planner", retry_count=retry_count)
+        await _trace(
+                        state["run_id"],
             "retry_planner",
             input_summary=f"retry={retry_count}",
             output_summary=next_question,
@@ -828,7 +929,7 @@ class RetryPlanner:
 class ContextSynthesizer:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         docs = state.get("graded_documents", [])
         if not docs:
             context = ""
@@ -849,10 +950,9 @@ class ContextSynthesizer:
                 parts.append(f"[{idx + 1}] {item['document_title']} / {item.get('chapter') or 'General'}\n{content}")
             context = "\n\n".join(parts)
 
-        _set_run_state(db, state["run_id"], "running", current_node="context_synthesizer")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="context_synthesizer")
+        await _trace(
+                        state["run_id"],
             "context_synthesizer",
             input_summary=f"{len(docs)} graded chunks",
             output_summary=_summarize(context),
@@ -865,7 +965,7 @@ class ContextSynthesizer:
 class AnswerGenerator:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         route = state.get("route", "retrieve_both")
         if route == "direct_answer":
             answer = "I can answer questions about the indexed course materials, show citations, and explain how the retrieval agent reached its answer."
@@ -929,10 +1029,9 @@ class AnswerGenerator:
                 else:
                     citations = [citation for item in used_chunks for citation in item["citations"]]
         audit = state.get("answer_model_audit", {})
-        _set_run_state(db, state["run_id"], "running", current_node="answer_generator")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="answer_generator")
+        await _trace(
+                        state["run_id"],
             "answer_generator",
             input_summary=state["question"],
             output_summary=(
@@ -949,15 +1048,14 @@ class AnswerGenerator:
 class CitationChecker:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         allowed = {item["chunk_id"] for item in state.get("graded_documents", [])}
         citations = [citation for citation in state.get("citations", []) if citation.get("chunk_id") in allowed]
         if state.get("route", "retrieve_both") in {"direct_answer", "clarify"}:
             citations = []
-        _set_run_state(db, state["run_id"], "running", current_node="citation_checker")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="citation_checker")
+        await _trace(
+                        state["run_id"],
             "citation_checker",
             input_summary=f"{len(state.get('citations', []))} citations",
             output_summary=f"{len(citations)} verified citations",
@@ -970,7 +1068,7 @@ class CitationChecker:
 class CitationVerifier:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         settings = get_settings()
         citations = state.get("citations", [])
         answer = state.get("answer", "")
@@ -984,10 +1082,9 @@ class CitationVerifier:
             except Exception:
                 pass
 
-        _set_run_state(db, state["run_id"], "running", current_node="citation_verifier")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="citation_verifier")
+        await _trace(
+                        state["run_id"],
             "citation_verifier",
             input_summary=f"{len(citations)} citations",
             output_summary=f"{len(unverified)} unverified",
@@ -999,7 +1096,7 @@ class CitationVerifier:
 class Reflection:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         settings = get_settings()
         reflection_result = {"has_issue": False, "issue_type": "none", "suggestion": ""}
 
@@ -1014,10 +1111,9 @@ class Reflection:
             except Exception:
                 pass
 
-        _set_run_state(db, state["run_id"], "running", current_node="reflection")
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="reflection")
+        await _trace(
+                        state["run_id"],
             "reflection",
             input_summary=state.get("answer", "")[:200],
             output_summary=f"has_issue={reflection_result.get('has_issue')} type={reflection_result.get('issue_type')}",
@@ -1029,7 +1125,7 @@ class Reflection:
 class AnswerCorrector:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         reflection = state.get("reflection_result", {})
         issue_type = reflection.get("issue_type", "none")
         retry_count = state.get("retry_count", 0)
@@ -1069,10 +1165,9 @@ class AnswerCorrector:
         else:
             correction = {"retry_count": retry_count}
 
-        _set_run_state(db, state["run_id"], "running", current_node="answer_corrector", retry_count=correction.get("retry_count", retry_count))
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], "running", current_node="answer_corrector", retry_count=correction.get("retry_count", retry_count))
+        await _trace(
+                        state["run_id"],
             "answer_corrector",
             input_summary=f"issue={issue_type}",
             output_summary=f"retry={correction.get('retry_count', retry_count)}",
@@ -1084,15 +1179,14 @@ class AnswerCorrector:
 class SelfCheck:
     async def __call__(self, state: AgentState) -> dict:
         start = time.perf_counter()
-        db = state["db"]
+        db = SessionLocal()
         if state.get("route", "retrieve_both") == "clarify":
             status = "needs_clarification"
         else:
             status = "completed"
-        _set_run_state(db, state["run_id"], status, current_node=None, answer=state.get("answer"))
-        _trace(
-            db,
-            state["run_id"],
+        await _set_run_state( state["run_id"], status, current_node=None, answer=state.get("answer"))
+        await _trace(
+                        state["run_id"],
             "self_check",
             input_summary=state.get("route", "retrieve_both"),
             output_summary=status,
@@ -1150,7 +1244,7 @@ def route_after_router(state: AgentState) -> str:
 def route_after_retrieval_decision(state: AgentState) -> str:
     if state.get("skip_retrieval"):
         return "answer_generator"
-    return "retrievers"
+    return "base_retrieval"
 
 
 def route_after_grader(state: AgentState) -> str:
@@ -1188,7 +1282,7 @@ def route_after_corrector(state: AgentState) -> str:
     # For insufficient_coverage or contradiction, we need to re-retrieve with updated params.
     if issue_type == "hallucination":
         return "context_synthesizer"
-    return "retrievers"
+    return "base_retrieval"
 
 
 def build_agent_graph():
@@ -1196,7 +1290,11 @@ def build_agent_graph():
     # New architecture nodes
     workflow.add_node("perception", Perception())
     workflow.add_node("retrieval_planner", RetrievalPlanner())
-    workflow.add_node("retrievers", RetrievalExecutor())
+    workflow.add_node("base_retrieval", BaseRetrieval())
+    workflow.add_node("evidence_anchor_selector", EvidenceAnchorSelector())
+    workflow.add_node("evidence_chain_planner", EvidenceChainPlanner())
+    workflow.add_node("controlled_graph_enhancer", ControlledGraphEnhancer())
+    workflow.add_node("evidence_assembler", EvidenceAssembler())
     # Legacy nodes (kept for compatibility / phased migration)
     workflow.add_node("query_analyzer", QueryAnalyzer())
     workflow.add_node("router", Router())
@@ -1220,8 +1318,12 @@ def build_agent_graph():
         route_after_perception,
         {"direct_answer": "answer_generator", "clarify": "answer_generator", "retrieval_planner": "retrieval_planner"},
     )
-    workflow.add_edge("retrieval_planner", "retrievers")
-    workflow.add_edge("retrievers", "document_grader")
+    workflow.add_edge("retrieval_planner", "base_retrieval")
+    workflow.add_edge("base_retrieval", "evidence_anchor_selector")
+    workflow.add_edge("evidence_anchor_selector", "evidence_chain_planner")
+    workflow.add_edge("evidence_chain_planner", "controlled_graph_enhancer")
+    workflow.add_edge("controlled_graph_enhancer", "evidence_assembler")
+    workflow.add_edge("evidence_assembler", "document_grader")
     workflow.add_conditional_edges(
         "document_grader",
         route_after_grader,
@@ -1232,7 +1334,7 @@ def build_agent_graph():
         route_after_evidence_evaluator,
         {"retrieval_planner": "retrieval_planner", "context_synthesizer": "context_synthesizer"},
     )
-    workflow.add_edge("retry_planner", "retrievers")
+    workflow.add_edge("retry_planner", "base_retrieval")
     workflow.add_edge("context_synthesizer", "answer_generator")
     workflow.add_edge("answer_generator", "citation_checker")
     workflow.add_edge("citation_checker", "citation_verifier")
@@ -1241,7 +1343,7 @@ def build_agent_graph():
     workflow.add_conditional_edges(
         "answer_corrector",
         route_after_corrector,
-        {"context_synthesizer": "context_synthesizer", "retrievers": "retrievers"},
+        {"context_synthesizer": "context_synthesizer", "base_retrieval": "base_retrieval"},
     )
     workflow.add_edge("self_check", END)
     return workflow.compile()
@@ -1304,7 +1406,6 @@ def create_agent_run_context(db: Session, request: AgentRequest) -> tuple[QASess
     db.refresh(run)
     history = [item.model_dump() for item in request.history] or list(session.transcript or [])[-8:]
     initial: AgentState = {
-        "db": db,
         "run_id": run.id,
         "session_id": session.id,
         "course_id": course.id,
@@ -1337,8 +1438,8 @@ async def execute_agent_run(db: Session, request: AgentRequest, session: QASessi
             "answer_model_audit": final_state.get("answer_model_audit") or {},
         }
     except Exception as exc:
-        _set_run_state(db, run.id, "failed", current_node=None, error=str(exc))
-        _trace(db, run.id, "error", status="failed", output_summary=str(exc), error=str(exc))
+        _set_run_state_sync(db, run.id, "failed", current_node=None, error=str(exc))
+        _trace_sync(db, run.id, "error", status="failed", output_summary=str(exc), error=str(exc))
         raise
 
 

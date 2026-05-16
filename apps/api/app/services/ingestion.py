@@ -43,6 +43,65 @@ _SOURCE_PATH_LOCKS_GUARD = Lock()
 _MAX_SOURCE_PATH_LOCKS = 256
 
 
+def _get_redis_lock_client():
+    """Return a redis client for distributed locking, or None if unavailable."""
+    try:
+        import redis as redis_lib
+        from app.core.config import get_settings
+
+        client = redis_lib.from_url(
+            get_settings().redis_url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        client.ping()
+        return client
+    except Exception:
+        return None
+
+
+def _redis_lock_key(source_path: str) -> str:
+    import hashlib
+    return f"kg:ingestion_lock:{hashlib.sha256(source_path.encode()).hexdigest()[:32]}"
+
+
+class _RedisDistributedLock:
+    """Async context manager wrapping a Redis-based distributed lock."""
+
+    def __init__(self, redis_client, lock_key: str, timeout: int = 300) -> None:
+        self._redis = redis_client
+        self._key = lock_key
+        self._timeout = timeout
+        self._token: str | None = None
+
+    async def __aenter__(self):
+        import uuid
+        self._token = uuid.uuid4().hex
+        # Simple spin-lock with exponential backoff
+        delay = 0.05
+        max_delay = 1.0
+        while True:
+            acquired = self._redis.set(self._key, self._token, nx=True, ex=self._timeout)
+            if acquired:
+                return self
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._token:
+            # Lua script to release only if we still own the lock
+            release_script = """
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+            """
+            self._redis.eval(release_script, 1, self._key, self._token)
+        return False
+
+
 def exception_message(exc: Exception) -> str:
     message = str(exc).strip()
     if message:
@@ -58,8 +117,17 @@ def state_label(state: str) -> str:
     return STATE_LABELS.get(state, state)
 
 
-def source_path_lock(path: Path) -> asyncio.Lock:
+def source_path_lock(path: Path) -> asyncio.Lock | _RedisDistributedLock:
+    """Return a lock for the given source path.
+
+    Prefers a Redis distributed lock when Redis is available (supports multi-process
+    / multi-container deployments). Falls back to an in-memory asyncio.Lock otherwise.
+    """
     key = normalized_source_path(path)
+    redis_client = _get_redis_lock_client()
+    if redis_client is not None:
+        return _RedisDistributedLock(redis_client, _redis_lock_key(key))
+    # Fallback: in-memory lock (single-process only)
     with _SOURCE_PATH_LOCKS_GUARD:
         if key not in _SOURCE_PATH_LOCKS:
             _SOURCE_PATH_LOCKS[key] = asyncio.Lock()
@@ -68,6 +136,29 @@ def source_path_lock(path: Path) -> asyncio.Lock:
         while len(_SOURCE_PATH_LOCKS) > _MAX_SOURCE_PATH_LOCKS:
             _SOURCE_PATH_LOCKS.popitem(last=False)
         return _SOURCE_PATH_LOCKS[key]
+
+
+def _course_graph_lock_id(course_id: str) -> int:
+    """Deterministic lock ID derived from course_id for PostgreSQL advisory lock."""
+    import zlib
+    return zlib.crc32(course_id.encode()) & 0x7FFFFFFFFFFFFFFF
+
+
+def acquire_course_graph_lock(db: Session, course_id: str) -> bool:
+    """Try to acquire a PostgreSQL advisory lock for graph rebuild.
+    Returns True if lock acquired, False if another session holds it.
+    """
+    from sqlalchemy import text
+    lock_id = _course_graph_lock_id(course_id)
+    result = db.scalar(text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id})
+    return bool(result)
+
+
+def release_course_graph_lock(db: Session, course_id: str) -> None:
+    """Release the PostgreSQL advisory lock for graph rebuild."""
+    from sqlalchemy import text
+    lock_id = _course_graph_lock_id(course_id)
+    db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
 
 
 def active_batch_for_course(db: Session, course_id: str) -> IngestionBatch | None:
@@ -215,11 +306,13 @@ async def recover_existing_graph_algorithm_metrics(session: Session, course_id: 
 
 async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -> dict:
     from app.db import SessionLocal
-    from app.services.concept_graph import incremental_update_course_graph, _restore_course_graph_from_backup
+    from app.services.concept_graph import incremental_update_course_graph, _restore_course_graph_from_backup, has_resumable_graph_extraction
     from app.models import Document, IngestionBatch
 
     session = SessionLocal()
     try:
+        if not acquire_course_graph_lock(session, course_id):
+            raise RuntimeError("课程图谱正在重建中，请等待当前任务完成")
         batch = session.get(IngestionBatch, batch_id)
         if batch is None:
             raise RuntimeError(f"Batch {batch_id} not found")
@@ -260,6 +353,9 @@ async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -
                     session.rollback()
                     emit_ingestion_log(batch_id, "graph_incremental_failed", f"增量图谱更新失败，尝试全量重建：{exception_message(exc)}")
                     mode = "full"
+            elif mode == "incremental" and has_resumable_graph_extraction(session, course_id):
+                emit_ingestion_log(batch_id, "batch_graph_resume_started", "检测到未完成的自适应图谱抽取任务，正在继续生成")
+                mode = "full"
             elif mode == "incremental":
                 emit_ingestion_log(batch_id, "graph_incremental_skipped", "没有检测到变更文档，跳过增量更新")
                 graph_stats = {"graph_rebuilt": False, "reason": "no_changed_documents"}
@@ -276,6 +372,7 @@ async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -
                     session.commit()
                     recovery_stats = {"graph_restored_from_backup": True}
                 except Exception:
+                    session.rollback()
                     recovery_stats = await recover_existing_graph_algorithm_metrics(session, course_id)
                 batch = session.get(IngestionBatch, batch_id)
                 if batch is not None:
@@ -309,6 +406,10 @@ async def run_graph_rebuild(batch_id: str, course_id: str, mode: str = "full") -
         emit_ingestion_log(batch_id, "batch_completed", "图谱重建完成")
         return graph_stats
     finally:
+        try:
+            release_course_graph_lock(session, course_id)
+        except Exception:
+            pass
         session.close()
 
 
@@ -679,6 +780,13 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
 
     if document is not None:
         document.is_active = False
+        # Collect chunk IDs for Qdrant vector cleanup (P1-11)
+        stale_chunk_ids = [
+            chunk_id
+            for (chunk_id,) in db.query(Chunk.id)
+            .filter(Chunk.document_id == document.id, Chunk.is_active.is_(True))
+            .all()
+        ]
         db.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).update({"is_active": False})
         db.query(Chunk).filter(Chunk.document_id == document.id).update({"is_active": False})
         removed = True
@@ -712,6 +820,23 @@ def remove_course_file(db: Session, course: Course, source_path: str) -> bool:
 
     if removed:
         db.commit()
+        # P1-11: Delete stale vectors from Qdrant and create compensation log
+        if document is not None and stale_chunk_ids:
+            delete_log = None
+            try:
+                vector_store = VectorStore(course_name=course.name)
+                delete_log = create_vector_compensation_log(
+                    db,
+                    course_id=course.id,
+                    job_id=None,
+                    operation="delete",
+                    vector_ids=stale_chunk_ids,
+                )
+                vector_store.delete(stale_chunk_ids)
+                mark_vector_compensation_log(db, delete_log.id, "completed")
+            except Exception as exc:
+                if delete_log is not None:
+                    mark_vector_compensation_log(db, delete_log.id, "failed", str(exc))
         if file_to_delete is not None:
             try:
                 file_to_delete.unlink()
@@ -1071,7 +1196,17 @@ async def _ingest_file_locked(
     parent_chunks = [c for c in created_chunks if c.metadata_json.get("is_parent")]
     if parent_chunks:
         chat = ChatProvider()
-        await _generate_chunk_knowledge(parent_chunks, chat)
+        try:
+            await _generate_chunk_knowledge(parent_chunks, chat)
+        except Exception:
+            # P1-3: Summary generation is an enhancement step. Failure should not
+            # block the main ingestion pipeline — chunks will proceed without summaries.
+            import logging
+            logging.getLogger(__name__).warning(
+                "Chunk knowledge generation failed for document %s; continuing without summaries",
+                document.id,
+                exc_info=True,
+            )
         db.flush()
 
     if not created_chunks:
@@ -1194,12 +1329,18 @@ async def _ingest_file_locked(
                 },
             }
         )
-    db.commit()
+    # P0-7: Flush (not commit) before Qdrant upsert to keep DB in uncommitted state.
+    # This way, if the process crashes between here and the Qdrant upsert, no chunks
+    # will be marked as ready in the DB without corresponding vectors in Qdrant.
+    db.flush()
 
     new_chunk_ids = [chunk.id for chunk in created_chunks]
-    # 防御：写入 Qdrant 前再次检查全零向量
+    # P1-12: Distinguish empty-dimension vectors from zero vectors for clearer errors
     for point in vector_points:
-        if vector_norm(point["vector"]) <= 1e-12:
+        vec = point["vector"]
+        if not vec or len(vec) == 0:
+            raise RuntimeError(f"Empty vector (0 dimensions) for chunk {point['id']} — check embedding_dimensions config")
+        if vector_norm(vec) <= 1e-12:
             raise RuntimeError(f"Zero vector detected for chunk {point['id']} before upsert")
     upsert_log = create_vector_compensation_log(
         db,
@@ -1210,20 +1351,27 @@ async def _ingest_file_locked(
     )
     vector_store = VectorStore(course_name=course.name)
     try:
-        vector_store.upsert(vector_points)
+        await vector_store.async_upsert(vector_points)
     except Exception as exc:
         mark_vector_compensation_log(db, upsert_log.id, "failed", str(exc))
         raise
     # 防御：写入 Qdrant 后验证向量
     try:
         written = vector_store.get_points(new_chunk_ids)
+        # P1-13: Verify that all expected points were actually written
+        if len(written) != len(new_chunk_ids):
+            missing_count = len(new_chunk_ids) - len(written)
+            raise RuntimeError(
+                f"Qdrant upsert verification failed: expected {len(new_chunk_ids)} points, "
+                f"got {len(written)} ({missing_count} missing)"
+            )
         for point in written:
             if vector_norm(point["vector"]) <= 1e-12:
                 raise RuntimeError(f"Zero vector detected for chunk {point['id']} after upsert")
     except Exception as exc:
         mark_vector_compensation_log(db, upsert_log.id, "failed", f"Vector validation after upsert failed: {exc}")
         try:
-            vector_store.delete(new_chunk_ids)
+            await vector_store.async_delete(new_chunk_ids)
         finally:
             pass
         raise
@@ -1246,7 +1394,7 @@ async def _ingest_file_locked(
     except Exception as exc:
         db.rollback()
         try:
-            vector_store.delete(new_chunk_ids)
+            await vector_store.async_delete(new_chunk_ids)
         finally:
             mark_vector_compensation_log(db, upsert_log.id, "failed", f"DB activation failed after upsert; compensated new vectors: {exc}")
         raise
@@ -1267,7 +1415,7 @@ async def _ingest_file_locked(
             payload_json={"points": stale_points},
         )
         try:
-            vector_store.delete(stale_chunk_ids)
+            await vector_store.async_delete(stale_chunk_ids)
             mark_vector_compensation_log(db, delete_log.id, "completed")
         except Exception as exc:
             mark_vector_compensation_log(db, delete_log.id, "failed", str(exc))
@@ -1317,7 +1465,7 @@ async def _ingest_file_locked(
         "stats": job.stats,
         "source_type": source_type,
         "concept_cards": get_concept_cards(db, course.id),
-        "graph": get_graph_payload(db, course.id),
+        "graph": get_graph_payload(db, course.id, graph_type="semantic"),
     }
 
 
@@ -1419,25 +1567,32 @@ async def run_batch_ingestion(batch_id: str, force: bool = False) -> dict:
             raise RuntimeError(f"Batch {batch_id} disappeared")
         if batch.success_count > 0:
             settings = get_settings()
+            batch_course_id = batch.course_id
+            graph_start_payload = {
+                "processed_files": batch.processed_files,
+                "total_files": batch.total_files,
+                "success_count": batch.success_count,
+                "failure_count": batch.failure_count,
+                "skipped_count": batch.skipped_count,
+                "graph_extraction_strategy": settings.graph_extraction_strategy,
+                "graph_extraction_soft_start_budget": settings.graph_extraction_soft_start_budget or 120,
+                "graph_extraction_concurrency": settings.graph_extraction_concurrency,
+                "graph_extraction_resume_batch_size": settings.graph_extraction_resume_batch_size,
+            }
             batch.status = "extracting_graph"
             session.commit()
             emit_ingestion_log(
                 batch_id,
                 "batch_graph_started",
                 "正在生成课程图谱",
-                processed_files=batch.processed_files,
-                total_files=batch.total_files,
-                success_count=batch.success_count,
-                failure_count=batch.failure_count,
-                skipped_count=batch.skipped_count,
-                graph_extraction_chunk_limit=settings.graph_extraction_chunk_limit,
-                graph_extraction_chunks_per_document=settings.graph_extraction_chunks_per_document,
+                **graph_start_payload,
             )
             try:
-                graph_stats = await rebuild_course_graph_for_batch(session, batch.course_id, batch_id)
+                session.rollback()
+                graph_stats = await rebuild_course_graph_for_batch(session, batch_course_id, batch_id)
             except Exception as exc:
                 session.rollback()
-                recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch.course_id)
+                recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch_course_id)
                 return finalize_graph_generation_failure(
                     session,
                     batch_id,
@@ -1593,25 +1748,32 @@ async def run_uploaded_files_ingestion(batch_id: str, file_paths: list[str], for
             raise RuntimeError(f"Batch {batch_id} disappeared")
         if batch.success_count > 0:
             settings = get_settings()
+            batch_course_id = batch.course_id
+            graph_start_payload = {
+                "processed_files": batch.processed_files,
+                "total_files": batch.total_files,
+                "success_count": batch.success_count,
+                "failure_count": batch.failure_count,
+                "skipped_count": batch.skipped_count,
+                "graph_extraction_strategy": settings.graph_extraction_strategy,
+                "graph_extraction_soft_start_budget": settings.graph_extraction_soft_start_budget or 120,
+                "graph_extraction_concurrency": settings.graph_extraction_concurrency,
+                "graph_extraction_resume_batch_size": settings.graph_extraction_resume_batch_size,
+            }
             batch.status = "extracting_graph"
             session.commit()
             emit_ingestion_log(
                 batch_id,
                 "batch_graph_started",
                 "正在生成课程图谱",
-                processed_files=batch.processed_files,
-                total_files=batch.total_files,
-                success_count=batch.success_count,
-                failure_count=batch.failure_count,
-                skipped_count=batch.skipped_count,
-                graph_extraction_chunk_limit=settings.graph_extraction_chunk_limit,
-                graph_extraction_chunks_per_document=settings.graph_extraction_chunks_per_document,
+                **graph_start_payload,
             )
             try:
-                graph_stats = await rebuild_course_graph_for_batch(session, batch.course_id, batch_id)
+                session.rollback()
+                graph_stats = await rebuild_course_graph_for_batch(session, batch_course_id, batch_id)
             except Exception as exc:
                 session.rollback()
-                recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch.course_id)
+                recovery_stats = await recover_existing_graph_algorithm_metrics(session, batch_course_id)
                 return finalize_graph_generation_failure(
                     session,
                     batch_id,

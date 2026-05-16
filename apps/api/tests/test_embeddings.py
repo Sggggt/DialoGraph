@@ -295,3 +295,17 @@ async def test_chat_content_parts_are_normalized(no_fallback_env, monkeypatch):
     )
 
     assert result.answer == "Part one part two"
+
+
+@pytest.mark.asyncio
+async def test_classify_json_without_fallback_raises_on_exception(no_fallback_env, monkeypatch):
+    """Regression: classify_json without fallback must propagate exceptions instead of silently returning empty dict."""
+    from app.services.embeddings import ChatProvider
+
+    async def failing_post(*args, **kwargs):
+        raise RuntimeError("model error")
+
+    monkeypatch.setattr(ChatProvider, "_post_chat_json_with_response_format_fallback", failing_post)
+
+    with pytest.raises(RuntimeError, match="model error"):
+        await ChatProvider().classify_json("system", "user")

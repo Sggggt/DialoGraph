@@ -54,6 +54,15 @@ async def test_agent_retrieval_qa_path_uses_real_provider_metadata(db_session, s
     async def fake_rewrite(self, question, history=None):
         return question
 
+    async def fake_perceive(self, question, history=None):
+        return {
+            "intent": "definition",
+            "entities": ["degree centrality"],
+            "sub_queries": [question],
+            "needs_graph": False,
+            "suggested_strategy": "base_retrieval",
+        }
+
     async def fake_hybrid_search(db, course_id, query, filters, top_k):
         return [search_payload]
 
@@ -66,13 +75,10 @@ async def test_agent_retrieval_qa_path_uses_real_provider_metadata(db_session, s
             fallback_reason=None,
         )
 
-    async def fake_layered_search(db, course_id, query, filters, top_k, route="retrieve_notes"):
-        return [search_payload], {"layer": 2}
-
     monkeypatch.setattr(ChatProvider, "rewrite_question", fake_rewrite)
+    monkeypatch.setattr(ChatProvider, "perceive_question", fake_perceive)
     monkeypatch.setattr(ChatProvider, "answer_question_with_meta", fake_answer)
     monkeypatch.setattr(agent_graph, "hybrid_search_chunks", fake_hybrid_search)
-    monkeypatch.setattr(agent_graph, "layered_search_chunks", fake_layered_search)
 
     response = await agent_graph.run_agent(
         db_session,
@@ -122,7 +128,16 @@ async def test_related_question_in_this_course_routes_to_multi_hop(db_session, s
     async def fake_rewrite(self, question, history=None):
         return question
 
-    async def fake_graph_search(db, course_id, query, filters, top_k):
+    async def fake_perceive(self, question, history=None):
+        return {
+            "intent": "comparison",
+            "entities": ["degree centrality", "closeness centrality"],
+            "sub_queries": [question],
+            "needs_graph": True,
+            "suggested_strategy": "evidence_chain",
+        }
+
+    async def fake_hybrid_search(db, course_id, query, filters, top_k):
         return [search_payload]
 
     async def fake_answer(self, question, contexts, history=None, evidence_quality="normal"):
@@ -134,13 +149,10 @@ async def test_related_question_in_this_course_routes_to_multi_hop(db_session, s
             fallback_reason=None,
         )
 
-    async def fake_layered_search(db, course_id, query, filters, top_k, route="retrieve_notes"):
-        return [search_payload], {"layer": 3}
-
     monkeypatch.setattr(ChatProvider, "rewrite_question", fake_rewrite)
+    monkeypatch.setattr(ChatProvider, "perceive_question", fake_perceive)
     monkeypatch.setattr(ChatProvider, "answer_question_with_meta", fake_answer)
-    monkeypatch.setattr(agent_graph, "graph_enhanced_search", fake_graph_search)
-    monkeypatch.setattr(agent_graph, "layered_search_chunks", fake_layered_search)
+    monkeypatch.setattr(agent_graph, "hybrid_search_chunks", fake_hybrid_search)
 
     response = await agent_graph.run_agent(
         db_session,
@@ -158,7 +170,6 @@ async def test_retrieval_decision_skips_retrieval_for_pronoun_with_history(db_se
 
     decision = RetrievalDecision()
     state1 = {
-        "db": db_session,
         "run_id": "run-1",
         "question": "Explain it again",
         "history": [{"role": "user", "content": "What is degree centrality?"}, {"role": "assistant", "content": "It counts edges."}],
@@ -167,7 +178,6 @@ async def test_retrieval_decision_skips_retrieval_for_pronoun_with_history(db_se
     assert result["skip_retrieval"] is True
 
     state2 = {
-        "db": db_session,
         "run_id": "run-2",
         "question": "What is closeness centrality?",
         "history": [{"role": "user", "content": "What is degree centrality?"}, {"role": "assistant", "content": "It counts edges."}],
@@ -206,10 +216,10 @@ def test_route_after_corrector_routes_by_issue_type():
     assert route_after_corrector(state) == "context_synthesizer"
 
     state = {"reflection_result": {"issue_type": "insufficient_coverage"}}
-    assert route_after_corrector(state) == "retrievers"
+    assert route_after_corrector(state) == "base_retrieval"
 
     state = {"reflection_result": {"issue_type": "contradiction"}}
-    assert route_after_corrector(state) == "retrievers"
+    assert route_after_corrector(state) == "base_retrieval"
 
 
 @pytest.mark.asyncio
@@ -219,7 +229,6 @@ async def test_answer_corrector_updates_params_by_issue_type(db_session, sample_
     corrector = AnswerCorrector()
 
     state = {
-        "db": db_session,
         "run_id": "run-1",
         "question": "q",
         "rewritten_question": "q",
@@ -254,17 +263,15 @@ async def test_stream_agent_events_emits_trace_before_answer_tokens(db_session, 
 
     class FakeGraph:
         async def ainvoke(self, initial):
-            agent_graph._trace(
-                initial["db"],
+            await agent_graph._trace(
                 initial["run_id"],
                 "router",
                 output_summary="route=retrieve_notes",
             )
             await asyncio.sleep(0)
-            agent_graph._trace(
-                initial["db"],
+            await agent_graph._trace(
                 initial["run_id"],
-                "retrievers",
+                "base_retrieval",
                 output_summary="1 candidate chunks",
             )
             return {
@@ -285,7 +292,7 @@ async def test_stream_agent_events_emits_trace_before_answer_tokens(db_session, 
 
     event_types = [event["type"] for event in events]
     assert event_types.index("trace") < event_types.index("token")
-    assert [event["trace"]["node"] for event in events if event["type"] == "trace"][:2] == ["router", "retrievers"]
+    assert [event["trace"]["node"] for event in events if event["type"] == "trace"][:2] == ["router", "base_retrieval"]
 
 
 @pytest.mark.asyncio
@@ -294,7 +301,6 @@ async def test_evidence_evaluator_marks_sufficient_for_high_quality_docs(db_sess
 
     evaluator = EvidenceEvaluator()
     state = {
-        "db": db_session,
         "run_id": "run-ev-1",
         "question": "q",
         "top_k": 3,
@@ -317,7 +323,6 @@ async def test_evidence_evaluator_triggers_retry_when_insufficient(db_session, s
 
     evaluator = EvidenceEvaluator()
     state = {
-        "db": db_session,
         "run_id": "run-ev-2",
         "question": "q",
         "top_k": 3,
@@ -340,7 +345,6 @@ async def test_evidence_evaluator_sets_low_evidence_after_max_retries(db_session
 
     evaluator = EvidenceEvaluator()
     state = {
-        "db": db_session,
         "run_id": "run-ev-3",
         "question": "q",
         "top_k": 3,
@@ -360,7 +364,6 @@ async def test_evidence_evaluator_marginal_with_anchor(db_session, sample_course
 
     evaluator = EvidenceEvaluator()
     state = {
-        "db": db_session,
         "run_id": "run-ev-4",
         "question": "q",
         "top_k": 3,

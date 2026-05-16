@@ -22,7 +22,7 @@ class _FakeEmbedder:
 
 
 class _FakeChatProvider:
-    async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict):
+    async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None):
         count = max(1, user_prompt.count("\n\n---\n\n") + 1)
         return {
             "results": [
@@ -33,7 +33,7 @@ class _FakeChatProvider:
 
 
 class _ListChatProvider:
-    async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict):
+    async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict | None = None):
         return [{"summary": "List summary", "keywords": ["modularity", "community"]}]
 
 
@@ -99,6 +99,9 @@ async def test_vector_upsert_failure_keeps_old_chunks_active(db_session, sample_
         def upsert(self, points):
             raise RuntimeError("qdrant unavailable")
 
+        async def async_upsert(self, points):
+            self.upsert(points)
+
     monkeypatch.setattr(ingestion, "EmbeddingProvider", _FakeEmbedder)
     monkeypatch.setattr(ingestion, "ChatProvider", _FakeChatProvider)
     monkeypatch.setattr(ingestion, "VectorStore", FailingVectorStore)
@@ -132,17 +135,25 @@ async def test_db_activation_failure_deletes_new_vectors(db_session, sample_cour
 
     class TrackingVectorStore:
         def __init__(self, course_name=None):
-            pass
+            self._upserted = {}
 
         def upsert(self, points):
             state["after_upsert"] = True
             state["upserted"] = [point["id"] for point in points]
+            for point in points:
+                self._upserted[point["id"]] = point
 
         def delete(self, ids):
             state["deleted"].extend(ids)
 
         def get_points(self, ids):
-            return []
+            return [{"id": pid, "vector": self._upserted[pid]["vector"], "payload": self._upserted[pid]["payload"]} for pid in ids if pid in self._upserted]
+
+        async def async_upsert(self, points):
+            self.upsert(points)
+
+        async def async_delete(self, ids):
+            self.delete(ids)
 
     real_commit = db_session.commit
 
@@ -220,6 +231,12 @@ def test_pending_upsert_compensation_keeps_active_vectors(db_session, sample_cou
         def delete(self, ids):
             deleted.extend(ids)
 
+        async def async_upsert(self, points):
+            pass
+
+        async def async_delete(self, ids):
+            self.delete(ids)
+
     monkeypatch.setattr(ingestion, "VectorStore", TrackingVectorStore)
 
     assert ingestion.process_pending_vector_compensations(db_session) == 1
@@ -259,6 +276,12 @@ async def test_ingest_uses_enriched_embedding_text_and_payload_marker(db_session
 
         def delete(self, ids):
             captured["deleted"] = ids
+
+        async def async_upsert(self, points):
+            self.upsert(points)
+
+        async def async_delete(self, ids):
+            self.delete(ids)
 
     monkeypatch.setattr(ingestion, "EmbeddingProvider", CapturingEmbedder)
     monkeypatch.setattr(ingestion, "ChatProvider", _FakeChatProvider)
@@ -361,6 +384,12 @@ async def test_force_ingest_rebuilds_duplicate_document_in_same_course(db_sessio
 
         def delete(self, ids):
             self.deleted = ids
+
+        async def async_upsert(self, points):
+            self.upsert(points)
+
+        async def async_delete(self, ids):
+            self.delete(ids)
 
     monkeypatch.setattr(ingestion, "EmbeddingProvider", _FakeEmbedder)
     monkeypatch.setattr(ingestion, "ChatProvider", _FakeChatProvider)

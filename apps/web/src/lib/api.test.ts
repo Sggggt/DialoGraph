@@ -111,6 +111,43 @@ describe("api client", () => {
     );
   });
 
+  it("requires graph_type on graph requests and confirms destructive rebuilds", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ graph_type: "semantic", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {} }))
+      .mockResolvedValueOnce(jsonResponse({ graph_type: "evidence", schema_version: "typed_graph_v1", nodes: [], edges: [], node_counts: {}, edge_counts: {} }))
+      .mockResolvedValueOnce(jsonResponse({ batch_id: "batch-1", state: "extracting_graph", mode: "full" }))
+      .mockResolvedValueOnce(jsonResponse({ batch_id: null, state: "dry_run", mode: "full", dry_run: true, affected_documents: 3 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { fetchGraph, fetchChapterGraph, rebuildGraph } = await import("./api");
+
+    await fetchGraph("course-1", "semantic");
+    await fetchChapterGraph("Lecture 1", "course-1", "evidence");
+    await rebuildGraph("course-1", "full");
+    await rebuildGraph("course-1", "full", true);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://api.test/api/courses/current/graph?course_id=course-1&graph_type=semantic",
+      expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://api.test/api/graph/chapters/Lecture%201?course_id=course-1&graph_type=evidence",
+      expect.objectContaining({ cache: "no-store", headers: { "X-API-Key": "test-key" } }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "http://api.test/api/maintenance/rebuild-graph?course_id=course-1",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "full", confirm_destructive: true, dry_run: false }) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      "http://api.test/api/maintenance/rebuild-graph?course_id=course-1",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "full", confirm_destructive: false, dry_run: true }) }),
+    );
+  });
+
   it("deletes courses with API key headers", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ deleted: true }));
     vi.stubGlobal("fetch", fetchMock);

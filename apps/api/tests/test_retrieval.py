@@ -183,6 +183,9 @@ async def test_search_chunks_with_audit_reports_real_query_embedding(db_session,
             assert vector == [0.1, 0.2, 0.3]
             return [{"id": chunks[0].id, "score": 0.9}]
 
+        async def async_search(self, **kwargs):
+            return self.search(**kwargs)
+
     def fake_rerank_or_return(query, candidates, top_k):
         return candidates[:top_k]
 
@@ -216,6 +219,9 @@ async def test_search_ignores_zero_score_dense_index_and_uses_lexical(db_session
         def search(self, *, vector, limit, filters):
             return [{"id": chunk.id, "score": 0.0} for chunk in chunks]
 
+        async def async_search(self, **kwargs):
+            return self.search(**kwargs)
+
     def fake_rerank_or_return(query, candidates, top_k):
         return candidates[:top_k]
 
@@ -247,6 +253,9 @@ async def test_search_scores_include_primary_channels_for_dense_only_results(db_
 
         def search(self, *, vector, limit, filters):
             return [{"id": chunks[0].id, "score": 0.8}]
+
+        async def async_search(self, **kwargs):
+            return self.search(**kwargs)
 
     def fake_rerank_or_return(query, candidates, top_k):
         for item in candidates:
@@ -334,6 +343,9 @@ async def test_search_expands_child_result_to_parent_context(db_session, sample_
         def search(self, *, vector, limit, filters):
             assert "is_parent" not in filters
             return [{"id": child.id, "score": 0.9}]
+
+        async def async_search(self, **kwargs):
+            return self.search(**kwargs)
 
     monkeypatch.setattr(retrieval.EmbeddingProvider, "embed_texts_with_meta", fake_embed)
     monkeypatch.setattr(retrieval, "VectorStore", ChildOnlyStore)

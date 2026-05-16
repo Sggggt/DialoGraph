@@ -52,8 +52,14 @@ def model_settings_payload() -> dict:
         "embedding_model": settings.embedding_model,
         "chat_model": settings.chat_model,
         "embedding_dimensions": settings.embedding_dimensions,
-        "graph_extraction_chunk_limit": settings.graph_extraction_chunk_limit,
-        "graph_extraction_chunks_per_document": settings.graph_extraction_chunks_per_document,
+        "graph_extraction_strategy": settings.graph_extraction_strategy,
+        "graph_extraction_soft_start_budget": settings.graph_extraction_soft_start_budget or 120,
+        "graph_extraction_max_input_tokens_per_run": settings.graph_extraction_max_input_tokens_per_run,
+        "graph_extraction_max_model_calls_per_run": settings.graph_extraction_max_model_calls_per_run,
+        "graph_extraction_min_marginal_gain": settings.graph_extraction_min_marginal_gain,
+        "graph_extraction_stall_rounds": settings.graph_extraction_stall_rounds,
+        "graph_extraction_concurrency": settings.graph_extraction_concurrency,
+        "graph_extraction_resume_batch_size": settings.graph_extraction_resume_batch_size,
         "reranker_enabled": read_env_bool("RERANKER_ENABLED", settings.reranker_enabled),
         "reranker_model": read_env_str("RERANKER_MODEL", settings.reranker_model),
         "reranker_max_length": read_env_int("RERANKER_MAX_LENGTH", settings.reranker_max_length),
@@ -69,16 +75,18 @@ def model_settings_payload() -> dict:
     }
 
 
-def _serialize_env_value(value: str | int | bool) -> str:
+def _serialize_env_value(value: str | int | float | bool) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     text = str(value)
-    if not text or any(char.isspace() for char in text) or any(char in text for char in ['"', "#", "="]):
+    if not text:
+        return ""
+    if any(char.isspace() for char in text) or any(char in text for char in ['"', "#", "="]):
         return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return text
 
 
-def _update_env_file(updates: dict[str, str | int | bool | None]) -> None:
+def _update_env_file(updates: dict[str, str | int | float | bool | None]) -> None:
     ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
     lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
     remaining = {key.upper(): value for key, value in updates.items()}
@@ -112,7 +120,7 @@ def _update_env_file(updates: dict[str, str | int | bool | None]) -> None:
     ENV_PATH.write_text("\n".join(next_lines).rstrip() + "\n", encoding="utf-8")
 
 
-def _apply_runtime_env(updates: dict[str, str | int | bool | None]) -> None:
+def _apply_runtime_env(updates: dict[str, str | int | float | bool | None]) -> None:
     for key, value in updates.items():
         env_key = key.upper()
         if value is None:
@@ -295,7 +303,7 @@ def runtime_check_payload() -> dict:
 
 def update_model_settings(payload: dict) -> dict:
     normalize_env_file()
-    updates: dict[str, str | int | bool | None] = {}
+    updates: dict[str, str | int | float | bool | None] = {}
     key_map = {
         "chat_base_url": "chat_base_url",
         "embedding_base_url": "embedding_base_url",
@@ -305,32 +313,44 @@ def update_model_settings(payload: dict) -> dict:
         "embedding_model": "embedding_model",
         "chat_model": "chat_model",
         "embedding_dimensions": "embedding_dimensions",
-        "graph_extraction_chunk_limit": "graph_extraction_chunk_limit",
-        "graph_extraction_chunks_per_document": "graph_extraction_chunks_per_document",
+        "graph_extraction_strategy": "graph_extraction_strategy",
+        "graph_extraction_soft_start_budget": "graph_extraction_soft_start_budget",
+        "graph_extraction_max_input_tokens_per_run": "graph_extraction_max_input_tokens_per_run",
+        "graph_extraction_max_model_calls_per_run": "graph_extraction_max_model_calls_per_run",
+        "graph_extraction_min_marginal_gain": "graph_extraction_min_marginal_gain",
+        "graph_extraction_stall_rounds": "graph_extraction_stall_rounds",
+        "graph_extraction_concurrency": "graph_extraction_concurrency",
+        "graph_extraction_resume_batch_size": "graph_extraction_resume_batch_size",
         "reranker_enabled": "reranker_enabled",
         "reranker_model": "reranker_model",
         "reranker_max_length": "reranker_max_length",
         "semantic_chunking_enabled": "semantic_chunking_enabled",
         "semantic_chunking_min_length": "semantic_chunking_min_length",
     }
+    nullable_setting_keys = {
+        "graph_extraction_max_input_tokens_per_run",
+        "graph_extraction_max_model_calls_per_run",
+    }
     for key, env_key in key_map.items():
         if key not in payload:
             continue
         value = payload.get(key)
         if key in {"chat_resolve_ip", "embedding_resolve_ip"} and (value is None or (isinstance(value, str) and not value.strip())):
+            updates[env_key] = ""
+        elif key in nullable_setting_keys and value is None:
             updates[env_key] = None
         elif value is not None:
             updates[env_key] = value.strip() if isinstance(value, str) else value
 
     api_key = payload.get("api_key")
     if payload.get("clear_api_key"):
-        updates["openai_api_key"] = None
+        updates["openai_api_key"] = ""
     elif isinstance(api_key, str) and api_key.strip():
         updates["openai_api_key"] = api_key.strip()
 
     embedding_api_key = payload.get("embedding_api_key")
     if payload.get("clear_embedding_api_key"):
-        updates["embedding_api_key"] = None
+        updates["embedding_api_key"] = ""
     elif isinstance(embedding_api_key, str) and embedding_api_key.strip():
         updates["embedding_api_key"] = embedding_api_key.strip()
 

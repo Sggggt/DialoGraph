@@ -77,7 +77,7 @@ def build_engine():
 
 
 engine = build_engine()
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 
 
 SCHEMA_PATCHES: dict[str, dict[str, str]] = {
@@ -98,6 +98,7 @@ SCHEMA_PATCHES: dict[str, dict[str, str]] = {
         "centrality_json": "JSON DEFAULT '{}'",
         "graph_rank_score": "FLOAT DEFAULT 0",
         "source_document_ids": "JSON DEFAULT '[]'",
+        "quality_json": "JSON DEFAULT '{}'",
     },
     "concept_relations": {
         "confidence": "FLOAT DEFAULT 0.55",
@@ -137,6 +138,36 @@ SCHEMA_PATCHES: dict[str, dict[str, str]] = {
         "scores": "JSON DEFAULT '{}'",
         "duration_ms": "INTEGER DEFAULT 0",
         "error_message": "TEXT",
+    },
+    "quality_profiles": {
+        "sample_chunk_ids": "JSON DEFAULT '[]'",
+        "is_active": "BOOLEAN DEFAULT true",
+    },
+    "graph_relation_candidates": {
+        "decision_json": "JSON DEFAULT '{}'",
+        "metadata_json": "JSON DEFAULT '{}'",
+        "source_document_ids": "JSON DEFAULT '[]'",
+    },
+    "graph_community_summaries": {
+        "key_concepts_json": "JSON DEFAULT '[]'",
+        "representative_chunk_ids": "JSON DEFAULT '[]'",
+        "source_document_ids": "JSON DEFAULT '[]'",
+        "quality_json": "JSON DEFAULT '{}'",
+        "is_active": "BOOLEAN DEFAULT true",
+    },
+    "graph_extraction_runs": {
+        "coverage_json": "JSON DEFAULT '{}'",
+        "budget_json": "JSON DEFAULT '{}'",
+        "stats_json": "JSON DEFAULT '{}'",
+        "error_message": "TEXT",
+        "started_at": "DATETIME",
+        "completed_at": "DATETIME",
+    },
+    "graph_extraction_chunk_tasks": {
+        "selected_reason": "JSON DEFAULT '{}'",
+        "payload_json": "JSON",
+        "error_message": "TEXT",
+        "token_estimate": "INTEGER DEFAULT 0",
     },
 }
 

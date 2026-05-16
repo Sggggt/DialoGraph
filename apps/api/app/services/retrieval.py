@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Any
 
 from rank_bm25 import BM25Okapi
 from sqlalchemy import or_, select
@@ -10,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.utils import source_type_from_path
 from app.core.config import get_settings
-from app.models import Chunk, Concept, ConceptRelation, Course, Document, DocumentVersion, IngestionBatch, IngestionJob
+from app.models import Chunk, Concept, ConceptRelation, Course, Document, DocumentVersion, GraphCommunitySummary, IngestionBatch, IngestionJob
 from app.schemas import Citation, SearchFilters
 from app.services.concept_graph import get_graph_payload
 from app.services.cache_manager import get_cache_manager
@@ -48,22 +50,10 @@ QUERY_TYPE_CONFIG = {
     "procedure": {"alpha": 0.75, "recall_k": 60},
     "default": {"alpha": 0.72, "recall_k": 64},
 }
-RETRIEVAL_LAYER_CONFIG = {
-    ("definition", "retrieve_notes"): 1,
-    ("formula", "retrieve_notes"): 1,
-    ("definition", "retrieve_both"): 1,
-    ("formula", "retrieve_both"): 1,
-    ("example", "retrieve_notes"): 2,
-    ("example", "retrieve_both"): 2,
-    ("procedure", "retrieve_notes"): 2,
-    ("procedure", "retrieve_both"): 2,
-    ("comparison", "multi_hop_research"): 3,
-    ("default", "multi_hop_research"): 3,
-    ("comparison", "retrieve_both"): 3,
-    ("default", "retrieve_notes"): 2,
-    ("default", "retrieve_both"): 2,
-}
 PRIMARY_SCORE_KEYS = ("dense", "lexical", "fused", "rerank", "lightweight_rerank", "term_overlap_ratio")
+UNVERIFIED_GRAPH_SOURCES = {"semantic_sparse", "dijkstra_inferred"}
+EVIDENCE_FIRST_MAX_ANCHORS = 4
+EVIDENCE_FIRST_MAX_PATHS = 8
 
 
 def should_include_storage_file(path: Path) -> bool:
@@ -271,7 +261,7 @@ def build_search_payload(chunk: Chunk, document: Document, query: str, score: fl
 
 
 async def dense_search_chunks(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int, model_audit: dict | None = None) -> list[dict]:
-    course = db.get(Course, course_id)
+    course = await asyncio.to_thread(db.get, Course, course_id)
     if course is None:
         return []
     embedder = EmbeddingProvider()
@@ -293,7 +283,7 @@ async def dense_search_chunks(db: Session, course_id: str, query: str, filters: 
             }
         )
     vector_store = VectorStore(course_name=course.name)
-    results = vector_store.search(
+    results = await vector_store.async_search(
         vector=embedding_result.vectors[0],
         limit=max(top_k * 3, top_k),
         filters={
@@ -306,10 +296,10 @@ async def dense_search_chunks(db: Session, course_id: str, query: str, filters: 
     payloads = []
     dense_scores: list[float] = []
     for result in results:
-        chunk = db.get(Chunk, result["id"])
-        if chunk is None or chunk.course_id != course_id or not chunk.is_active or not is_child_retrieval_candidate(chunk, db):
+        chunk = await asyncio.to_thread(db.get, Chunk, result["id"])
+        if chunk is None or chunk.course_id != course_id or not chunk.is_active or not await asyncio.to_thread(is_child_retrieval_candidate, chunk, db):
             continue
-        document = db.get(Document, chunk.document_id)
+        document = await asyncio.to_thread(db.get, Document, chunk.document_id)
         if document is None or document.course_id != course_id:
             continue
         if filters.tags and not set(filters.tags).intersection(set(document.tags or [])):
@@ -458,68 +448,258 @@ def weighted_score_fusion(dense_results: list[dict], lexical_results: list[dict]
     return ranked[:top_n]
 
 
-async def graph_enhanced_search(db: Session, course_id: str, query: str, filters: SearchFilters, top_k: int) -> list[dict]:
-    base_results = await hybrid_search_chunks(db, course_id, query, filters, top_k)
+def is_verified_graph_relation(relation: ConceptRelation) -> bool:
+    metadata = relation.metadata_json or {}
+    if metadata.get("candidate_only"):
+        return False
+    if relation.relation_source in UNVERIFIED_GRAPH_SOURCES:
+        return False
+    if relation.relation_type == "related_to" and (
+        not relation.is_validated or float(relation.weight or 0.0) < 0.75
+    ):
+        return False
+    if not relation.evidence_chunk_id:
+        return False
+    endpoint_match = bool(metadata.get("evidence_source_match") and metadata.get("evidence_target_match"))
+    return endpoint_match or bool(relation.is_validated)
+
+
+def _result_score(item: dict) -> float:
+    scores = item.get("metadata", {}).get("scores", {})
+    for key in ("rerank", "cross_encoder", "fused", "dense", "bm25"):
+        value = scores.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    try:
+        return float(item.get("score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _mark_result(item: dict, **metadata: Any) -> dict:
+    result = dict(item)
+    result["metadata"] = dict(item.get("metadata") or {})
+    result["metadata"]["scores"] = dict(result["metadata"].get("scores") or {})
+    result["metadata"].update({key: value for key, value in metadata.items() if value is not None})
+    return result
+
+
+def select_evidence_anchors(db: Session, course_id: str, base_results: list[dict], *, max_anchors: int = EVIDENCE_FIRST_MAX_ANCHORS) -> tuple[list[dict], dict]:
     if not base_results:
-        return []
-    merged = {item["chunk_id"]: item for item in base_results}
-    base_chunk_ids = list(merged)
-    seed_relations = db.scalars(
+        return [], {"anchor_count": 0, "candidate_count": 0}
+    chunk_ids = [str(item["chunk_id"]) for item in base_results if item.get("chunk_id")]
+    relations = db.scalars(
         select(ConceptRelation).where(
             ConceptRelation.course_id == course_id,
-            ConceptRelation.evidence_chunk_id.in_(base_chunk_ids),
+            ConceptRelation.evidence_chunk_id.in_(chunk_ids),
         )
-    ).all()
-    concept_ids = {
-        concept_id
-        for relation in seed_relations
-        for concept_id in (relation.source_concept_id, relation.target_concept_id)
-        if concept_id
-    }
-    if not concept_ids:
-        return base_results
+    ).all() if chunk_ids else []
+    verified_by_chunk: dict[str, list[ConceptRelation]] = defaultdict(list)
+    for relation in relations:
+        if is_verified_graph_relation(relation):
+            verified_by_chunk[str(relation.evidence_chunk_id)].append(relation)
 
-    neighbor_relations = db.scalars(
-        select(ConceptRelation).where(
-            ConceptRelation.course_id == course_id,
-            or_(
-                ConceptRelation.source_concept_id.in_(concept_ids),
-                ConceptRelation.target_concept_id.in_(concept_ids),
-            ),
-        )
-    ).all()
-    evidence_ids = {relation.evidence_chunk_id for relation in neighbor_relations if relation.evidence_chunk_id}
-    evidence_ids.difference_update(base_chunk_ids)
-    if not evidence_ids:
-        return base_results
-
-    related_concept_ids = {
-        concept_id
-        for relation in neighbor_relations
-        for concept_id in (relation.source_concept_id, relation.target_concept_id)
-        if concept_id
-    }
-    concepts = {
-        concept.id: concept
-        for concept in db.scalars(select(Concept).where(Concept.id.in_(related_concept_ids))).all()
-    }
-    boost_by_chunk: dict[str, float] = {}
-    for relation in neighbor_relations:
-        if not relation.evidence_chunk_id:
+    scored: list[tuple[float, dict]] = []
+    for item in base_results:
+        chunk_id = str(item.get("chunk_id") or "")
+        metadata = item.get("metadata") or {}
+        quality_action = metadata.get("quality_action")
+        routes = metadata.get("route_eligibility") or {}
+        relations_for_chunk = verified_by_chunk.get(chunk_id, [])
+        base_score = _result_score(item)
+        quality_bonus = 0.0
+        if routes.get("graph_extraction") or quality_action == "graph_candidate":
+            quality_bonus = 0.08
+        elif routes.get("retrieval") or quality_action == "retrieval_candidate":
+            quality_bonus = 0.05
+        elif routes.get("evidence_only") or quality_action == "evidence_only":
+            quality_bonus = 0.02
+        relation_bonus = min(0.18, 0.06 * len(relations_for_chunk))
+        anchor_score = base_score + quality_bonus + relation_bonus
+        if base_score <= 0 and not relations_for_chunk:
             continue
-        source = concepts.get(relation.source_concept_id)
-        target = concepts.get(relation.target_concept_id or "")
-        importance = max(float(getattr(source, "importance_score", 0.0) or 0.0), float(getattr(target, "importance_score", 0.0) or 0.0))
-        boost = float(relation.confidence or 0.0) * importance
-        boost_by_chunk[relation.evidence_chunk_id] = max(boost_by_chunk.get(relation.evidence_chunk_id, 0.0), boost)
+        concept_ids = sorted(
+            {
+                concept_id
+                for relation in relations_for_chunk
+                for concept_id in (relation.source_concept_id, relation.target_concept_id)
+                if concept_id
+            }
+        )
+        scored.append(
+            (
+                anchor_score,
+                _mark_result(
+                    item,
+                    retrieval_stage="evidence_anchor_selector",
+                    evidence_role="base_anchor",
+                    anchor_score=round(anchor_score, 4),
+                    anchor_concept_ids=concept_ids,
+                    graph_verified=bool(relations_for_chunk),
+                    evidence_support_reason="base_retrieval_high_score" if not relations_for_chunk else "base_retrieval_verified_relation",
+                ),
+            )
+        )
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    anchors = [item for _score, item in scored[:max_anchors]]
+    return anchors, {
+        "anchor_count": len(anchors),
+        "candidate_count": len(base_results),
+        "verified_anchor_relations": sum(len(verified_by_chunk.get(str(item.get("chunk_id")), [])) for item in anchors),
+    }
+
+
+def _load_verified_relations(db: Session, course_id: str, concept_ids: set[str], depth: int) -> list[ConceptRelation]:
+    if not concept_ids:
+        return []
+    frontier = set(concept_ids)
+    seen = set(concept_ids)
+    relations: list[ConceptRelation] = []
+    for _ in range(max(1, depth)):
+        batch = db.scalars(
+            select(ConceptRelation).where(
+                ConceptRelation.course_id == course_id,
+                or_(
+                    ConceptRelation.source_concept_id.in_(frontier),
+                    ConceptRelation.target_concept_id.in_(frontier),
+                ),
+            )
+        ).all()
+        next_frontier: set[str] = set()
+        for relation in batch:
+            if not is_verified_graph_relation(relation):
+                continue
+            relations.append(relation)
+            for concept_id in (relation.source_concept_id, relation.target_concept_id):
+                if concept_id and concept_id not in seen:
+                    seen.add(concept_id)
+                    next_frontier.add(concept_id)
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    unique: dict[str, ConceptRelation] = {}
+    for relation in relations:
+        unique[relation.id] = relation
+    return list(unique.values())
+
+
+def plan_evidence_chains(
+    db: Session,
+    course_id: str,
+    anchors: list[dict],
+    *,
+    query_type: str,
+    community_ids: list[int] | None = None,
+) -> tuple[list[dict], dict]:
+    anchor_concepts = {
+        concept_id
+        for anchor in anchors
+        for concept_id in (anchor.get("metadata", {}).get("anchor_concept_ids") or [])
+        if isinstance(concept_id, str)
+    }
+    max_depth = 3 if query_type in {"comparison", "procedure", "formula"} else 2
+    relations = _load_verified_relations(db, course_id, anchor_concepts, max_depth) if anchor_concepts else []
+    adjacency: dict[str, list[ConceptRelation]] = defaultdict(list)
+    for relation in relations:
+        adjacency[relation.source_concept_id].append(relation)
+        if relation.target_concept_id:
+            adjacency[relation.target_concept_id].append(relation)
+
+    paths: list[dict] = []
+    seen_relation_paths: set[tuple[str, ...]] = set()
+    for seed in sorted(anchor_concepts):
+        queue: list[tuple[str, list[ConceptRelation]]] = [(seed, [])]
+        visited = {seed}
+        while queue and len(paths) < EVIDENCE_FIRST_MAX_PATHS:
+            current, path_relations = queue.pop(0)
+            if len(path_relations) >= max_depth:
+                continue
+            for relation in sorted(adjacency.get(current, []), key=lambda item: float(item.weight or item.confidence or 0.0), reverse=True):
+                other = relation.target_concept_id if relation.source_concept_id == current else relation.source_concept_id
+                if not other or other in visited:
+                    continue
+                next_path = [*path_relations, relation]
+                visited.add(other)
+                queue.append((other, next_path))
+                if next_path:
+                    relation_key = tuple(sorted(item.id for item in next_path))
+                    if relation_key in seen_relation_paths:
+                        continue
+                    seen_relation_paths.add(relation_key)
+                    path_id = f"path-{len(paths) + 1}"
+                    paths.append(
+                        {
+                            "path_id": path_id,
+                            "concept_ids": [seed, other],
+                            "relation_ids": [item.id for item in next_path],
+                            "evidence_chunk_ids": [str(item.evidence_chunk_id) for item in next_path if item.evidence_chunk_id],
+                            "relation_types": [item.relation_type for item in next_path],
+                            "score": round(sum(float(item.weight or item.confidence or 0.0) for item in next_path) / len(next_path), 4),
+                        }
+                    )
+                if len(paths) >= EVIDENCE_FIRST_MAX_PATHS:
+                    break
+
+    community_ids = [int(item) for item in community_ids or [] if item is not None]
+    community_summaries = []
+    if community_ids:
+        community_summaries = db.scalars(
+            select(GraphCommunitySummary).where(
+                GraphCommunitySummary.course_id == course_id,
+                GraphCommunitySummary.algorithm == "louvain",
+                GraphCommunitySummary.community_id.in_(community_ids),
+                GraphCommunitySummary.is_active.is_(True),
+            )
+        ).all()
+    for summary in community_summaries:
+        paths.append(
+            {
+                "path_id": f"community-{summary.community_id}",
+                "community_id": summary.community_id,
+                "relation_ids": [],
+                "evidence_chunk_ids": list(summary.representative_chunk_ids or [])[:3],
+                "relation_types": ["community_summary"],
+                "score": 0.55,
+            }
+        )
+
+    return paths[:EVIDENCE_FIRST_MAX_PATHS], {
+        "planned_paths": min(len(paths), EVIDENCE_FIRST_MAX_PATHS),
+        "verified_edges": len(relations),
+        "community_summaries": len(community_summaries),
+        "max_depth": max_depth,
+        "skipped_reason": None if paths else "no_anchor_concepts_or_communities",
+    }
+
+
+def controlled_graph_enhancement(
+    db: Session,
+    course_id: str,
+    query: str,
+    filters: SearchFilters,
+    base_chunk_ids: set[str],
+    paths: list[dict],
+) -> tuple[list[dict], dict]:
+    evidence_by_chunk: dict[str, dict] = {}
+    for path in paths:
+        for chunk_id in path.get("evidence_chunk_ids", []):
+            if not chunk_id or chunk_id in base_chunk_ids:
+                continue
+            evidence_by_chunk.setdefault(str(chunk_id), path)
+    if not evidence_by_chunk:
+        return [], {"graph_enhanced_chunks": 0, "path_evidence_chunks": 0}
 
     chunks = db.scalars(
         select(Chunk).where(
-            Chunk.id.in_(evidence_ids),
+            Chunk.id.in_(list(evidence_by_chunk)),
             Chunk.course_id == course_id,
             Chunk.is_active.is_(True),
         )
     ).all()
+    enhanced: list[dict] = []
     for chunk in chunks:
         document = db.get(Document, chunk.document_id)
         if document is None or document.course_id != course_id or not document.is_active:
@@ -530,390 +710,120 @@ async def graph_enhanced_search(db: Session, course_id: str, query: str, filters
             continue
         if filters.tags and not set(filters.tags).intersection(set(document.tags or [])):
             continue
-        graph_boost = boost_by_chunk.get(chunk.id, 0.0)
-        item = build_search_payload(chunk, document, query, graph_boost, {"graph_boost": graph_boost})
-        item["metadata"]["graph_expanded"] = True
-        merged[chunk.id] = item
-
-    for item in merged.values():
-        scores = item.setdefault("metadata", {}).setdefault("scores", {})
-        if "graph_boost" in scores:
-            item["score"] = float(item["score"]) + float(scores["graph_boost"])
-    ranked = sorted(merged.values(), key=lambda item: item["score"], reverse=True)[:top_k]
-    return expand_results_with_parent_context(db, course_id, ranked)
-
-
-async def graph_enhanced_search_v2(
-    db: Session,
-    course_id: str,
-    query: str,
-    filters: SearchFilters,
-    top_k: int,
-    query_type: str = "default",
-) -> list[dict]:
-    """Graph-enhanced search with centrality boost, community aggregation, and Dijkstra path expansion."""
-    base_results = await hybrid_search_chunks(db, course_id, query, filters, top_k)
-    if not base_results:
-        return []
-    merged = {item["chunk_id"]: item for item in base_results}
-    base_chunk_ids = list(merged)
-
-    seed_relations = db.scalars(
-        select(ConceptRelation).where(
-            ConceptRelation.course_id == course_id,
-            ConceptRelation.evidence_chunk_id.in_(base_chunk_ids),
+        path = evidence_by_chunk[str(chunk.id)]
+        item = build_search_payload(
+            chunk,
+            document,
+            query,
+            float(path.get("score", 0.0)),
+            {"graph_path": float(path.get("score", 0.0))},
         )
-    ).all()
-    seed_concept_ids = {
-        concept_id
-        for relation in seed_relations
-        for concept_id in (relation.source_concept_id, relation.target_concept_id)
-        if concept_id
-    }
-    if not seed_concept_ids:
-        return base_results
-
-    concepts = {
-        concept.id: concept
-        for concept in db.scalars(select(Concept).where(Concept.course_id == course_id)).all()
-    }
-    seed_concepts = {cid: concepts[cid] for cid in seed_concept_ids if cid in concepts}
-
-    # Determine relation type priority based on query
-    relation_priority: set[str] = set()
-    if query_type == "comparison":
-        relation_priority = {"compares", "relates_to", "contrasts_with"}
-    elif query_type == "definition":
-        relation_priority = {"defines", "example_of"}
-    elif query_type == "procedure":
-        relation_priority = {"solves", "extends", "prerequisite_of"}
-
-    neighbor_relations = db.scalars(
-        select(ConceptRelation).where(
-            ConceptRelation.course_id == course_id,
-            or_(
-                ConceptRelation.source_concept_id.in_(seed_concept_ids),
-                ConceptRelation.target_concept_id.in_(seed_concept_ids),
-            ),
-        )
-    ).all()
-
-    # Centrality and community boost
-    boost_by_chunk: dict[str, float] = {}
-    boost_by_concept: dict[str, float] = {}
-    for relation in neighbor_relations:
-        if not relation.evidence_chunk_id:
-            continue
-        source = concepts.get(relation.source_concept_id)
-        target = concepts.get(relation.target_concept_id or "")
-        source_imp = float(getattr(source, "importance_score", 0.0) or 0.0)
-        target_imp = float(getattr(target, "importance_score", 0.0) or 0.0)
-        source_cent = float((getattr(source, "centrality_json", {}) or {}).get("centrality_score", 0.0))
-        target_cent = float((getattr(target, "centrality_json", {}) or {}).get("centrality_score", 0.0))
-        importance = max(source_imp, target_imp)
-        centrality = max(source_cent, target_cent)
-
-        # Relation type boost
-        type_boost = 1.3 if relation_priority and relation.relation_type in relation_priority else 1.0
-
-        # Community aggregation: boost if source or target shares community with seed
-        community_boost = 1.0
-        seed_communities: set[int] = set()
-        for sc in seed_concepts.values():
-            if sc.community_louvain is not None:
-                seed_communities.add(sc.community_louvain)
-        if source and source.community_louvain in seed_communities:
-            community_boost = 1.15
-        if target and target.community_louvain in seed_communities:
-            community_boost = 1.15
-
-        boost = float(relation.confidence or 0.0) * importance * (1.0 + centrality) * type_boost * community_boost
-        boost_by_chunk[relation.evidence_chunk_id] = max(boost_by_chunk.get(relation.evidence_chunk_id, 0.0), boost)
-        for cid in (relation.source_concept_id, relation.target_concept_id):
-            if cid:
-                boost_by_concept[cid] = max(boost_by_concept.get(cid, 0.0), boost)
-
-    # Dijkstra path expansion for multi-hop (2-3 hops between seed concepts)
-    try:
-        import networkx as nx
-
-        G = nx.Graph()
-        all_relations = db.scalars(select(ConceptRelation).where(ConceptRelation.course_id == course_id)).all()
-        for rel in all_relations:
-            if rel.source_concept_id and rel.target_concept_id:
-                w = float(rel.weight or rel.confidence or 0.1)
-                G.add_edge(rel.source_concept_id, rel.target_concept_id, weight=1.0 / (0.05 + w))
-        for source_id in seed_concept_ids:
-            for target_id in seed_concept_ids:
-                if source_id >= target_id:
-                    continue
-                if nx.has_path(G, source_id, target_id):
-                    try:
-                        path = nx.shortest_path(G, source_id, target_id, weight="weight")
-                        if 3 <= len(path) <= 4:  # 2-3 hops
-                            path_boost = max(boost_by_concept.get(source_id, 0.5), boost_by_concept.get(target_id, 0.5)) * 0.6
-                            for node_id in path[1:-1]:
-                                # Add evidence chunks from path intermediates
-                                node_rels = db.scalars(
-                                    select(ConceptRelation).where(
-                                        ConceptRelation.course_id == course_id,
-                                        or_(
-                                            ConceptRelation.source_concept_id == node_id,
-                                            ConceptRelation.target_concept_id == node_id,
-                                        ),
-                                    )
-                                ).all()
-                                for nr in node_rels:
-                                    if nr.evidence_chunk_id and nr.evidence_chunk_id not in base_chunk_ids:
-                                        boost_by_chunk[nr.evidence_chunk_id] = max(
-                                            boost_by_chunk.get(nr.evidence_chunk_id, 0.0),
-                                            path_boost,
-                                        )
-                    except (nx.NetworkXNoPath, nx.NodeNotFound):
-                        pass
-    except Exception:
-        pass
-
-    evidence_ids = {cid for cid in boost_by_chunk if cid not in base_chunk_ids}
-    if evidence_ids:
-        chunks = db.scalars(
-            select(Chunk).where(
-                Chunk.id.in_(evidence_ids),
-                Chunk.course_id == course_id,
-                Chunk.is_active.is_(True),
+        enhanced.append(
+            _mark_result(
+                item,
+                retrieval_stage="controlled_graph_enhancer",
+                evidence_role="path_edge" if path.get("relation_ids") else "community_summary",
+                path_id=path.get("path_id"),
+                relation_id=(path.get("relation_ids") or [None])[0],
+                relation_type=(path.get("relation_types") or [None])[0],
+                graph_verified=bool(path.get("relation_ids")),
+                community_id=path.get("community_id"),
+                evidence_support_reason="verified_graph_path" if path.get("relation_ids") else "community_summary_representative_chunk",
             )
-        ).all()
-        for chunk in chunks:
-            document = db.get(Document, chunk.document_id)
-            if document is None or document.course_id != course_id or not document.is_active:
-                continue
-            if filters.chapter and chunk.chapter != filters.chapter:
-                continue
-            if filters.source_type and chunk.source_type != filters.source_type:
-                continue
-            if filters.tags and not set(filters.tags).intersection(set(document.tags or [])):
-                continue
-            graph_boost = boost_by_chunk.get(chunk.id, 0.0)
-            item = build_search_payload(chunk, document, query, graph_boost, {"graph_boost": graph_boost, "graph_expanded": True})
-            merged[chunk.id] = item
-
-    for item in merged.values():
-        scores = item.setdefault("metadata", {}).setdefault("scores", {})
-        if "graph_boost" in scores:
-            item["score"] = float(item["score"]) + float(scores["graph_boost"])
-    ranked = sorted(merged.values(), key=lambda item: item["score"], reverse=True)[:top_k]
-    return expand_results_with_parent_context(db, course_id, ranked)
+        )
+    return expand_results_with_parent_context(db, course_id, enhanced), {
+        "graph_enhanced_chunks": len(enhanced),
+        "path_evidence_chunks": len(evidence_by_chunk),
+    }
 
 
-def select_retrieval_layer(query_type: str, route: str) -> int:
-    return RETRIEVAL_LAYER_CONFIG.get((query_type, route), 2)
+def assemble_evidence_documents(base_results: list[dict], anchors: list[dict], graph_results: list[dict], top_k: int) -> tuple[list[dict], dict]:
+    anchor_by_id = {str(item["chunk_id"]): item for item in anchors}
+    merged: dict[str, dict] = {}
+    for item in base_results:
+        chunk_id = str(item["chunk_id"])
+        role = "base_anchor" if chunk_id in anchor_by_id else "base_candidate"
+        source_item = anchor_by_id.get(chunk_id, item)
+        merged[chunk_id] = _mark_result(
+            source_item,
+            retrieval_stage="evidence_assembler",
+            evidence_role=source_item.get("metadata", {}).get("evidence_role") or role,
+            graph_verified=bool(source_item.get("metadata", {}).get("graph_verified")),
+            evidence_support_reason=source_item.get("metadata", {}).get("evidence_support_reason") or "base_retrieval",
+        )
+    for item in graph_results:
+        chunk_id = str(item["chunk_id"])
+        current = merged.get(chunk_id)
+        if current is None or _result_score(item) > _result_score(current):
+            merged[chunk_id] = _mark_result(item, retrieval_stage="evidence_assembler")
+    documents = sorted(merged.values(), key=_result_score, reverse=True)[: max(top_k * 2, top_k)]
+    return documents, {
+        "assembled_documents": len(documents),
+        "base_documents": len(base_results),
+        "anchor_documents": len(anchors),
+        "graph_documents": len(graph_results),
+    }
 
 
-async def layered_search_chunks(
+async def evidence_first_search_chunks_with_audit(
     db: Session,
     course_id: str,
     query: str,
     filters: SearchFilters,
     top_k: int,
     route: str = "retrieve_notes",
-    use_cache: bool = True,
+    community_ids: list[int] | None = None,
 ) -> tuple[list[dict], dict]:
-    """Layered retrieval entry point with caching and query-type-aware depth selection."""
     config = query_type_config(query)
-    query_type = config["query_type"]
-    layer = select_retrieval_layer(query_type, route)
-    cache = get_cache_manager()
-    filters_hash = f"{filters.chapter or ''}:{filters.source_type or ''}:{','.join(filters.tags or [])}"
-    embedding_version = "contextual_enriched_v2"
-
-    if use_cache:
-        cached = cache.get_search_results(course_id, query, filters_hash, embedding_version)
-        if cached is not None:
-            return cached, {"cached": True, "layer": layer}
-
-    if layer == 1:
-        # Fast: dense only
-        model_audit = default_model_audit()
-        results = await dense_search_chunks(db, course_id, query, filters, top_k, model_audit)
-        results = expand_results_with_parent_context(db, course_id, results)
-        results = attach_model_audit(results, model_audit)
-    elif layer == 3:
-        # Deep graph: hybrid + graph v2
-        results = await graph_enhanced_search_v2(db, course_id, query, filters, top_k, query_type)
-    else:
-        # Standard hybrid
-        results, _ = await hybrid_search_chunks_with_audit(db, course_id, query, filters, top_k)
-
-    if use_cache and results:
-        cache.set_search_results(course_id, query, filters_hash, embedding_version, results)
-    return results, {"layer": layer, "query_type": query_type}
-
-
-async def local_graph_search(
-    db: Session,
-    course_id: str,
-    query: str,
-    filters: SearchFilters,
-    top_k: int,
-    seed_concept_ids: list[str],
-) -> list[dict]:
-    """Retrieve chunks centered around seed concepts and their 1-hop neighbors."""
-    from app.models import Concept, ConceptRelation
-
-    # 1. Get seed concept evidence chunks
-    seed_chunks = db.scalars(
-        select(Chunk)
-        .join(ConceptRelation, Chunk.id == ConceptRelation.evidence_chunk_id)
-        .where(
-            Chunk.course_id == course_id,
-            Chunk.is_active.is_(True),
-            or_(
-                ConceptRelation.source_concept_id.in_(seed_concept_ids),
-                ConceptRelation.target_concept_id.in_(seed_concept_ids),
-            ),
+    recall_k = max(top_k * 3, int(config["recall_k"]))
+    base_results, model_audit = await hybrid_search_chunks_with_audit(db, course_id, query, filters, recall_k)
+    base_results = [
+        _mark_result(item, retrieval_stage="base_retrieval", evidence_role="base_candidate", graph_verified=False)
+        for item in base_results
+    ]
+    anchors, anchor_audit = select_evidence_anchors(db, course_id, base_results)
+    should_plan_graph = route == "multi_hop_research" or config["query_type"] in {"comparison", "procedure", "formula"} or bool(community_ids)
+    paths: list[dict] = []
+    path_audit = {"planned_paths": 0, "verified_edges": 0, "skipped_reason": "simple_query"}
+    graph_results: list[dict] = []
+    graph_audit = {"graph_enhanced_chunks": 0, "path_evidence_chunks": 0}
+    if should_plan_graph and anchors:
+        paths, path_audit = plan_evidence_chains(
+            db,
+            course_id,
+            anchors,
+            query_type=config["query_type"],
+            community_ids=community_ids,
         )
-        .distinct()
-    ).all()
-
-    # 2. Get neighbor concept evidence chunks
-    neighbor_relations = db.scalars(
-        select(ConceptRelation).where(
-            ConceptRelation.course_id == course_id,
-            or_(
-                ConceptRelation.source_concept_id.in_(seed_concept_ids),
-                ConceptRelation.target_concept_id.in_(seed_concept_ids),
-            ),
+        graph_results, graph_audit = controlled_graph_enhancement(
+            db,
+            course_id,
+            query,
+            filters,
+            {str(item["chunk_id"]) for item in base_results},
+            paths,
         )
-    ).all()
-    neighbor_concept_ids = {
-        rel.target_concept_id if rel.source_concept_id in set(seed_concept_ids) else rel.source_concept_id
-        for rel in neighbor_relations
-        if rel.target_concept_id and rel.source_concept_id
+    documents, assembly_audit = assemble_evidence_documents(base_results, anchors, graph_results, top_k)
+    evidence_audit = {
+        **model_audit,
+        "retrieval_pipeline": "evidence_first_v1",
+        "query_type": config["query_type"],
+        "route": route,
+        "base_candidate_count": len(base_results),
+        "anchors": anchor_audit,
+        "paths": path_audit,
+        "graph": graph_audit,
+        "assembly": assembly_audit,
+        "community_ids": community_ids or [],
     }
-    neighbor_chunks = []
-    if neighbor_concept_ids:
-        neighbor_chunks = db.scalars(
-            select(Chunk)
-            .join(ConceptRelation, Chunk.id == ConceptRelation.evidence_chunk_id)
-            .where(
-                Chunk.course_id == course_id,
-                Chunk.is_active.is_(True),
-                or_(
-                    ConceptRelation.source_concept_id.in_(list(neighbor_concept_ids)),
-                    ConceptRelation.target_concept_id.in_(list(neighbor_concept_ids)),
-                ),
-            )
-            .distinct()
-        ).all()
-
-    # 3. Also do a base dense recall and merge
-    base_results, _ = await hybrid_search_chunks_with_audit(db, course_id, query, filters, top_k)
-    base_ids = {r["chunk_id"] for r in base_results}
-
-    # 4. Build result set: seed chunks get highest score, neighbor next, base dense fills remaining
-    result_map: dict[str, dict] = {}
-    for chunk in seed_chunks:
-        if not is_child_retrieval_candidate(chunk, db):
-            continue
-        result_map[str(chunk.id)] = chunk_to_result(chunk, score=1.0, source="local_graph_seed")
-    for chunk in neighbor_chunks:
-        if not is_child_retrieval_candidate(chunk, db):
-            continue
-        cid = str(chunk.id)
-        if cid not in result_map:
-            result_map[cid] = chunk_to_result(chunk, score=0.8, source="local_graph_neighbor")
-
-    # Add base dense results with lower priority
-    for result in base_results:
-        cid = result["chunk_id"]
-        if cid not in result_map:
-            result_map[cid] = {**result, "source": "local_graph_dense"}
-        else:
-            # Boost if also in dense results
-            existing = result_map[cid]
-            existing["score"] = max(existing.get("score", 0.0), result.get("score", 0.0)) + 0.1
-
-    results = sorted(result_map.values(), key=lambda x: x.get("score", 0.0), reverse=True)[:top_k]
-    return expand_results_with_parent_context(db, course_id, results)
-
-
-async def community_search_chunks(
-    db: Session,
-    course_id: str,
-    query: str,
-    filters: SearchFilters,
-    top_k: int,
-    community_ids: list[int],
-) -> list[dict]:
-    """Retrieve chunks from concepts within specified communities, blended with dense recall."""
-    from app.models import Concept
-
-    community_concepts = db.scalars(
-        select(Concept).where(
-            Concept.course_id == course_id,
-            Concept.community_louvain.in_(community_ids),
-        )
-    ).all()
-    concept_ids = {c.id for c in community_concepts}
-
-    # Get evidence chunks from community concepts
-    community_chunk_ids: set[str] = set()
-    if concept_ids:
-        from app.models import ConceptRelation
-        relations = db.scalars(
-            select(ConceptRelation).where(
-                ConceptRelation.course_id == course_id,
-                or_(
-                    ConceptRelation.source_concept_id.in_(concept_ids),
-                    ConceptRelation.target_concept_id.in_(concept_ids),
-                ),
-            )
-        ).all()
-        community_chunk_ids = {str(r.evidence_chunk_id) for r in relations if r.evidence_chunk_id}
-
-    # Base dense recall
-    base_results, _ = await hybrid_search_chunks_with_audit(db, course_id, query, filters, top_k)
-
-    # Boost community chunks
-    result_map: dict[str, dict] = {}
-    for result in base_results:
-        cid = result["chunk_id"]
-        score = result.get("score", 0.0)
-        if cid in community_chunk_ids:
-            score += 0.15
-        result_map[cid] = {**result, "score": score, "source": "community" if cid in community_chunk_ids else "dense"}
-
-    results = sorted(result_map.values(), key=lambda x: x.get("score", 0.0), reverse=True)[:top_k]
-    return expand_results_with_parent_context(db, course_id, results)
-
-
-def chunk_to_result(chunk, score: float = 0.0, source: str = "") -> dict:
-    from app.models import Document
-    document = chunk.document if hasattr(chunk, "document") and chunk.document else None
-    return {
-        "chunk_id": str(chunk.id),
-        "document_id": str(chunk.document_id),
-        "document_title": getattr(document, "title", "") if document else "",
-        "source_path": getattr(document, "source_path", "") if document else "",
-        "chapter": chunk.chapter or "General",
-        "section": chunk.section,
-        "page_number": chunk.page_number,
-        "snippet": chunk.snippet or "",
-        "content": chunk.content or "",
-        "source_type": chunk.source_type or "",
-        "citations": [{
-            "chunk_id": str(chunk.id),
-            "document_id": str(chunk.document_id),
-            "document_title": getattr(document, "title", "") if document else "",
-            "source_path": getattr(document, "source_path", "") if document else "",
-            "chapter": chunk.chapter or "General",
-            "section": chunk.section,
-            "page_number": chunk.page_number,
-            "snippet": chunk.snippet or "",
-        }],
-        "metadata": {"scores": {"dense": score}, "source": source},
-        "score": score,
-    }
+    for item in documents:
+        item.setdefault("metadata", {})["evidence_first_audit"] = {
+            "pipeline": "evidence_first_v1",
+            "route": route,
+            "query_type": config["query_type"],
+        }
+        item.setdefault("metadata", {}).setdefault("model_audit", dict(model_audit))
+    return documents, evidence_audit
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -1027,7 +937,7 @@ def get_dashboard_snapshot(db: Session, course_id: str) -> dict:
         for chapter, entries in sorted(chapter_map.items())
     ]
     latest_batch = next((batch for batch in batches if batch.status not in TERMINAL_BATCH_STATES), None)
-    graph_payload = get_graph_payload(db, course.id)
+    graph_payload = get_graph_payload(db, course.id, graph_type="semantic")
     return {
         "course": {
             "id": course.id,

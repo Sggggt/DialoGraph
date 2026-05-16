@@ -114,6 +114,7 @@ class Concept(TimestampMixin, Base):
     centrality_json: Mapped[dict] = mapped_column(JSON, default=dict)
     graph_rank_score: Mapped[float] = mapped_column(Float, default=0.0)
     source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    quality_json: Mapped[dict] = mapped_column(JSON, default=dict)
 
     course: Mapped["Course"] = relationship(back_populates="concepts")
     aliases: Mapped[list["ConceptAlias"]] = relationship(back_populates="concept")
@@ -128,6 +129,42 @@ class ConceptAlias(Base):
     normalized_alias: Mapped[str] = mapped_column(String(255), index=True)
 
     concept: Mapped["Concept"] = relationship(back_populates="aliases")
+
+
+class EntityMention(Base):
+    __tablename__ = "entity_mentions"
+    __table_args__ = (UniqueConstraint("course_id", "chunk_id", "surface", "entity_type", name="uq_entity_mention_surface_chunk_type"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    chunk_id: Mapped[str] = mapped_column(ForeignKey("chunks.id"), index=True)
+    document_id: Mapped[str | None] = mapped_column(ForeignKey("documents.id"), nullable=True, index=True)
+    concept_id: Mapped[str | None] = mapped_column(ForeignKey("concepts.id"), nullable=True, index=True)
+    surface: Mapped[str] = mapped_column(String(255))
+    canonical_name: Mapped[str] = mapped_column(String(255), index=True)
+    normalized_key: Mapped[str] = mapped_column(String(320), index=True)
+    entity_type: Mapped[str] = mapped_column(String(64), index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    evidence_spans: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(32), default="staged", index=True)
+    decision_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class EntityMergeCandidate(Base):
+    __tablename__ = "entity_merge_candidates"
+    __table_args__ = (UniqueConstraint("course_id", "left_key", "right_key", name="uq_entity_merge_candidate_pair"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    left_key: Mapped[str] = mapped_column(String(320), index=True)
+    right_key: Mapped[str] = mapped_column(String(320), index=True)
+    entity_type: Mapped[str] = mapped_column(String(64), index=True)
+    source: Mapped[str] = mapped_column(String(64), default="lexical")
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    verifier_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class ConceptRelation(Base):
@@ -151,6 +188,96 @@ class ConceptRelation(Base):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class QualityProfile(Base):
+    __tablename__ = "quality_profiles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    version: Mapped[str] = mapped_column(String(128), index=True)
+    profile_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    sample_chunk_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class GraphRelationCandidate(Base):
+    __tablename__ = "graph_relation_candidates"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    source_concept_id: Mapped[str] = mapped_column(ForeignKey("concepts.id"), index=True)
+    target_concept_id: Mapped[str | None] = mapped_column(ForeignKey("concepts.id"), nullable=True)
+    target_name: Mapped[str] = mapped_column(String(255))
+    relation_type: Mapped[str] = mapped_column(String(64), index=True)
+    relation_source: Mapped[str] = mapped_column(String(64), default="semantic_sparse", index=True)
+    evidence_chunk_id: Mapped[str | None] = mapped_column(ForeignKey("chunks.id"), nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    weight: Mapped[float] = mapped_column(Float, default=0.0)
+    semantic_similarity: Mapped[float] = mapped_column(Float, default=0.0)
+    support_count: Mapped[int] = mapped_column(Integer, default=1)
+    is_inferred: Mapped[bool] = mapped_column(Boolean, default=True)
+    decision_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class GraphCommunitySummary(TimestampMixin, Base):
+    __tablename__ = "graph_community_summaries"
+    __table_args__ = (UniqueConstraint("course_id", "algorithm", "community_id", "version", name="uq_graph_community_summary_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    algorithm: Mapped[str] = mapped_column(String(64), default="louvain", index=True)
+    community_id: Mapped[int] = mapped_column(Integer, index=True)
+    version: Mapped[str] = mapped_column(String(128), index=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    key_concepts_json: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    representative_chunk_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    source_document_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    prompt_version: Mapped[str] = mapped_column(String(128), default="community_summary_v1")
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    quality_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class GraphExtractionRun(TimestampMixin, Base):
+    __tablename__ = "graph_extraction_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    batch_id: Mapped[str | None] = mapped_column(ForeignKey("ingestion_batches.id"), nullable=True, index=True)
+    strategy: Mapped[str] = mapped_column(String(64), default="adaptive_best_first", index=True)
+    profile_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    prompt_version: Mapped[str] = mapped_column(String(128), default="graph_extraction_v1")
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="planned", index=True)
+    coverage_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    budget_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    stats_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class GraphExtractionChunkTask(TimestampMixin, Base):
+    __tablename__ = "graph_extraction_chunk_tasks"
+    __table_args__ = (UniqueConstraint("run_id", "chunk_id", name="uq_graph_extraction_run_chunk"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    run_id: Mapped[str] = mapped_column(ForeignKey("graph_extraction_runs.id"), index=True)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    chunk_id: Mapped[str] = mapped_column(ForeignKey("chunks.id"), index=True)
+    chunk_hash: Mapped[str] = mapped_column(String(64), index=True)
+    priority: Mapped[float] = mapped_column(Float, default=0.0)
+    selected_reason: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    payload_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_estimate: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class IngestionBatch(TimestampMixin, Base):

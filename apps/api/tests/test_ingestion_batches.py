@@ -96,7 +96,7 @@ async def test_ingest_short_markdown_keeps_parent_and_child_chunks(db_session, s
             )
 
     class FakeChatProvider:
-        async def classify_json(self, system_prompt, user_prompt, fallback):
+        async def classify_json(self, system_prompt, user_prompt, fallback=None):
             return fallback
 
     class FakeVectorStore:
@@ -115,6 +115,12 @@ async def test_ingest_short_markdown_keeps_parent_and_child_chunks(db_session, s
         def delete(self, ids):
             for item in ids:
                 self.points.pop(item, None)
+
+        async def async_upsert(self, points):
+            self.upsert(points)
+
+        async def async_delete(self, ids):
+            self.delete(ids)
 
     monkeypatch.setattr(ingestion, "EmbeddingProvider", FakeEmbeddingProvider)
     monkeypatch.setattr(ingestion, "ChatProvider", FakeChatProvider)

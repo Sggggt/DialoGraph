@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from app.services import parsers
-from app.services.parsers import derive_chapter, parse_document
+from app.services.parsers import clean_extracted_text, decode_text_bytes, derive_chapter, parse_document
 
 
 def test_parse_markdown_html_notebook(tmp_path, no_fallback_env):
@@ -31,6 +31,38 @@ def test_parse_markdown_html_notebook(tmp_path, no_fallback_env):
     assert "Nodes and edges" in parse_document(html)[1][0].text
     _, notebook_sections = parse_document(notebook)
     assert {section.metadata["content_kind"] for section in notebook_sections} == {"markdown", "code"}
+
+
+def test_decode_text_bytes_handles_common_encodings():
+    utf8_bom, utf8_meta = decode_text_bytes("\ufeffBayesian inference".encode("utf-8-sig"))
+    gb18030_text, gb18030_meta = decode_text_bytes("贝叶斯 inference".encode("gb18030"))
+    latin_text, latin_meta = decode_text_bytes("café likelihood".encode("cp1252"))
+
+    assert utf8_bom.lstrip("\ufeff") == "Bayesian inference"
+    assert "encoding_used" in utf8_meta
+    assert "贝叶斯" in gb18030_text
+    assert "encoding_used" in gb18030_meta
+    assert "café" in latin_text
+    assert "encoding_used" in latin_meta
+
+
+def test_clean_extracted_text_repairs_mojibake_and_preserves_math():
+    cleaned, metadata = clean_extracted_text("cafÃ© posterior\x00\n\n\\(\\alpha + \\beta \\le \\gamma\\)\nE = mc^2")
+
+    assert "café posterior" in cleaned
+    assert "\\alpha" in cleaned
+    assert "\\beta" in cleaned
+    assert "E = mc^2" in cleaned
+    assert metadata["mojibake_repaired"] is True
+    assert "removed_control_chars" in metadata["text_cleaning_flags"]
+
+
+def test_clean_extracted_text_normalizes_pdf_ocr_layout_noise():
+    cleaned, metadata = clean_extracted_text("inter-\nnational\nnetwork\n\nnext paragraph", source_type="pdf")
+
+    assert "international network" in cleaned
+    assert "next paragraph" in cleaned
+    assert "normalized_pdf_ocr_linebreaks" in metadata["text_cleaning_flags"]
 
 
 def test_parse_docx_pptx_pdf(tmp_path, no_fallback_env):

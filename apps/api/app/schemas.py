@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 JobState = Literal[
@@ -21,15 +21,23 @@ SourceType = Literal["pdf", "ppt", "pptx", "docx", "markdown", "text", "image", 
 AgentRoute = Literal["direct_answer", "retrieve_notes", "retrieve_exercises", "retrieve_both", "clarify", "multi_hop_research"]
 AgentRunState = Literal["queued", "running", "needs_clarification", "completed", "failed"]
 GraphRelationType = Literal[
-    "defines",
-    "relates_to",
+    "is_a",
+    "part_of",
     "prerequisite_of",
+    "used_for",
+    "causes",
+    "derives_from",
+    "compares_with",
     "example_of",
+    "defined_by",
+    "formula_of",
     "solves",
-    "compares",
-    "extends",
-    "mentions",
+    "implemented_by",
+    "related_to",
 ]
+GraphType = Literal["semantic", "structural", "evidence"]
+SemanticEntityType = Literal["concept", "method", "formula", "metric", "algorithm", "definition", "theorem", "problem_type"]
+GraphNodeCategory = Literal["semantic_entity", "course", "document", "chapter", "section", "chunk", "evidence_chunk", "document_version"]
 
 
 class SearchFilters(BaseModel):
@@ -73,21 +81,52 @@ class Citation(BaseModel):
 
 
 class GraphExtractionConcept(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
+    name: str = Field(default="", max_length=255)
+    surface: str = Field(default="", max_length=255)
+    canonical_name: str = Field(default="", max_length=255)
     aliases: list[str] = Field(default_factory=list)
     summary: str = ""
-    concept_type: str = Field(default="concept", min_length=1, max_length=64)
+    definition: str = ""
+    concept_type: SemanticEntityType = "concept"
+    entity_type: SemanticEntityType | None = None
     importance_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    evidence_spans: list[str] = Field(default_factory=list)
 
-    @field_validator("name", "summary", "concept_type")
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_typed_payload(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        canonical = str(payload.get("canonical_name") or payload.get("name") or payload.get("surface") or "").strip()
+        surface = str(payload.get("surface") or payload.get("name") or canonical).strip()
+        payload["name"] = canonical or surface
+        payload["canonical_name"] = canonical or surface
+        payload["surface"] = surface or canonical
+        if payload.get("entity_type") and not payload.get("concept_type"):
+            payload["concept_type"] = payload["entity_type"]
+        if payload.get("concept_type") and not payload.get("entity_type"):
+            payload["entity_type"] = payload["concept_type"]
+        if payload.get("definition") and not payload.get("summary"):
+            payload["summary"] = payload["definition"]
+        return payload
+
+    @field_validator("name", "surface", "canonical_name", "summary", "definition")
     @classmethod
     def strip_text(cls, value: str) -> str:
         return value.strip()
 
-    @field_validator("aliases")
+    @field_validator("aliases", "evidence_spans")
     @classmethod
     def strip_aliases(cls, value: list[str]) -> list[str]:
         return [item.strip() for item in value if item.strip()]
+
+    @model_validator(mode="after")
+    def require_name(self) -> "GraphExtractionConcept":
+        if not self.name.strip():
+            raise ValueError("semantic entity name is required")
+        return self
 
 
 class GraphExtractionRelation(BaseModel):
@@ -260,18 +299,24 @@ class CleanupStaleGraphResponse(BaseModel):
     removed_relations: int = 0
     removed_aliases: int = 0
     removed_concepts: int = 0
+    migrated_relations: int = 0
 
 
 class RebuildGraphRequest(BaseModel):
     mode: str = "incremental"
+    confirm_destructive: bool = False
+    dry_run: bool = False
 
 
 class RebuildGraphResponse(BaseModel):
-    batch_id: str
+    batch_id: str | None = None
     state: str
     mode: str = "full"
     affected_documents: int = 0
     previous_batch_id: str | None = None
+    dry_run: bool = False
+    semantic_entities: int = 0
+    semantic_relations: int = 0
 
 
 class BatchLogTokenResponse(BaseModel):
@@ -314,8 +359,14 @@ class ModelSettingsResponse(BaseModel):
     embedding_model: str
     chat_model: str
     embedding_dimensions: int
-    graph_extraction_chunk_limit: int
-    graph_extraction_chunks_per_document: int
+    graph_extraction_strategy: str = "adaptive_best_first"
+    graph_extraction_soft_start_budget: int | None = None
+    graph_extraction_max_input_tokens_per_run: int | None = None
+    graph_extraction_max_model_calls_per_run: int | None = None
+    graph_extraction_min_marginal_gain: float = 0.03
+    graph_extraction_stall_rounds: int = 2
+    graph_extraction_concurrency: int = 2
+    graph_extraction_resume_batch_size: int = 24
     reranker_enabled: bool = False
     reranker_model: str = ""
     reranker_max_length: int = 512
@@ -339,8 +390,14 @@ class ModelSettingsUpdate(BaseModel):
     embedding_model: str | None = None
     chat_model: str | None = None
     embedding_dimensions: int | None = Field(default=None, ge=1, le=8192)
-    graph_extraction_chunk_limit: int | None = Field(default=None, ge=1, le=200)
-    graph_extraction_chunks_per_document: int | None = Field(default=None, ge=1, le=10)
+    graph_extraction_strategy: str | None = None
+    graph_extraction_soft_start_budget: int | None = Field(default=None, ge=1)
+    graph_extraction_max_input_tokens_per_run: int | None = Field(default=None, ge=1)
+    graph_extraction_max_model_calls_per_run: int | None = Field(default=None, ge=1)
+    graph_extraction_min_marginal_gain: float | None = Field(default=None, ge=0.0, le=1.0)
+    graph_extraction_stall_rounds: int | None = Field(default=None, ge=1, le=20)
+    graph_extraction_concurrency: int | None = Field(default=None, ge=1, le=8)
+    graph_extraction_resume_batch_size: int | None = Field(default=None, ge=1, le=100)
     reranker_enabled: bool | None = None
     reranker_model: str | None = None
     reranker_max_length: int | None = Field(default=None, ge=64, le=2048)
@@ -412,11 +469,22 @@ class ConceptCard(BaseModel):
 class GraphNode(BaseModel):
     id: str
     name: str
-    category: str
+    category: GraphNodeCategory | str
     value: int | float | None = None
     chapter: str | None = None
     importance_score: float | None = None
     source_type: str | None = None
+    entity_type: SemanticEntityType | str | None = None
+    aliases: list[str] = Field(default_factory=list)
+    support_count: int | None = None
+    confidence: float | None = None
+    canonical_key: str | None = None
+    concept_id: str | None = None
+    summary: str | None = None
+    document_id: str | None = None
+    document_version_id: str | None = None
+    snippet: str | None = None
+    page_number: int | None = None
     evidence_count: int | None = None
     community_louvain: int | None = None
     community_spectral: int | None = None
@@ -440,8 +508,12 @@ class GraphEdge(BaseModel):
 
 
 class GraphResponse(BaseModel):
+    graph_type: GraphType
+    schema_version: str = "typed_graph_v1"
     nodes: list[GraphNode]
     edges: list[GraphEdge]
+    node_counts: dict[str, int] = Field(default_factory=dict)
+    edge_counts: dict[str, int] = Field(default_factory=dict)
     focus_chapter: str | None = None
 
 

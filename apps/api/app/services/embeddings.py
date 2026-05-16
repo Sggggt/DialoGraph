@@ -274,10 +274,12 @@ class ChatProvider:
                 raise
             return {"concepts": [], "relations": []}
 
-    async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict[str, Any]) -> dict[str, Any]:
+    async def classify_json(self, system_prompt: str, user_prompt: str, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self.settings.openai_api_key:
             if not self.settings.enable_model_fallback:
                 raise FallbackDisabledError("OPENAI_API_KEY is required because ENABLE_MODEL_FALLBACK is false")
+            if fallback is None:
+                raise FallbackDisabledError("OPENAI_API_KEY is required (no fallback provided)")
             return fallback
         payload: dict[str, Any] = {
             "model": self.settings.chat_model,
@@ -287,8 +289,10 @@ class ChatProvider:
         }
         try:
             return await self._post_chat_json_with_response_format_fallback(payload)
-        except Exception:
+        except Exception as exc:
             if not self.settings.enable_model_fallback:
+                raise
+            if fallback is None:
                 raise
             return fallback
 

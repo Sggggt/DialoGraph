@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -206,6 +207,14 @@ class VectorStore:
         if self.settings.enable_model_fallback:
             self.fallback.delete(ids)
 
+    async def async_upsert(self, points: list[dict]) -> None:
+        """Async wrapper for upsert to avoid blocking the event loop."""
+        await asyncio.to_thread(self.upsert, points)
+
+    async def async_delete(self, ids: list[str]) -> None:
+        """Async wrapper for delete to avoid blocking the event loop."""
+        await asyncio.to_thread(self.delete, ids)
+
     def get_points(self, ids: list[str]) -> list[dict]:
         if not ids:
             return []
@@ -283,3 +292,7 @@ class VectorStore:
         if not self.settings.enable_model_fallback:
             raise RuntimeError("Qdrant is unavailable and ENABLE_MODEL_FALLBACK is false")
         return self.fallback.search(vector=vector, limit=limit, filters=filters)
+
+    async def async_search(self, vector: list[float], limit: int, filters: dict[str, Any] | None = None) -> list[dict]:
+        """Async wrapper for search to avoid blocking the event loop."""
+        return await asyncio.to_thread(self.search, vector=vector, limit=limit, filters=filters)

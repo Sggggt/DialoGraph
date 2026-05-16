@@ -564,7 +564,7 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
 
   const chapterGraphQuery = useQuery({
     queryKey: ["chapter-graph", selectedCourseId, selectedChapter],
-    queryFn: () => fetchChapterGraph(selectedChapter, selectedCourseId),
+    queryFn: () => fetchChapterGraph(selectedChapter, selectedCourseId, "evidence"),
     enabled: Boolean(selectedCourseId && selectedChapter),
   });
 
@@ -572,7 +572,7 @@ function SearchWorkspaceContent({ selectedCourseId }: { selectedCourseId: string
   const results = searchResults?.results ?? [];
   const selectedResult = results.find((result) => result.chunk_id === activeChunkId) ?? null;
   const focusChapter = selectedResult ? resultChapter(selectedResult) : selectedChapter;
-  const selectedNodeId = selectedResult?.citations[0]?.document_id ?? (focusChapter ? `chapter:${focusChapter}` : null);
+  const selectedNodeId = selectedResult?.chunk_id ? `evidence_chunk:${selectedResult.chunk_id}` : null;
   const selectedLabel = selectedResult?.document_title ?? selectedResult?.citations[0]?.document_title ?? null;
 
   useEffect(() => {

@@ -49,6 +49,13 @@ class CacheManager:
         key = self._key("search", course_id, self._hash(query), filters_hash, embedding_version)
         self._set(key, results, ttl)
 
+    def get_quality_judgment(self, cache_key: str) -> dict | None:
+        value = self._get(self._key("quality_judge", cache_key))
+        return value if isinstance(value, dict) else None
+
+    def set_quality_judgment(self, cache_key: str, result: dict, ttl: int = 86400) -> None:
+        self._set(self._key("quality_judge", cache_key), result, ttl)
+
     def invalidate_course(self, course_id: str) -> None:
         if self._redis:
             try:

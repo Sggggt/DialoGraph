@@ -1,7 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,17 +26,202 @@ def detect_source_type(path: Path) -> str:
     return source_type_from_path(path)
 
 
-def load_text(path: Path) -> str:
-    for encoding in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+MOJIBAKE_MARKERS = (
+    "\ufffd",
+    "\u00c3",
+    "\u00c2",
+    "\u00e2",
+    "\u9208",
+    "\u9365",
+    "\u9429",
+    "\u95b3",
+    "\u951f",
+    "\u7d34",
+    "\u6d93",
+    "\u934f",
+    "\u704f",
+    "\u93c4",
+    "\u9a9e",
+)
+MOJIBAKE_MARKER_RE = re.compile("|".join(re.escape(marker) for marker in MOJIBAKE_MARKERS))
+LATIN_WORD_HYPHEN_BREAK_RE = re.compile(r"(?<=[A-Za-z])-\n(?=[a-z])")
+SOFT_SINGLE_NEWLINE_RE = re.compile(r"(?<![\n.!?:;。！？：；])\n(?!\s*(?:\n|[#>*+\-]|\d+[.)]))")
+TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "big5", "cp1252", "latin-1")
+
+
+def _safe_import_ftfy():
+    try:
+        import ftfy
+
+        return ftfy
+    except Exception:
+        return None
+
+
+def _detect_encoding(raw: bytes) -> tuple[str | None, float | None]:
+    try:
+        from charset_normalizer import from_bytes
+
+        match = from_bytes(raw).best()
+        if match is not None and match.encoding:
+            coherence = getattr(match, "percent_coherence", None)
+            return str(match.encoding), float(coherence) if coherence is not None else None
+    except Exception:
+        pass
+    return None, None
+
+
+def _mojibake_score(text: str) -> float:
+    if not text:
+        return 0.0
+    markers = len(MOJIBAKE_MARKER_RE.findall(text))
+    replacement = text.count("\ufffd")
+    controls = len(CONTROL_CHAR_RE.findall(text))
+    return (markers * 2.0 + replacement * 3.0 + controls * 2.0) / max(len(text), 1)
+
+
+def _repair_mojibake_candidate(text: str) -> tuple[str, bool]:
+    original_score = _mojibake_score(text)
+    if original_score <= 0:
+        return text, False
+
+    candidates = [text]
+    ftfy = _safe_import_ftfy()
+    if ftfy is not None:
         try:
-            return path.read_text(encoding=encoding)
-        except UnicodeDecodeError:
+            candidates.append(ftfy.fix_text(text, normalization="NFC"))
+        except Exception:
+            pass
+
+    # Typical PDF / web extraction failure: UTF-8 bytes were decoded as a
+    # legacy code page, producing CJK-looking garbage such as "閺嶇绺?.
+    for encoding in ("gb18030", "big5", "cp1252", "latin-1"):
+        try:
+            candidates.append(text.encode(encoding, errors="strict").decode("utf-8", errors="strict"))
+        except Exception:
             continue
-    return path.read_text(errors="ignore")
+
+    best = min(candidates, key=_mojibake_score)
+    best_score = _mojibake_score(best)
+    if best != text and best_score + 0.002 < original_score:
+        return best, True
+    return text, False
+
+
+def decode_text_bytes(raw: bytes) -> tuple[str, dict[str, Any]]:
+    metadata: dict[str, Any] = {}
+    detected, coherence = _detect_encoding(raw)
+    if detected:
+        metadata["encoding_detected"] = detected
+    if coherence is not None:
+        metadata["encoding_coherence"] = round(coherence, 3)
+
+    preferred = []
+    detected_usable = detected and (coherence is None or coherence >= 20.0 or detected.lower().replace("_", "-") in TEXT_ENCODINGS)
+    if detected_usable:
+        preferred.append(detected)
+    preferred.extend(encoding for encoding in TEXT_ENCODINGS if encoding.lower() not in {item.lower() for item in preferred})
+
+    last_error: Exception | None = None
+    for encoding in preferred:
+        try:
+            text = raw.decode(encoding)
+            metadata.setdefault("encoding_used", encoding)
+            return text, metadata
+        except (LookupError, UnicodeDecodeError) as exc:
+            last_error = exc
+            continue
+    metadata["encoding_used"] = "utf-8-ignore"
+    if last_error is not None:
+        metadata["encoding_error"] = str(last_error)
+    return raw.decode("utf-8", errors="ignore"), metadata
+
+
+def clean_extracted_text(text: str, *, source_type: str | None = None) -> tuple[str, dict[str, Any]]:
+    flags: list[str] = []
+    original = text or ""
+    cleaned = original.replace("\r\n", "\n").replace("\r", "\n").replace("\ufeff", "")
+    if cleaned != original:
+        flags.append("normalized_line_endings_or_bom")
+    before_controls = cleaned
+    cleaned = CONTROL_CHAR_RE.sub("", cleaned)
+    if cleaned != before_controls:
+        flags.append("removed_control_chars")
+    cleaned = unicodedata.normalize("NFC", cleaned)
+
+    repaired, repaired_mojibake = _repair_mojibake_candidate(cleaned)
+    if repaired_mojibake:
+        cleaned = repaired
+        flags.append("mojibake_repaired")
+
+    if source_type in {"pdf", "image", "ocr"}:
+        before_layout = cleaned
+        cleaned = LATIN_WORD_HYPHEN_BREAK_RE.sub("", cleaned)
+        cleaned = SOFT_SINGLE_NEWLINE_RE.sub(" ", cleaned)
+        if cleaned != before_layout:
+            flags.append("normalized_pdf_ocr_linebreaks")
+
+    before_space = cleaned
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned)
+    cleaned = cleaned.strip()
+    if cleaned != before_space.strip():
+        flags.append("normalized_whitespace")
+
+    metadata = {
+        "text_cleaning_flags": sorted(set(flags)),
+        "mojibake_repaired": repaired_mojibake,
+        "mojibake_score_before": round(_mojibake_score(original), 6),
+        "mojibake_score_after": round(_mojibake_score(cleaned), 6),
+    }
+    return cleaned, metadata
+
+
+def load_text_with_metadata(path: Path) -> tuple[str, dict[str, Any]]:
+    decoded, metadata = decode_text_bytes(path.read_bytes())
+    cleaned, cleaning = clean_extracted_text(decoded, source_type=detect_source_type(path))
+    return cleaned, {**metadata, **cleaning}
+
+
+def load_text(path: Path) -> str:
+    return load_text_with_metadata(path)[0]
+
+
+def _clean_section(section: ParsedSection, source_type: str, common_metadata: dict[str, Any] | None = None) -> ParsedSection:
+    text, cleaning = clean_extracted_text(section.text, source_type=source_type)
+    title, title_cleaning = clean_extracted_text(section.title, source_type=source_type)
+    section_label = section.section
+    if section_label is not None:
+        section_label, _ = clean_extracted_text(section_label, source_type=source_type)
+    flags = sorted(set((cleaning.get("text_cleaning_flags") or []) + (title_cleaning.get("text_cleaning_flags") or [])))
+    metadata = {
+        **(common_metadata or {}),
+        **section.metadata,
+        **cleaning,
+        "text_cleaning_flags": flags,
+        "mojibake_repaired": bool(cleaning.get("mojibake_repaired") or title_cleaning.get("mojibake_repaired")),
+    }
+    return ParsedSection(
+        title=title,
+        text=text,
+        page_number=section.page_number,
+        section=section_label,
+        metadata=metadata,
+    )
+
+
+def clean_parsed_sections(sections: list[ParsedSection], source_type: str, common_metadata: dict[str, Any] | None = None) -> list[ParsedSection]:
+    return [
+        cleaned
+        for section in sections
+        for cleaned in [_clean_section(section, source_type, common_metadata)]
+        if cleaned.text
+    ]
 
 
 def parse_markdown(path: Path) -> list[ParsedSection]:
-    text = load_text(path)
+    text, text_metadata = load_text_with_metadata(path)
     lines = text.splitlines()
     sections: list[ParsedSection] = []
     current_title = path.stem
@@ -48,7 +234,7 @@ def parse_markdown(path: Path) -> list[ParsedSection]:
                         title=current_title,
                         text="\n".join(buffer).strip(),
                         section=current_title,
-                        metadata={"content_kind": "markdown"},
+                        metadata={"content_kind": "markdown", **text_metadata},
                     )
                 )
                 buffer = []
@@ -61,28 +247,28 @@ def parse_markdown(path: Path) -> list[ParsedSection]:
                 title=current_title,
                 text="\n".join(buffer).strip(),
                 section=current_title,
-                metadata={"content_kind": "markdown"},
+                metadata={"content_kind": "markdown", **text_metadata},
             )
         )
     return [section for section in sections if section.text]
 
 
 def parse_text(path: Path) -> list[ParsedSection]:
-    text = load_text(path)
-    return [ParsedSection(title=path.stem, text=text.strip(), section=path.stem, metadata={"content_kind": "text"})]
+    text, text_metadata = load_text_with_metadata(path)
+    return [ParsedSection(title=path.stem, text=text.strip(), section=path.stem, metadata={"content_kind": "text", **text_metadata})]
 
 
 def parse_html(path: Path) -> list[ParsedSection]:
-    html = load_text(path)
+    html, text_metadata = load_text_with_metadata(path)
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.text.strip() if soup.title and soup.title.text else path.stem
     text = soup.get_text("\n", strip=True)
-    return [ParsedSection(title=title, text=text, section=title, metadata={"content_kind": "html"})]
+    return [ParsedSection(title=title, text=text, section=title, metadata={"content_kind": "html", **text_metadata})]
 
 
 def _detect_formula(text: str) -> bool:
-    """检测文本中是否包含大量数学符号，可能是公式。"""
-    formula_chars = set("∑∫√λθπσμ±×÷≤≥≠≈∝∂∇∆∞∈∪∩⊂⊃⟨⟩αβγδεζηικνξορστυφχψω")
+    """Detect formula-heavy text without rewriting math symbols."""
+    formula_chars = set("∑∫∂√∞≈≠≤≥±×÷∈∉⊂⊆∪∩→←↔∀∃∇αβγδθηλμπρστυφχψωΓΔΘΛΠΣΦΨΩ")
     if not text:
         return False
     ratio = sum(1 for c in text if c in formula_chars) / len(text)
@@ -92,39 +278,38 @@ def _detect_formula(text: str) -> bool:
 def parse_pdf(path: Path) -> list[ParsedSection]:
     import fitz
 
-    document = fitz.open(path)
     sections: list[ParsedSection] = []
-    for idx, page in enumerate(document, start=1):
-        # 优先尝试 markdown 格式以保留表格结构
-        try:
-            text = page.get_text("markdown").strip()
-        except Exception:
-            text = page.get_text("text").strip()
+    with fitz.open(path) as document:
+        for idx, page in enumerate(document, start=1):
+            try:
+                text = page.get_text("markdown").strip()
+            except Exception:
+                text = page.get_text("text").strip()
 
-        if not text:
-            continue
+            if not text:
+                continue
 
-        # 检测表格（Markdown 表格特征：包含 | 和 --- 分隔行）
-        lines = text.splitlines()
-        has_table = any("|" in line and "---" in line for line in lines)
-        has_formula = _detect_formula(text)
+            # Preserve table/formula hints for downstream chunk metadata.
+            lines = text.splitlines()
+            has_table = any("|" in line and "---" in line for line in lines)
+            has_formula = _detect_formula(text)
 
-        page_title = lines[0][:120] if lines else ""
-        metadata: dict[str, Any] = {"content_kind": "pdf_page"}
-        if has_table:
-            metadata["has_table"] = True
-        if has_formula:
-            metadata["has_formula"] = True
+            page_title = lines[0][:120] if lines else ""
+            metadata: dict[str, Any] = {"content_kind": "pdf_page"}
+            if has_table:
+                metadata["has_table"] = True
+            if has_formula:
+                metadata["has_formula"] = True
 
-        sections.append(
-            ParsedSection(
-                title=page_title or f"{path.stem} p.{idx}",
-                text=text,
-                page_number=idx,
-                section=page_title or path.stem,
-                metadata=metadata,
+            sections.append(
+                ParsedSection(
+                    title=page_title or f"{path.stem} p.{idx}",
+                    text=text,
+                    page_number=idx,
+                    section=page_title or path.stem,
+                    metadata=metadata,
+                )
             )
-        )
     return sections
 
 
@@ -191,7 +376,8 @@ def parse_docx(path: Path) -> list[ParsedSection]:
 
 
 def parse_notebook(path: Path) -> list[ParsedSection]:
-    notebook = json.loads(path.read_text(encoding="utf-8"))
+    decoded, text_metadata = decode_text_bytes(path.read_bytes())
+    notebook = json.loads(decoded)
     sections: list[ParsedSection] = []
     cell_buffer: list[str] = []
     current_title = path.stem
@@ -210,7 +396,7 @@ def parse_notebook(path: Path) -> list[ParsedSection]:
                             title=current_title,
                             text="\n".join(cell_buffer),
                             section=current_title,
-                            metadata={"cell_index": current_index, "content_kind": "markdown"},
+                            metadata={"cell_index": current_index, "content_kind": "markdown", **text_metadata},
                         )
                     )
                     cell_buffer = []
@@ -232,7 +418,7 @@ def parse_notebook(path: Path) -> list[ParsedSection]:
                         title=current_title,
                         text="\n\n".join(cell_buffer),
                         section=current_title,
-                        metadata={"cell_index": current_index, "content_kind": "markdown"},
+                        metadata={"cell_index": current_index, "content_kind": "markdown", **text_metadata},
                     )
                 )
                 cell_buffer = []
@@ -241,7 +427,7 @@ def parse_notebook(path: Path) -> list[ParsedSection]:
                     title=f"{current_title} code",
                     text="\n".join(part for part in block if part),
                     section=current_title,
-                    metadata={"cell_index": current_index, "content_kind": "code"},
+                    metadata={"cell_index": current_index, "content_kind": "code", **text_metadata},
                 )
             )
     if cell_buffer:
@@ -250,7 +436,7 @@ def parse_notebook(path: Path) -> list[ParsedSection]:
                 title=current_title,
                 text="\n\n".join(cell_buffer),
                 section=current_title,
-                metadata={"content_kind": "markdown"},
+                metadata={"content_kind": "markdown", **text_metadata},
             )
         )
     return sections
@@ -275,7 +461,7 @@ def parse_image(path: Path) -> list[ParsedSection]:
         image = Image.open(path)
         text = pytesseract.image_to_string(image, lang="chi_sim+eng")
         if text.strip():
-            return [ParsedSection(title=path.stem, text=text.strip(), section=path.stem)]
+            return [ParsedSection(title=path.stem, text=text.strip(), section=path.stem, metadata={"content_kind": "ocr"})]
     except Exception as exc:
         raise RuntimeError(f"OCR dependencies unavailable for {path.name}: {exc}") from exc
     raise RuntimeError(f"No OCR text extracted from {path.name}")
@@ -305,13 +491,13 @@ def parse_document(path: Path) -> tuple[str, list[ParsedSection]]:
     parser = parsers.get(source_type)
     if parser is None:
         if get_settings().enable_model_fallback:
-            return source_type, parse_with_unstructured(path)
+            return source_type, clean_parsed_sections(parse_with_unstructured(path), source_type)
         raise RuntimeError(f"Unsupported source type for {path.name}: {source_type}")
     try:
-        return source_type, parser(path)
+        return source_type, clean_parsed_sections(parser(path), source_type)
     except Exception as exc:
         if get_settings().enable_model_fallback:
-            return source_type, parse_with_unstructured(path)
+            return source_type, clean_parsed_sections(parse_with_unstructured(path), source_type)
         raise RuntimeError(f"Failed to parse {path.name} as {source_type}: {exc}") from exc
 
 
@@ -384,7 +570,7 @@ def canonical_chapter_label(value: str, course_name: str | None = None) -> str |
     if re.search(r"\bz\s*table\b|\breference\b|\bformula\b|\bsummary\b|\bvisuali[sz]er\b", cleaned, flags=re.IGNORECASE):
         return "Reference"
 
-    if re.search(r"\breview\b|\brevision\b|复习|总讲义", cleaned, flags=re.IGNORECASE):
+    if re.search(r"\breview\b|\brevision\b|\brecap\b", cleaned, flags=re.IGNORECASE):
         return "Review"
 
     cleaned = cleaned[:80].strip()

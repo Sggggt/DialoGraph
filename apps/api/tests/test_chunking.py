@@ -52,6 +52,8 @@ def test_content_kind_and_chunk_metadata():
     assert chunks[1]["metadata"]["raw"] == "ab"
     assert all(chunk["chapter"] == "L1" for chunk in chunks)
     assert all(chunk["metadata"]["chunking_strategy"] == "chunk_800_metadata_enriched_v1" for chunk in chunks)
+    assert "route_eligibility" in chunks[0]["metadata"]
+    assert "retention_decision" in chunks[0]["metadata"]
 
 
 def test_default_chunk_sizes_are_best_eval_strategy():
@@ -61,12 +63,12 @@ def test_default_chunk_sizes_are_best_eval_strategy():
     assert CODE_CHUNK_OVERLAP == 100
 
 
-def test_chunk_sections_filters_noise_and_keeps_relevant_code():
+def test_chunk_sections_routes_noise_and_keeps_relevant_code():
     sections = [
         ParsedSection(title="Output", text="[Output]\n1\n2\n3", metadata={"content_kind": "output"}),
         ParsedSection(title="Short", text="too short", metadata={"content_kind": "markdown"}),
         ParsedSection(title="TOC", text="\n".join(["1", "2", "3", "4", "5", "6", "7", "8"]), metadata={"content_kind": "pdf_page"}),
-        ParsedSection(title="Bad", text="鐩" * 20 + " readable network material", metadata={"content_kind": "pdf_page"}),
+        ParsedSection(title="Bad", text="\ufffd" * 20, metadata={"content_kind": "pdf_page"}),
         ParsedSection(title="Generic Code", text="[Code Cell]\nprint('hello world from a utility cell')", metadata={}),
         ParsedSection(title="Community Code", section="community detection", text="[Code Cell]\nprint('community detection centrality network')", metadata={}),
         ParsedSection(title="Good", text="This paragraph explains degree centrality in complex networks with enough detail.", metadata={"content_kind": "markdown"}),
@@ -75,8 +77,14 @@ def test_chunk_sections_filters_noise_and_keeps_relevant_code():
     chunks, stats = chunk_sections_with_stats(sections, chapter="L1", source_type="notebook")
 
     assert stats["chunks_before_filter"] == 7
-    assert stats["chunks_filtered"] == 5
-    assert [chunk["section"] for chunk in chunks] == ["community detection", "Good"]
+    assert stats["chunks_filtered"] == 1
+    assert [chunk["section"] for chunk in chunks] == ["Output", "Short", "TOC", "Generic Code", "community detection", "Good"]
+    assert chunks[0]["metadata"]["quality_action"] == "evidence_only"
+    assert chunks[0]["metadata"]["route_eligibility"]["graph_extraction"] is False
+    assert chunks[1]["metadata"]["quality_retain"] is True
+    assert chunks[2]["metadata"]["quality_action"] == "summary_only"
+    assert chunks[3]["metadata"]["quality_action"] == "embed_only"
+    assert chunks[4]["metadata"]["quality_action"] == "graph_candidate"
 
 
 def test_embedding_text_adds_metadata_without_changing_content():

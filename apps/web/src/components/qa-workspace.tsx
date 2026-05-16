@@ -30,6 +30,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
 import { deleteSession, fetchDashboard, fetchSessionMessages, fetchSessions, streamAnswer } from "@/lib/api";
+import { evidenceFirstTraceFallbackSteps, traceAuditSummary, traceNodeLabel } from "@/lib/agent-trace";
 import { cn } from "@/lib/utils";
 import { useLocalStorage } from "@/hooks/use-local-storage";
 
@@ -47,30 +48,6 @@ const fallbackSuggestions = [
   "找出本课程中容易混淆的概念并比较",
   "基于课程引用给我一份复习路线",
 ];
-
-const traceNodeLabels: Record<string, string> = {
-  perception: "感知",
-  retrieval_planner: "检索规划",
-  query_analyzer: "问题分析",
-  router: "路由判断",
-  query_rewriter: "查询改写",
-  retrieval_decision: "检索决策",
-  retrievers: "检索召回",
-  document_grader: "证据筛选",
-  retry_planner: "重试规划",
-  context_synthesizer: "上下文合成",
-  answer_generator: "答案生成",
-  citation_checker: "引用校验",
-  citation_verifier: "引用验证",
-  reflection: "反思",
-  answer_corrector: "答案修正",
-  self_check: "自检",
-  error: "错误",
-};
-
-function traceNodeLabel(node: string): string {
-  return traceNodeLabels[node] ?? node;
-}
 
 function answerModelLabel(latestRun: AgentResponse | null): string {
   const audit = latestRun?.answer_model_audit;
@@ -210,7 +187,7 @@ function EmptyChatState({ suggestions, onPick }: { suggestions: string[]; onPick
         </div>
         <h3 className="glow-text mt-6 text-3xl font-semibold text-white">开始一轮有证据支撑的课程问答</h3>
         <p className="mx-auto mt-3 max-w-2xl text-sm leading-7 text-white/56">
-          系统会路由问题、检索课程片段、评估证据、生成回答，并校验引用来源。
+          系统会先召回基础证据，再选择锚点、规划证据链、受控图增强，并校验引用来源。
         </p>
         <div className="mt-7">
           <SuggestionChips suggestions={suggestions} onPick={onPick} />
@@ -460,15 +437,15 @@ function SessionsDrawer({
 }
 
 function TraceTimeline({ trace, isRunning }: { trace: AgentTraceEventPayload[]; isRunning: boolean }) {
-  const fallbackSteps = ["perception", "retrieval_planner", "retrievers", "document_grader", "evidence_evaluator", "context_synthesizer", "answer_generator", "citation_checker"];
   const steps: AgentTraceEventPayload[] = trace.length
     ? trace
-    : fallbackSteps.map((node) => ({ node, status: "pending", document_ids: [], scores: {}, duration_ms: 0 }));
+    : evidenceFirstTraceFallbackSteps.map((node) => ({ node, status: "pending", document_ids: [], scores: {}, duration_ms: 0 }));
   return (
     <div className="relative flex flex-col gap-3">
       <div className="absolute bottom-4 left-[15px] top-4 w-px bg-gradient-to-b from-cyan-200/30 via-white/12 to-violet-200/20" />
       {steps.map((event, index) => {
         const active = isRunning && index === steps.length - 1;
+        const auditSummary = traceAuditSummary(event.scores);
         return (
           <motion.div key={`${event.node}-${index}`} initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} className="relative flex gap-3">
             <div className={cn("z-10 mt-1 grid size-8 place-items-center rounded-full border bg-[#081126]", active ? "border-cyan-200/50 text-cyan-100 shadow-[0_0_22px_rgba(86,217,255,0.18)]" : "border-white/12 text-white/50")}>
@@ -480,6 +457,15 @@ function TraceTimeline({ trace, isRunning }: { trace: AgentTraceEventPayload[]; 
                 <span className="font-mono text-xs text-white/38">{event.duration_ms}ms</span>
               </div>
               {event.output_summary ? <MarkdownRenderer content={event.output_summary} compact className="mt-2 line-clamp-3 text-white/55" /> : null}
+              {auditSummary.length ? (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {auditSummary.map((item) => (
+                    <span key={item} className="rounded-full border border-white/10 px-2 py-1 text-[11px] text-white/45">
+                      {item}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
               {event.document_ids.length ? <p className="mt-2 text-xs text-cyan-100/48">触达 {event.document_ids.length} 个片段</p> : null}
             </div>
           </motion.div>
@@ -505,7 +491,7 @@ function TraceDrawer({
       <SheetContent className="w-full border-white/10 bg-[rgba(3,7,20,0.78)] p-0 text-white backdrop-blur-2xl sm:max-w-xl">
         <SheetHeader className="border-b border-white/8 p-6">
           <SheetTitle>智能体轨迹</SheetTitle>
-          <SheetDescription>路由、检索、评分、生成和引用检查。</SheetDescription>
+          <SheetDescription>基础召回、锚点选择、证据链规划、受控图增强、证据校验和答案生成。</SheetDescription>
         </SheetHeader>
         <ScrollArea className="h-[calc(100dvh-8rem)] p-6">
           <TraceTimeline trace={trace} isRunning={isRunning} />

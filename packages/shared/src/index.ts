@@ -155,10 +155,28 @@ export interface AgentRequest {
   stream_trace?: boolean;
 }
 
+export type AgentTraceNode =
+  | "perception"
+  | "retrieval_planner"
+  | "base_retrieval"
+  | "evidence_anchor_selector"
+  | "evidence_chain_planner"
+  | "controlled_graph_enhancer"
+  | "evidence_assembler"
+  | "document_grader"
+  | "evidence_evaluator"
+  | "context_synthesizer"
+  | "answer_generator"
+  | "citation_checker"
+  | "citation_verifier"
+  | "reflection"
+  | "self_check"
+  | "error";
+
 export interface AgentTraceEventPayload {
   id?: string | null;
   run_id?: string | null;
-  node: string;
+  node: AgentTraceNode | (string & {});
   status: string;
   input_summary?: string | null;
   output_summary?: string | null;
@@ -224,18 +242,24 @@ export interface CleanupStaleGraphResponse {
   removed_relations: number;
   removed_aliases: number;
   removed_concepts: number;
+  migrated_relations: number;
 }
 
 export interface RebuildGraphRequest {
   mode: "incremental" | "full";
+  confirm_destructive?: boolean;
+  dry_run?: boolean;
 }
 
 export interface RebuildGraphResponse {
-  batch_id: string;
+  batch_id?: string | null;
   state: string;
   mode: string;
   affected_documents: number;
   previous_batch_id?: string | null;
+  dry_run?: boolean;
+  semantic_entities?: number;
+  semantic_relations?: number;
 }
 
 export interface BatchLogTokenResponse {
@@ -277,8 +301,14 @@ export interface ModelSettingsResponse {
   embedding_model: string;
   chat_model: string;
   embedding_dimensions: number;
-  graph_extraction_chunk_limit: number;
-  graph_extraction_chunks_per_document: number;
+  graph_extraction_strategy: string;
+  graph_extraction_soft_start_budget?: number | null;
+  graph_extraction_max_input_tokens_per_run?: number | null;
+  graph_extraction_max_model_calls_per_run?: number | null;
+  graph_extraction_min_marginal_gain: number;
+  graph_extraction_stall_rounds: number;
+  graph_extraction_concurrency: number;
+  graph_extraction_resume_batch_size: number;
   reranker_enabled: boolean;
   reranker_model: string;
   reranker_max_length: number;
@@ -302,8 +332,14 @@ export interface ModelSettingsUpdate {
   embedding_model?: string | null;
   chat_model?: string | null;
   embedding_dimensions?: number | null;
-  graph_extraction_chunk_limit?: number | null;
-  graph_extraction_chunks_per_document?: number | null;
+  graph_extraction_strategy?: string | null;
+  graph_extraction_soft_start_budget?: number | null;
+  graph_extraction_max_input_tokens_per_run?: number | null;
+  graph_extraction_max_model_calls_per_run?: number | null;
+  graph_extraction_min_marginal_gain?: number | null;
+  graph_extraction_stall_rounds?: number | null;
+  graph_extraction_concurrency?: number | null;
+  graph_extraction_resume_batch_size?: number | null;
   reranker_enabled?: boolean | null;
   reranker_model?: string | null;
   reranker_max_length?: number | null;
@@ -365,9 +401,24 @@ export interface StructuredApiErrorBody {
   fix_commands: string[];
 }
 
+export type GraphRelationType =
+  | "is_a"
+  | "part_of"
+  | "prerequisite_of"
+  | "used_for"
+  | "causes"
+  | "derives_from"
+  | "compares_with"
+  | "example_of"
+  | "defined_by"
+  | "formula_of"
+  | "solves"
+  | "implemented_by"
+  | "related_to";
+
 export interface RelatedConcept {
   concept_id: string;
-  relation_type: string;
+  relation_type: GraphRelationType;
   target_name: string;
   confidence?: number | null;
   weight?: number | null;
@@ -386,14 +437,29 @@ export interface ConceptCard {
   related_concepts: RelatedConcept[];
 }
 
+export type GraphType = "semantic" | "structural" | "evidence";
+export type SemanticEntityType = "concept" | "method" | "formula" | "metric" | "algorithm" | "definition" | "theorem" | "problem_type";
+export type GraphNodeCategory = "semantic_entity" | "course" | "document" | "chapter" | "section" | "chunk" | "evidence_chunk" | "document_version";
+
 export interface GraphNode {
   id: string;
   name: string;
-  category: string;
+  category: GraphNodeCategory | string;
   value?: number;
   chapter?: string | null;
   importance_score?: number | null;
   source_type?: string | null;
+  entity_type?: SemanticEntityType | string | null;
+  aliases?: string[];
+  support_count?: number | null;
+  confidence?: number | null;
+  canonical_key?: string | null;
+  concept_id?: string | null;
+  summary?: string | null;
+  document_id?: string | null;
+  document_version_id?: string | null;
+  snippet?: string | null;
+  page_number?: number | null;
   evidence_count?: number | null;
   community_louvain?: number | null;
   community_spectral?: number | null;
@@ -417,8 +483,12 @@ export interface GraphEdge {
 }
 
 export interface GraphResponse {
+  graph_type: GraphType;
+  schema_version: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  node_counts: Record<string, number>;
+  edge_counts: Record<string, number>;
   focus_chapter?: string | null;
 }
 
@@ -505,7 +575,7 @@ export interface CourseFileSummary {
 
 export interface GraphNodeRelation {
   relation_id: string;
-  relation_type: string;
+  relation_type: GraphRelationType;
   target_concept_id?: string | null;
   target_name: string;
   confidence: number;

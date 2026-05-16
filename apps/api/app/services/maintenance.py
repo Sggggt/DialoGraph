@@ -17,13 +17,15 @@ from app.models import (
     Course,
     Document,
     DocumentVersion,
+    GraphExtractionChunkTask,
+    GraphRelationCandidate,
     IngestionBatch,
     IngestionCompensationLog,
     IngestionJob,
     IngestionLog,
     QASession,
 )
-from app.services.concept_graph import is_valid_concept
+from app.services.concept_graph import is_valid_concept, normalize_relation_type
 from app.services.ingestion import active_batch_for_course
 from app.services.vector_store import VectorStore
 
@@ -37,12 +39,14 @@ class GraphCleanupStats:
     removed_relations: int = 0
     removed_aliases: int = 0
     removed_concepts: int = 0
+    migrated_relations: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return {
             "removed_relations": self.removed_relations,
             "removed_aliases": self.removed_aliases,
             "removed_concepts": self.removed_concepts,
+            "migrated_relations": self.migrated_relations,
         }
 
 
@@ -71,8 +75,21 @@ def cleanup_stale_graph_references(db: Session, course_id: str) -> GraphCleanupS
 
     stale_relation_ids: list[str] = []
     affected_concept_ids: set[str] = set()
+    migrated_relations = 0
     for relation in relations:
         stale = False
+        relation_type = normalize_relation_type(relation.relation_type)
+        if not relation_type:
+            stale = True
+        elif relation_type != relation.relation_type:
+            relation.relation_type = relation_type
+            metadata = dict(getattr(relation, "metadata_json", None) or {})
+            metadata["legacy_relation_type_migrated"] = True
+            relation.metadata_json = metadata
+            stats_migrated = True
+            migrated_relations += 1
+        else:
+            stats_migrated = False
         source_concept = concepts.get(relation.source_concept_id)
         target_concept = concepts.get(relation.target_concept_id or "")
         if source_concept is None or not is_valid_concept(source_concept.canonical_name):
@@ -91,10 +108,17 @@ def cleanup_stale_graph_references(db: Session, course_id: str) -> GraphCleanupS
                 for concept_id in (relation.source_concept_id, relation.target_concept_id)
                 if concept_id
             )
+        elif stats_migrated:
+            affected_concept_ids.update(
+                concept_id
+                for concept_id in (relation.source_concept_id, relation.target_concept_id)
+                if concept_id
+            )
 
     stats = GraphCleanupStats()
+    stats.migrated_relations = migrated_relations
     if stale_relation_ids:
-        stats.removed_relations = db.query(ConceptRelation).filter(ConceptRelation.id.in_(stale_relation_ids)).delete(synchronize_session=False)
+        stats.removed_relations = db.query(ConceptRelation).filter(ConceptRelation.id.in_(stale_relation_ids)).delete(synchronize_session="fetch")
 
     if affected_concept_ids:
         remaining_relations = db.scalars(
@@ -114,11 +138,17 @@ def cleanup_stale_graph_references(db: Session, course_id: str) -> GraphCleanupS
         }
         orphan_concept_ids = sorted(affected_concept_ids - still_referenced)
         if orphan_concept_ids:
-            stats.removed_aliases = db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(orphan_concept_ids)).delete(synchronize_session=False)
+            db.query(GraphRelationCandidate).filter(
+                or_(
+                    GraphRelationCandidate.source_concept_id.in_(orphan_concept_ids),
+                    GraphRelationCandidate.target_concept_id.in_(orphan_concept_ids),
+                )
+            ).delete(synchronize_session="fetch")
+            stats.removed_aliases = db.query(ConceptAlias).filter(ConceptAlias.concept_id.in_(orphan_concept_ids)).delete(synchronize_session="fetch")
             stats.removed_concepts = db.query(Concept).filter(
                 Concept.course_id == course_id,
                 Concept.id.in_(orphan_concept_ids),
-            ).delete(synchronize_session=False)
+            ).delete(synchronize_session="fetch")
 
     return stats
 
@@ -131,6 +161,8 @@ def cleanup_stale_graph(db: Session, course_id: str) -> dict[str, int]:
 
 
 def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[str, int]:
+    from app.services.ingestion import create_vector_compensation_log, mark_vector_compensation_log
+
     ensure_no_active_batch(db, course_id)
     graph_stats = cleanup_stale_graph_references(db, course_id)
 
@@ -139,7 +171,6 @@ def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[st
     )
     vector_store = VectorStore(course_name=course_name)
     stale_vector_ids = sorted(set(vector_store.list_ids(course_id)) - active_chunk_ids)
-    vector_store.delete(stale_vector_ids)
 
     inactive_document_ids = set(
         db.scalars(select(Document.id).where(Document.course_id == course_id, Document.is_active.is_(False))).all()
@@ -147,7 +178,7 @@ def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[st
     if inactive_document_ids:
         db.query(IngestionJob).filter(IngestionJob.document_id.in_(inactive_document_ids)).update(
             {"document_id": None},
-            synchronize_session=False,
+            synchronize_session="fetch",
         )
 
     inactive_version_ids = db.scalars(
@@ -158,16 +189,40 @@ def cleanup_stale_data(db: Session, course_id: str, course_name: str) -> dict[st
             or_(DocumentVersion.is_active.is_(False), Document.is_active.is_(False)),
         )
     ).all()
-    deleted_chunks = db.query(Chunk).filter(Chunk.course_id == course_id, Chunk.is_active.is_(False)).delete(synchronize_session=False)
+    inactive_chunk_ids = set(
+        db.scalars(select(Chunk.id).where(Chunk.course_id == course_id, Chunk.is_active.is_(False))).all()
+    )
+    if inactive_chunk_ids:
+        db.query(GraphExtractionChunkTask).filter(
+            GraphExtractionChunkTask.chunk_id.in_(inactive_chunk_ids)
+        ).delete(synchronize_session="fetch")
+    deleted_chunks = db.query(Chunk).filter(Chunk.course_id == course_id, Chunk.is_active.is_(False)).delete(synchronize_session="fetch")
     deleted_document_versions = (
         db.query(DocumentVersion)
         .filter(DocumentVersion.id.in_(inactive_version_ids))
-        .delete(synchronize_session=False)
+        .delete(synchronize_session="fetch")
         if inactive_version_ids
         else 0
     )
-    deleted_documents = db.query(Document).filter(Document.course_id == course_id, Document.is_active.is_(False)).delete(synchronize_session=False)
+    deleted_documents = db.query(Document).filter(Document.course_id == course_id, Document.is_active.is_(False)).delete(synchronize_session="fetch")
     db.commit()
+
+    # Delete Qdrant vectors AFTER DB commit to maintain cross-store consistency.
+    if stale_vector_ids:
+        delete_log = create_vector_compensation_log(
+            db,
+            course_id=course_id,
+            job_id=None,
+            operation="delete",
+            vector_ids=stale_vector_ids,
+            payload_json={"source": "cleanup_stale_data"},
+        )
+        try:
+            vector_store.delete(stale_vector_ids)
+            mark_vector_compensation_log(db, delete_log.id, "completed")
+        except Exception as exc:
+            mark_vector_compensation_log(db, delete_log.id, "failed", str(exc))
+            raise
 
     return {
         "deleted_vectors": len(stale_vector_ids),

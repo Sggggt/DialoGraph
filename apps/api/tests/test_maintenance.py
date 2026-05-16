@@ -157,7 +157,7 @@ def test_cleanup_stale_graph_removes_invalid_relations_and_orphans(db_session, s
         source_concept_id=keep_source.id,
         target_concept_id=keep_target.id,
         target_name=keep_target.canonical_name,
-        relation_type="supports",
+        relation_type="defines",
         evidence_chunk_id=active_chunk.id,
     )
     stale_relation = ConceptRelation(
@@ -179,8 +179,9 @@ def test_cleanup_stale_graph_removes_invalid_relations_and_orphans(db_session, s
 
     stats = cleanup_stale_graph(db_session, sample_course.id)
 
-    assert stats == {"removed_relations": 1, "removed_aliases": 2, "removed_concepts": 2}
+    assert stats == {"removed_relations": 1, "removed_aliases": 2, "removed_concepts": 2, "migrated_relations": 1}
     assert db_session.get(ConceptRelation, keep_relation_id) is not None
+    assert db_session.get(ConceptRelation, keep_relation_id).relation_type == "defined_by"
     assert db_session.get(ConceptRelation, stale_relation_id) is None
     assert db_session.get(Concept, keep_source_id) is not None
     assert db_session.get(Concept, keep_target_id) is not None
@@ -222,6 +223,31 @@ async def test_rebuild_graph_endpoint_accepts_mode_parameter(db_session, sample_
     assert response["mode"] == "incremental"
     assert response["batch_id"]
     assert response["state"] == "extracting_graph"
+
+
+@pytest.mark.asyncio
+async def test_rebuild_graph_endpoint_dry_run_has_no_batch(db_session, sample_course, monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from app.api import rebuild_graph_endpoint
+    from app.core.config import get_settings
+    from app.schemas import RebuildGraphRequest
+
+    monkeypatch.setenv("ENABLE_MODEL_FALLBACK", "false")
+    get_settings.cache_clear()
+
+    response = await rebuild_graph_endpoint(
+        BackgroundTasks(),
+        request=RebuildGraphRequest(mode="full", dry_run=True),
+        course_id=sample_course.id,
+        db=db_session,
+    )
+
+    assert response["batch_id"] is None
+    assert response["state"] == "dry_run"
+    assert response["mode"] == "full"
+    assert response["dry_run"] is True
+    assert response["affected_documents"] >= 0
 
 
 def test_delete_course_data_removes_database_vectors_and_directory(db_session, sample_course, monkeypatch):
@@ -293,3 +319,38 @@ def test_delete_course_data_removes_database_vectors_and_directory(db_session, s
     assert stats["deleted_directory"] == 1
     assert not course_root.exists()
     assert db_session.get(Course, course_id) is None
+
+
+def test_cleanup_stale_data_commits_db_before_qdrant_delete(db_session, sample_course, monkeypatch):
+    """Regression: DB commit must happen before Qdrant vector deletion to maintain cross-store consistency."""
+    from app.services import maintenance
+    from app.services.maintenance import cleanup_stale_data
+
+    operations: list[str] = []
+
+    class TrackingVectorStore:
+        def __init__(self, course_name=None):
+            self.course_name = course_name
+
+        def list_ids(self, course_id=None):
+            return ["stale-vector-1"]
+
+        def delete(self, ids):
+            operations.append("qdrant_delete")
+
+    original_commit = db_session.commit
+
+    def tracking_commit():
+        operations.append("db_commit")
+        original_commit()
+
+    monkeypatch.setattr(maintenance, "VectorStore", TrackingVectorStore)
+    monkeypatch.setattr(db_session, "commit", tracking_commit)
+
+    cleanup_stale_data(db_session, sample_course.id, sample_course.name)
+
+    db_commit_indices = [i for i, op in enumerate(operations) if op == "db_commit"]
+    qdrant_index = operations.index("qdrant_delete")
+    assert any(idx < qdrant_index for idx in db_commit_indices), (
+        f"DB commit must occur before Qdrant delete, but operations were: {operations}"
+    )

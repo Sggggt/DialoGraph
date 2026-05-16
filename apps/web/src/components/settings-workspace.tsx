@@ -37,8 +37,9 @@ type SettingsForm = {
   embedding_model: string;
   chat_model: string;
   embedding_dimensions: string;
-  graph_extraction_chunk_limit: string;
-  graph_extraction_chunks_per_document: string;
+  graph_extraction_soft_start_budget: string;
+  graph_extraction_concurrency: string;
+  graph_extraction_resume_batch_size: string;
   api_key: string;
   clear_api_key: boolean;
   embedding_api_key: string;
@@ -158,8 +159,9 @@ export function SettingsWorkspace() {
       embedding_model: settingsQuery.data.embedding_model,
       chat_model: settingsQuery.data.chat_model,
       embedding_dimensions: String(settingsQuery.data.embedding_dimensions),
-      graph_extraction_chunk_limit: String(settingsQuery.data.graph_extraction_chunk_limit ?? 72),
-      graph_extraction_chunks_per_document: String(settingsQuery.data.graph_extraction_chunks_per_document ?? 2),
+      graph_extraction_soft_start_budget: String(settingsQuery.data.graph_extraction_soft_start_budget ?? 120),
+      graph_extraction_concurrency: String(settingsQuery.data.graph_extraction_concurrency ?? 2),
+      graph_extraction_resume_batch_size: String(settingsQuery.data.graph_extraction_resume_batch_size ?? 24),
       api_key: "",
       clear_api_key: false,
       embedding_api_key: "",
@@ -206,8 +208,9 @@ export function SettingsWorkspace() {
 
   const buildPayload = (): ModelSettingsUpdate => {
     const dimensions = Number.parseInt(form.embedding_dimensions, 10);
-    const graphChunkLimit = Number.parseInt(form.graph_extraction_chunk_limit, 10);
-    const graphChunksPerDocument = Number.parseInt(form.graph_extraction_chunks_per_document, 10);
+    const graphSoftStartBudget = Number.parseInt(form.graph_extraction_soft_start_budget, 10);
+    const graphConcurrency = Number.parseInt(form.graph_extraction_concurrency, 10);
+    const graphResumeBatchSize = Number.parseInt(form.graph_extraction_resume_batch_size, 10);
     const rerankerMaxLength = Number.parseInt(form.reranker_max_length, 10);
     const semanticMinLength = Number.parseInt(form.semantic_chunking_min_length, 10);
     return {
@@ -218,8 +221,9 @@ export function SettingsWorkspace() {
       embedding_model: form.embedding_model.trim(),
       chat_model: form.chat_model.trim(),
       embedding_dimensions: Number.isFinite(dimensions) ? dimensions : undefined,
-      graph_extraction_chunk_limit: Number.isFinite(graphChunkLimit) ? graphChunkLimit : undefined,
-      graph_extraction_chunks_per_document: Number.isFinite(graphChunksPerDocument) ? graphChunksPerDocument : undefined,
+      graph_extraction_soft_start_budget: Number.isFinite(graphSoftStartBudget) ? graphSoftStartBudget : undefined,
+      graph_extraction_concurrency: Number.isFinite(graphConcurrency) ? graphConcurrency : undefined,
+      graph_extraction_resume_batch_size: Number.isFinite(graphResumeBatchSize) ? graphResumeBatchSize : undefined,
       api_key: form.api_key.trim() || null,
       clear_api_key: form.clear_api_key,
       embedding_api_key: form.embedding_api_key.trim() || null,
@@ -423,13 +427,18 @@ export function SettingsWorkspace() {
               </label>
 
               <label className="flex flex-col gap-2">
-                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">图谱最大读取片段</span>
-                <Input type="number" min={1} max={200} value={form.graph_extraction_chunk_limit} onChange={(event) => updateForm("graph_extraction_chunk_limit", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">图谱初始抽取预算</span>
+                <Input type="number" min={1} value={form.graph_extraction_soft_start_budget} onChange={(event) => updateForm("graph_extraction_soft_start_budget", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
               <label className="flex flex-col gap-2">
-                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">每文档重点片段</span>
-                <Input type="number" min={1} max={10} value={form.graph_extraction_chunks_per_document} onChange={(event) => updateForm("graph_extraction_chunks_per_document", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">图谱抽取并发数</span>
+                <Input type="number" min={1} max={8} value={form.graph_extraction_concurrency} onChange={(event) => updateForm("graph_extraction_concurrency", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
+              </label>
+
+              <label className="flex flex-col gap-2">
+                <span className="text-xs uppercase tracking-[0.24em] text-cyan-100/46">每批抽取片段数</span>
+                <Input type="number" min={1} max={100} value={form.graph_extraction_resume_batch_size} onChange={(event) => updateForm("graph_extraction_resume_batch_size", event.target.value)} className="h-12 rounded-2xl border-white/10 bg-white/[0.04] px-4 text-white" />
               </label>
 
               <label className="flex flex-col gap-2">

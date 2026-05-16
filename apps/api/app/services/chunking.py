@@ -7,6 +7,8 @@ from typing import Any
 from app.core.config import get_settings
 from app.services.parsers import ParsedSection
 from app.services.embeddings import vector_norm
+from app.services.quality.policies import ChunkQualityPolicy, QualityDecision
+from app.services.quality.signals import build_quality_signals
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
@@ -44,7 +46,7 @@ DEFAULT_CHUNK_OVERLAP = 120
 CODE_CHUNK_SIZE = 700
 CODE_CHUNK_OVERLAP = 100
 EMBEDDING_TEXT_VERSION = "metadata_enriched_v1"
-CURRENT_EMBEDDING_TEXT_VERSION = "contextual_enriched_v2"
+CURRENT_EMBEDDING_TEXT_VERSION = "contextual_enriched_v3"
 CODE_KEEP_MARKERS = ("centrality", "community", "random network", "configuration model")
 MOJIBAKE_MARKERS = ("�", "鈥", "鐩", "绗", "鍥", "灏", "瀛", "凹", "鍫")
 
@@ -304,18 +306,44 @@ def should_keep_code_chunk(section_name: str, section_title: str) -> bool:
 
 
 def should_keep_chunk(content: str, content_kind: str, section_name: str, section_title: str) -> bool:
-    normalized = normalize_for_dedup(content)
-    if content_kind == "output":
-        return False
-    if len(normalized) < 40:
-        return False
-    if mojibake_ratio(content) > 0.01:
-        return False
-    if is_toc_like(content):
-        return False
-    if content_kind == "code" and not should_keep_code_chunk(section_name, section_title):
-        return False
-    return True
+    return chunk_quality_decision(content, content_kind, section_name, section_title).action != "discard"
+
+
+def chunk_quality_decision(content: str, content_kind: str, section_name: str, section_title: str, metadata: dict | None = None) -> QualityDecision:
+    signals = build_quality_signals(
+        target_type="chunk",
+        text=content,
+        title=section_title,
+        section=section_name,
+        content_kind=content_kind,
+        metadata=metadata or {},
+        version="chunk_quality_v1",
+    )
+    return ChunkQualityPolicy().decide(signals, section_name=section_name, section_title=section_title)
+
+
+def quality_metadata(decision: QualityDecision) -> dict:
+    retention = decision.audit.get("retention_decision", {})
+    routes = decision.audit.get("route_eligibility", {})
+    return {
+        "quality_action": decision.action,
+        "quality_score": decision.score,
+        "quality_reasons": decision.reasons,
+        "quality_policy": "chunk_quality_v1",
+        "quality_profile_version": "chunk_quality_v1",
+        "quality_retain": bool(retention.get("retain", decision.action != "discard")),
+        "retention_decision": retention,
+        "route_eligibility": routes,
+        "quality_decision": {
+            "target_type": decision.target_type,
+            "action": decision.action,
+            "score": decision.score,
+            "reasons": decision.reasons,
+            "retention_decision": retention,
+            "route_eligibility": routes,
+        },
+        "quality_signals": decision.audit.get("signals", {}),
+    }
 
 
 def embedding_text(
@@ -403,7 +431,8 @@ def chunk_sections_with_stats(sections: Iterable[ParsedSection], chapter: str, s
         overlap = CODE_CHUNK_OVERLAP if content_kind == "code" else DEFAULT_CHUNK_OVERLAP
         for chunk_index, content in enumerate(split_text(section_text, unit_size, overlap), start=1):
             stats["chunks_before_filter"] += 1
-            if not should_keep_chunk(content, content_kind, section_name, section_title):
+            decision = chunk_quality_decision(content, content_kind, section_name, section_title, section.metadata)
+            if decision.action == "discard":
                 stats["chunks_filtered"] += 1
                 continue
             snippet = content[:280].strip()
@@ -421,6 +450,7 @@ def chunk_sections_with_stats(sections: Iterable[ParsedSection], chapter: str, s
                         "chunk_index": chunk_index,
                         "content_kind": content_kind,
                         "chunking_strategy": "chunk_800_metadata_enriched_v1",
+                        **quality_metadata(decision),
                         **section.metadata,
                     }),
                 }
@@ -442,7 +472,8 @@ def chunk_sections_semantic(sections: Iterable[ParsedSection], chapter: str, sou
         split_results = split_text_semantic(section_text, source_type, unit_size, overlap)
         for chunk_index, content in enumerate(split_results, start=1):
             stats["chunks_before_filter"] += 1
-            if not should_keep_chunk(content, content_kind, section_name, section_title):
+            decision = chunk_quality_decision(content, content_kind, section_name, section_title, section.metadata)
+            if decision.action == "discard":
                 stats["chunks_filtered"] += 1
                 continue
             snippet = content[:280].strip()
@@ -461,6 +492,7 @@ def chunk_sections_semantic(sections: Iterable[ParsedSection], chapter: str, sou
                         "chunk_index": chunk_index,
                         "content_kind": content_kind,
                         "chunking_strategy": strategy,
+                        **quality_metadata(decision),
                         **section.metadata,
                     }),
                 }
@@ -477,6 +509,7 @@ def chunk_sections_hierarchical(sections: Iterable[ParsedSection], chapter: str,
         section_title = normalize_text(section.title)
         section_name = normalize_text(section.section or section.title)
         content_kind = infer_content_kind(section_text, section.metadata.get("content_kind") if section.metadata else None, section.metadata)
+        parent_decision = chunk_quality_decision(section_text, content_kind, section_name, section_title, section.metadata)
 
         parent_payload = {
             "content": section_text,
@@ -492,6 +525,7 @@ def chunk_sections_hierarchical(sections: Iterable[ParsedSection], chapter: str,
                 "content_kind": content_kind,
                 "chunking_strategy": "hierarchical_parent_v2",
                 "is_parent": True,
+                **quality_metadata(parent_decision),
                 **section.metadata,
             }),
             "is_parent": True,
@@ -505,7 +539,8 @@ def chunk_sections_hierarchical(sections: Iterable[ParsedSection], chapter: str,
 
         for chunk_index, content in enumerate(split_results, start=1):
             stats["chunks_before_filter"] += 1
-            if not should_keep_chunk(content, content_kind, section_name, section_title):
+            decision = chunk_quality_decision(content, content_kind, section_name, section_title, section.metadata)
+            if decision.action == "discard":
                 stats["chunks_filtered"] += 1
                 continue
             snippet = content[:280].strip()
@@ -526,6 +561,7 @@ def chunk_sections_hierarchical(sections: Iterable[ParsedSection], chapter: str,
                     "content_kind": content_kind,
                     "chunking_strategy": strategy,
                     "is_parent": False,
+                    **quality_metadata(decision),
                     **section.metadata,
                 }),
                 "is_parent": False,
@@ -546,6 +582,7 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
         section_title = normalize_text(section.title)
         section_name = normalize_text(section.section or section.title)
         content_kind = infer_content_kind(section_text, section.metadata.get("content_kind") if section.metadata else None, section.metadata)
+        parent_decision = chunk_quality_decision(section_text, content_kind, section_name, section_title, section.metadata)
 
         parent_payload = {
             "content": section_text,
@@ -561,6 +598,7 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
                 "content_kind": content_kind,
                 "chunking_strategy": "hierarchical_parent_v2",
                 "is_parent": True,
+                **quality_metadata(parent_decision),
                 **section.metadata,
             }),
             "is_parent": True,
@@ -582,7 +620,8 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
 
         for chunk_index, content in enumerate(split_results, start=1):
             stats["chunks_before_filter"] += 1
-            if not should_keep_chunk(content, content_kind, section_name, section_title):
+            decision = chunk_quality_decision(content, content_kind, section_name, section_title, section.metadata)
+            if decision.action == "discard":
                 stats["chunks_filtered"] += 1
                 continue
             snippet = content[:280].strip()
@@ -603,6 +642,7 @@ async def chunk_sections_hierarchical_async(sections: Iterable[ParsedSection], c
                     "content_kind": content_kind,
                     "chunking_strategy": strategy,
                     "is_parent": False,
+                    **quality_metadata(decision),
                     **section.metadata,
                 }),
                 "is_parent": False,

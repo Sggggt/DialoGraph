@@ -12,6 +12,8 @@ dependencies = [
   "pydantic-settings>=2.6.1",
   "python-multipart>=0.0.19",
   "httpx>=0.28.1",
+  "charset-normalizer>=3.4.0",
+  "ftfy>=6.3.1",
   "qdrant-client>=1.12.1",
   "langchain>=1.0.0",
   "langgraph>=1.0.0",
@@ -32,6 +34,7 @@ dependencies = [
   "scipy>=1.14.0",
   "portalocker>=3.0.0",
   "jieba>=0.42.1",
+  "rapidfuzz>=3.10.0",
   "redis>=5.0.0",
   "tiktoken>=0.8.0",
 ]
@@ -63,3 +66,4 @@ markers = [
   "fallback_compat: explicitly enables local fallback paths for compatibility coverage",
 ]
 testpaths = ["tests"]
+norecursedirs = ["archived", "__pycache__", ".pytest_cache", "node_modules"]

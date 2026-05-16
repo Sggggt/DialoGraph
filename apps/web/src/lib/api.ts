@@ -14,6 +14,7 @@ import type {
   DeleteResponse,
   GraphNodeDetail,
   GraphResponse,
+  GraphType,
   IngestionBatchSummary,
   JobStatusResponse,
   ModelSettingsResponse,
@@ -21,6 +22,8 @@ import type {
   ParseUploadedFilesRequest,
   QARequest,
   QAResponse,
+  RebuildGraphRequest,
+  RebuildGraphResponse,
   RefreshResponse,
   RuntimeCheckResponse,
   SearchRequest,
@@ -165,22 +168,22 @@ export async function cleanupStaleGraph(courseId?: string | null): Promise<Clean
   return parseResponse<CleanupStaleGraphResponse>(response);
 }
 
-export async function rebuildGraph(courseId?: string | null, mode: "incremental" | "full" = "incremental"): Promise<BatchStartResponse> {
+export async function rebuildGraph(courseId?: string | null, mode: "incremental" | "full" = "incremental", dryRun = false): Promise<RebuildGraphResponse> {
   const response = await fetch(buildApiUrl("/maintenance/rebuild-graph", { course_id: courseId }), {
     method: "POST",
     headers: jsonHeaders(),
-    body: JSON.stringify({ mode }),
+    body: JSON.stringify({ mode, confirm_destructive: mode === "full" && !dryRun, dry_run: dryRun } satisfies RebuildGraphRequest),
   });
-  return parseResponse<BatchStartResponse>(response);
+  return parseResponse<RebuildGraphResponse>(response);
 }
 
-export async function fetchGraph(courseId?: string | null): Promise<GraphResponse> {
-  const response = await fetch(buildApiUrl("/courses/current/graph", { course_id: courseId }), { cache: "no-store", headers: authHeaders() });
+export async function fetchGraph(courseId: string | null | undefined, graphType: GraphType): Promise<GraphResponse> {
+  const response = await fetch(buildApiUrl("/courses/current/graph", { course_id: courseId, graph_type: graphType }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<GraphResponse>(response);
 }
 
-export async function fetchChapterGraph(chapter: string, courseId?: string | null): Promise<GraphResponse> {
-  const response = await fetch(buildApiUrl(`/graph/chapters/${encodeURIComponent(chapter)}`, { course_id: courseId }), { cache: "no-store", headers: authHeaders() });
+export async function fetchChapterGraph(chapter: string, courseId: string | null | undefined, graphType: GraphType): Promise<GraphResponse> {
+  const response = await fetch(buildApiUrl(`/graph/chapters/${encodeURIComponent(chapter)}`, { course_id: courseId, graph_type: graphType }), { cache: "no-store", headers: authHeaders() });
   return parseResponse<GraphResponse>(response);
 }
 

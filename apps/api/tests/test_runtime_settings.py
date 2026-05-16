@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 
@@ -216,3 +217,75 @@ def test_update_model_settings_updates_current_process_env(tmp_path, monkeypatch
     assert payload["embedding_model"] == "text-embedding-v3"
     assert env_path.read_text(encoding="utf-8").strip() == "EMBEDDING_MODEL=text-embedding-v3"
     assert get_settings().embedding_model == "text-embedding-v3"
+
+
+def test_update_model_settings_updates_graph_extraction_concurrency(tmp_path, monkeypatch):
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("GRAPH_EXTRACTION_CONCURRENCY=2\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
+    monkeypatch.setenv("GRAPH_EXTRACTION_CONCURRENCY", "2")
+    get_settings.cache_clear()
+
+    payload = runtime_settings.update_model_settings({"graph_extraction_concurrency": 4})
+
+    assert payload["graph_extraction_concurrency"] == 4
+    assert env_path.read_text(encoding="utf-8").strip() == "GRAPH_EXTRACTION_CONCURRENCY=4"
+    assert get_settings().graph_extraction_concurrency == 4
+
+
+def test_update_model_settings_does_not_remove_keys_when_cleared(tmp_path, monkeypatch):
+    """清除 API Key 或 resolve_ip 时，不应从 .env 中删除 key，否则会导致与 .env.example 不一致。"""
+    from app.core.config import get_settings
+    from app.services import runtime_settings
+
+    env_path = tmp_path / ".env"
+    example_path = tmp_path / ".env.example"
+    env_path.write_text(
+        "OPENAI_API_KEY=secret\nCHAT_RESOLVE_IP=1.2.3.4\nEMBEDDING_API_KEY=secret2\nEMBEDDING_RESOLVE_IP=5.6.7.8\n",
+        encoding="utf-8",
+    )
+    example_path.write_text(
+        "OPENAI_API_KEY=\nCHAT_BASE_URL=\nCHAT_RESOLVE_IP=\nEMBEDDING_API_KEY=\nEMBEDDING_BASE_URL=\nEMBEDDING_RESOLVE_IP=\nEMBEDDING_MODEL=\nCHAT_MODEL=\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runtime_settings, "ENV_PATH", env_path)
+    monkeypatch.setattr(runtime_settings, "ENV_EXAMPLE_PATH", example_path)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("CHAT_RESOLVE_IP", "1.2.3.4")
+    monkeypatch.setenv("EMBEDDING_API_KEY", "secret2")
+    monkeypatch.setenv("EMBEDDING_RESOLVE_IP", "5.6.7.8")
+    get_settings.cache_clear()
+
+    # Simulate clearing both API keys and resolve IPs
+    payload = runtime_settings.update_model_settings(
+        {
+            "chat_base_url": "https://chat.example/v1",
+            "embedding_base_url": "https://embedding.example/v1",
+            "chat_resolve_ip": None,
+            "embedding_resolve_ip": None,
+            "clear_api_key": True,
+            "clear_embedding_api_key": True,
+            "embedding_model": "text-embedding-v3",
+            "chat_model": "gpt-4",
+        }
+    )
+
+    # Keys should still be present in .env (with empty values)
+    env_text = env_path.read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY=" in env_text
+    assert "EMBEDDING_API_KEY=" in env_text
+    assert "CHAT_RESOLVE_IP=" in env_text
+    assert "EMBEDDING_RESOLVE_IP=" in env_text
+
+    # env_sync should still be consistent
+    sync = runtime_settings.env_sync_status()
+    assert sync["synced"] is True
+    assert sync["missing_keys"] == []
+    assert sync["extra_keys"] == []
+
+    get_settings.cache_clear()

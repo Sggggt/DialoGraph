@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import type { GraphNodeDetail, GraphResponse } from "@course-kg/shared";
+import type { GraphNodeDetail, GraphResponse, GraphType, SemanticEntityType } from "@course-kg/shared";
 import { motion } from "framer-motion";
 import { Boxes, ChevronDown, Expand, Lock, Minimize2, Network, RefreshCw, ScanSearch, Unlock } from "lucide-react";
 
@@ -15,10 +15,19 @@ import { useLocalStorage } from "@/hooks/use-local-storage";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 type SelectedNode = { id: string; category: string } | null;
+const graphTabs: Array<{ type: GraphType; label: string }> = [
+  { type: "semantic", label: "语义KG" },
+  { type: "structural", label: "结构图" },
+  { type: "evidence", label: "证据图" },
+];
+const entityTypes: SemanticEntityType[] = ["concept", "method", "formula", "metric", "algorithm", "definition", "theorem", "problem_type"];
+type RebuildPhase = "extraction" | "community_summary" | "completed";
 type RebuildLogEvent = {
   event: string;
   completed_graph_chunks?: number;
   total_graph_chunks?: number;
+  community_summary_count?: number;
+  total_communities?: number;
   message?: string;
   error?: string | null;
 };
@@ -41,39 +50,62 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
   const [chapterMenuOpen, setChapterMenuOpen] = useState(false);
   const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
   const [rebuildMode, setRebuildMode] = useState<"incremental" | "full">("incremental");
-  const [rebuildProgress, setRebuildProgress] = useState(0);
+  const [rebuildPhase, setRebuildPhase] = useState<RebuildPhase>("extraction");
+  const [chunkProgress, setChunkProgress] = useState(0);
+  const [communityProgress, setCommunityProgress] = useState(0);
   const [rebuildBatchId, setRebuildBatchId] = useState<string | null>(null);
   const [rebuildFailureDialog, setRebuildFailureDialog] = useState<{ title: string; message: string; details?: string | null } | null>(null);
+  const [dryRunResult, setDryRunResult] = useState<{ affectedDocuments: number; semanticEntities: number; semanticRelations: number } | null>(null);
   const [graphLogRetryCount, setGraphLogRetryCount] = useState(0);
   const [selectedCommunity, setSelectedCommunity] = useState<number | null>(null);
+  const [graphType, setGraphType] = useLocalStorage<GraphType>(`graph.type.${storageScope}`, "semantic");
+  const [selectedEntityType, setSelectedEntityType] = useLocalStorage<SemanticEntityType | "all">(`graph.entityType.${storageScope}`, "all");
   const canvasRef = useRef<NetworkCanvasHandle | null>(null);
   const fullscreenRef = useRef<HTMLDivElement | null>(null);
   const isRebuildingRef = useRef(false);
 
   const graphQuery = useQuery({
-    queryKey: ["graph", selectedCourseId, selectedChapter],
-    queryFn: () => (selectedChapter ? fetchChapterGraph(selectedChapter, selectedCourseId) : fetchGraph(selectedCourseId)),
+    queryKey: ["graph", selectedCourseId, graphType, selectedChapter],
+    queryFn: () => (selectedChapter && graphType !== "structural" ? fetchChapterGraph(selectedChapter, selectedCourseId, graphType) : fetchGraph(selectedCourseId, graphType)),
     enabled: Boolean(selectedCourseId),
   });
   const refetchGraph = graphQuery.refetch;
   const rebuildMutation = useMutation({
-    mutationFn: () => rebuildGraph(selectedCourseId, rebuildMode),
+    mutationFn: () => rebuildGraph(selectedCourseId, rebuildMode, false),
     onMutate: () => {
-      setRebuildProgress(0);
+      setRebuildPhase("extraction");
+      setChunkProgress(0);
+      setCommunityProgress(0);
       setGraphLogRetryCount(0);
       setRebuildFailureDialog(null);
+      setDryRunResult(null);
     },
     onSuccess: (data) => {
+      if (!data.batch_id) {
+        return;
+      }
       isRebuildingRef.current = true;
       setRebuildBatchId(data.batch_id);
     },
     onError: (error) => {
-      setRebuildProgress(0);
+      setRebuildPhase("extraction");
+      setChunkProgress(0);
+      setCommunityProgress(0);
       setRebuildBatchId(null);
       setRebuildDialogOpen(false);
       setRebuildFailureDialog({
         title: "图谱重建启动失败",
         message: error instanceof Error ? error.message : "图谱重建任务启动失败，后端未返回错误详情。",
+      });
+    },
+  });
+  const dryRunMutation = useMutation({
+    mutationFn: () => rebuildGraph(selectedCourseId, rebuildMode, true),
+    onSuccess: (data) => {
+      setDryRunResult({
+        affectedDocuments: data.affected_documents,
+        semanticEntities: data.semantic_entities ?? 0,
+        semanticRelations: data.semantic_relations ?? 0,
       });
     },
   });
@@ -85,20 +117,26 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
 
   const chapterOptions = useMemo(() => dashboardQuery.data?.tree.map((node) => node.title) ?? [], [dashboardQuery.data]);
   const visibleGraph = useMemo<GraphResponse | null>(() => {
-    if (!graphQuery.data || selectedCommunity === null) {
-      return graphQuery.data ?? null;
+    if (!graphQuery.data) {
+      return null;
     }
+    const data = graphQuery.data;
     const keptNodeIds = new Set(
-      graphQuery.data.nodes
-        .filter((node) => node.category !== "concept" || node.community_louvain === selectedCommunity)
+      data.nodes
+        .filter((node) => graphType !== "semantic" || selectedCommunity === null || node.category !== "semantic_entity" || node.community_louvain === selectedCommunity)
+        .filter((node) => graphType !== "semantic" || selectedEntityType === "all" || node.category !== "semantic_entity" || node.entity_type === selectedEntityType)
         .map((node) => node.id),
     );
     return {
-      ...graphQuery.data,
-      nodes: graphQuery.data.nodes.filter((node) => keptNodeIds.has(node.id)),
-      edges: graphQuery.data.edges.filter((edge) => keptNodeIds.has(String(edge.source)) && keptNodeIds.has(String(edge.target))),
+      ...data,
+      nodes: data.nodes.filter((node) => keptNodeIds.has(node.id)),
+      edges: data.edges.filter((edge) => keptNodeIds.has(String(edge.source)) && keptNodeIds.has(String(edge.target))),
     };
-  }, [graphQuery.data, selectedCommunity]);
+  }, [graphQuery.data, graphType, selectedCommunity, selectedEntityType]);
+  const selectedGraphNode = useMemo(
+    () => (selectedNode && visibleGraph ? visibleGraph.nodes.find((node) => node.id === selectedNode.id) ?? null : null),
+    [selectedNode, visibleGraph],
+  );
 
   useEffect(() => {
     const handleChange = () => {
@@ -146,7 +184,9 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
           }, graphLogStreamRetryDelayMs * retryCount);
           return;
         }
-        setRebuildProgress(0);
+        setRebuildPhase("extraction");
+        setChunkProgress(0);
+        setCommunityProgress(0);
         setRebuildDialogOpen(false);
         setRebuildBatchId(null);
         setRebuildFailureDialog({
@@ -167,18 +207,30 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
         if (item.event === "batch_graph_progress") {
           const completed = item.completed_graph_chunks ?? 0;
           const total = item.total_graph_chunks ?? 1;
-          setRebuildProgress(Math.round((completed / total) * 100));
+          setChunkProgress(Math.round((completed / total) * 100));
+          setRebuildPhase("extraction");
+        } else if (item.event === "batch_graph_community_summary") {
+          const completed = item.community_summary_count ?? 0;
+          const total = item.total_communities ?? 1;
+          setCommunityProgress(Math.round((completed / total) * 100));
+          setRebuildPhase("community_summary");
         } else if (item.event === "batch_graph_started") {
-          setRebuildProgress(0);
+          setChunkProgress(0);
+          setCommunityProgress(0);
+          setRebuildPhase("extraction");
         } else if (item.event === "graph_rebuilt" || item.event === "batch_completed") {
-          setRebuildProgress(100);
+          setChunkProgress(100);
+          setCommunityProgress(100);
+          setRebuildPhase("completed");
           setGraphLogRetryCount(0);
           refetchGraph();
           setRebuildDialogOpen(false);
           setRebuildBatchId(null);
           closeSource();
         } else if (item.event === "graph_failed" || item.event === "batch_failed") {
-          setRebuildProgress(0);
+          setRebuildPhase("extraction");
+          setChunkProgress(0);
+          setCommunityProgress(0);
           setGraphLogRetryCount(0);
           setRebuildDialogOpen(false);
           setRebuildBatchId(null);
@@ -203,7 +255,9 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
           }, graphLogStreamRetryDelayMs * retryCount);
           return;
         }
-        setRebuildProgress(0);
+        setRebuildPhase("extraction");
+        setChunkProgress(0);
+        setCommunityProgress(0);
         setRebuildDialogOpen(false);
         setRebuildBatchId(null);
         setRebuildFailureDialog({
@@ -234,9 +288,11 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
 
   const openDetail = (nodeId: string, category: string) => {
     setSelectedNode({ id: nodeId, category });
-    if (category === "concept") {
+    if (graphType === "semantic" && category === "semantic_entity") {
       setDetailNodeId(nodeId);
+      return;
     }
+    setDetailNodeId(null);
   };
 
   const toggleFullscreen = async () => {
@@ -334,13 +390,33 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
         <div className="mb-4 flex flex-wrap items-center justify-between gap-4 px-2">
           <div className="min-w-0">
             <p className="section-kicker">图谱画布</p>
-            <h2 className="mt-2 break-words text-3xl font-semibold text-white">{selectedChapter || "全课程图谱"}</h2>
+            <h2 className="mt-2 break-words text-3xl font-semibold text-white">{selectedChapter && graphType !== "structural" ? selectedChapter : "全课程图谱"}</h2>
             <p className="mt-2 max-w-3xl break-words text-sm leading-7 text-white/50">
-              单击节点只做高亮，双击概念节点打开知识详解。支持拖拽平移与滚轮缩放。
+              {graphType === "semantic" ? "单击节点只做高亮，双击语义实体打开知识详解。支持拖拽平移与滚轮缩放。" : graphType === "evidence" ? "语义实体、证据片段与文档版本分层展示，单击节点查看基础信息。" : "课程资料结构单独展示，不混入语义实体。"}
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            <div className="flex rounded-full border border-white/10 bg-white/[0.035] p-1">
+              {graphTabs.map((tab) => (
+                <button
+                  key={tab.type}
+                  type="button"
+                  onClick={() => {
+                    setSelectedNode(null);
+                    setDetailNodeId(null);
+                    setSelectedCommunity(null);
+                    if (tab.type !== "semantic") {
+                      setSelectedEntityType("all");
+                    }
+                    setGraphType(tab.type);
+                  }}
+                  className={`rounded-full px-3 py-1.5 text-xs transition ${graphType === tab.type ? "bg-cyan-300/12 text-cyan-50" : "text-white/58 hover:text-white"}`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
             <motion.button
               whileHover={{ y: -1 }}
               whileTap={{ scale: 0.98 }}
@@ -349,7 +425,9 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
               className="action-chip rounded-full px-4 py-2 text-xs uppercase tracking-[0.22em]"
               onClick={() => {
                 isRebuildingRef.current = false;
-                setRebuildProgress(0);
+                setRebuildPhase("extraction");
+                setChunkProgress(0);
+                setCommunityProgress(0);
                 setRebuildBatchId(null);
                 setGraphLogRetryCount(0);
                 setRebuildFailureDialog(null);
@@ -394,10 +472,32 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
           </div>
         </div>
 
+        {graphType === "semantic" ? (
+          <div className="mb-4 flex flex-wrap items-center gap-2 px-2">
+            <button
+              type="button"
+              onClick={() => setSelectedEntityType("all")}
+              className={`rounded-full border px-3 py-1.5 text-xs transition ${selectedEntityType === "all" ? "border-cyan-200/30 bg-cyan-300/[0.08] text-cyan-50" : "border-white/10 text-white/58 hover:text-white"}`}
+            >
+              全部实体
+            </button>
+            {entityTypes.map((entityType) => (
+              <button
+                key={entityType}
+                type="button"
+                onClick={() => setSelectedEntityType(entityType)}
+                className={`rounded-full border px-3 py-1.5 text-xs transition ${selectedEntityType === entityType ? "border-cyan-200/30 bg-cyan-300/[0.08] text-cyan-50" : "border-white/10 text-white/58 hover:text-white"}`}
+              >
+                {entityType}
+              </button>
+            ))}
+          </div>
+        ) : null}
+
         <div className={`grid min-h-0 flex-1 gap-4 ${isFullscreen ? "grid-cols-[minmax(0,1fr)_380px]" : "grid-cols-1"}`}>
           <div className="min-w-0 rounded-[24px] border border-white/8 bg-[rgba(4,9,24,0.36)] p-2">
             <NetworkCanvas
-              key={selectedChapter || "all"}
+              key={`${graphType}:${selectedChapter || "all"}`}
               ref={canvasRef}
               graph={visibleGraph}
               height={isFullscreen ? 900 : 760}
@@ -409,14 +509,18 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
 
           {(detailNodeId || isFullscreen) && (
             <aside className={`glass-panel min-w-0 ${isFullscreen ? "kg-scroll-panel rounded-[24px]" : "hidden"} p-5`}>
-              <NodeDetail
-                detailQuery={{
-                  data: detailQuery.data,
-                  isLoading: detailQuery.isLoading,
-                  error: (detailQuery.error as Error | null) ?? null,
-                }}
-                onClose={() => setDetailNodeId(null)}
-              />
+              {detailNodeId ? (
+                <NodeDetail
+                  detailQuery={{
+                    data: detailQuery.data,
+                    isLoading: detailQuery.isLoading,
+                    error: (detailQuery.error as Error | null) ?? null,
+                  }}
+                  onClose={() => setDetailNodeId(null)}
+                />
+              ) : (
+                <GraphNodeSummary node={selectedGraphNode} graphType={graphType} />
+              )}
             </aside>
           )}
         </div>
@@ -437,23 +541,37 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
         >
           <DialogHeader className="border-b border-white/8 px-6 py-5">
             <DialogTitle>确认重建图谱</DialogTitle>
-            <DialogDescription>选择重建模式：增量更新仅处理变更文档，全量重建会重新抽取整门课程。</DialogDescription>
+            <DialogDescription>全量重建会清空并重建当前课程的 Semantic KG；结构图和证据图会从持久文档与证据链重新生成。</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 px-6 py-5">
             {rebuildMutation.isPending || rebuildBatchId ? (
-              <div>
-                <div className="flex items-center justify-between gap-4 text-sm text-white/72">
-                  <span>图谱重建中，请稍候...</span>
-                  <span className="min-w-12 text-right font-mono text-cyan-100">{rebuildProgress}%</span>
+              <div className="space-y-4">
+                <div>
+                  <div className="flex items-center justify-between gap-4 text-sm text-white/72">
+                    <span className={rebuildPhase === "extraction" ? "text-white" : "text-white/40"}>图谱抽取 {rebuildPhase === "extraction" ? "进行中" : chunkProgress >= 100 ? "已完成" : "等待中"}</span>
+                    <span className="min-w-12 text-right font-mono text-cyan-100">{chunkProgress}%</span>
+                  </div>
+                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/8" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={chunkProgress}>
+                    <div
+                      className={`h-full rounded-full transition-[width] duration-700 ${rebuildPhase === "extraction" ? "bg-[linear-gradient(90deg,#64dfff,#7b7cff,#64dfff)]" : "bg-white/20"}`}
+                      style={{ width: `${chunkProgress}%` }}
+                    />
+                  </div>
                 </div>
-                <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/8" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={rebuildProgress}>
-                  <div
-                    className="h-full rounded-full bg-[linear-gradient(90deg,#64dfff,#7b7cff,#64dfff)] transition-[width] duration-700"
-                    style={{ width: `${rebuildProgress}%` }}
-                  />
+                <div>
+                  <div className="flex items-center justify-between gap-4 text-sm text-white/72">
+                    <span className={rebuildPhase === "community_summary" ? "text-white" : "text-white/40"}>社区摘要 {rebuildPhase === "community_summary" ? "生成中" : communityProgress >= 100 ? "已完成" : "等待中"}</span>
+                    <span className="min-w-12 text-right font-mono text-cyan-100">{communityProgress}%</span>
+                  </div>
+                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/8" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={communityProgress}>
+                    <div
+                      className={`h-full rounded-full transition-[width] duration-700 ${rebuildPhase === "community_summary" ? "bg-[linear-gradient(90deg,#64dfff,#7b7cff,#64dfff)]" : "bg-white/20"}`}
+                      style={{ width: `${communityProgress}%` }}
+                    />
+                  </div>
                 </div>
                 {graphLogRetryCount > 0 ? (
-                  <p className="mt-3 rounded-full border border-amber-200/14 bg-amber-300/[0.055] px-3 py-2 text-[11px] leading-5 text-amber-50/72">
+                  <p className="mt-1 rounded-full border border-amber-200/14 bg-amber-300/[0.055] px-3 py-2 text-[11px] leading-5 text-amber-50/72">
                     日志流重连 {Math.min(graphLogRetryCount, graphLogStreamMaxRetries)}/{graphLogStreamMaxRetries}
                   </p>
                 ) : null}
@@ -464,13 +582,26 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
               </p>
             ) : (
               <div className="space-y-3">
+                {dryRunResult ? (
+                  <div className="rounded-2xl border border-cyan-200/18 bg-cyan-300/[0.055] px-4 py-3 text-xs leading-5 text-cyan-50/74">
+                    Dry-run：将扫描 {dryRunResult.affectedDocuments} 份文档；当前 Semantic KG 有 {dryRunResult.semanticEntities} 个实体、{dryRunResult.semanticRelations} 条关系。未写入数据库。
+                  </div>
+                ) : null}
+                {dryRunMutation.isError ? (
+                  <div className="rounded-2xl border border-rose-200/16 bg-rose-300/[0.055] px-4 py-3 text-xs leading-5 text-rose-50/78">
+                    Dry-run 失败：{(dryRunMutation.error as Error)?.message || "未知错误"}
+                  </div>
+                ) : null}
                 <label className={`flex cursor-pointer items-start gap-3 rounded-2xl border p-4 transition ${rebuildMode === "incremental" ? "border-cyan-200/30 bg-cyan-300/[0.06]" : "border-white/10 bg-white/[0.035] hover:bg-white/[0.05]"}`}>
                   <input
                     type="radio"
                     name="rebuild-mode"
                     className="mt-1"
                     checked={rebuildMode === "incremental"}
-                    onChange={() => setRebuildMode("incremental")}
+                    onChange={() => {
+                      setRebuildMode("incremental");
+                      setDryRunResult(null);
+                    }}
                   />
                   <div>
                     <p className="text-sm font-medium text-white">增量更新（推荐）</p>
@@ -483,11 +614,14 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
                     name="rebuild-mode"
                     className="mt-1"
                     checked={rebuildMode === "full"}
-                    onChange={() => setRebuildMode("full")}
+                    onChange={() => {
+                      setRebuildMode("full");
+                      setDryRunResult(null);
+                    }}
                   />
                   <div>
                     <p className="text-sm font-medium text-white">全量重建</p>
-                    <p className="mt-1 text-xs leading-5 text-white/60">完整重建整门课程的图谱，耗时较长，会自动保留备份。</p>
+                    <p className="mt-1 text-xs leading-5 text-white/60">完整重建整门课程的 Semantic KG，耗时较长，会自动保留备份并在失败时回滚。</p>
                   </div>
                 </label>
               </div>
@@ -495,21 +629,31 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
             <div className="flex justify-end gap-2">
               <button
                 type="button"
-                disabled={rebuildMutation.isPending || Boolean(rebuildBatchId)}
+                disabled={rebuildMutation.isPending || dryRunMutation.isPending || Boolean(rebuildBatchId)}
                 onClick={() => setRebuildDialogOpen(false)}
                 className="rounded-full border border-white/12 px-4 py-2 text-sm text-white/70 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
               >
                 {rebuildMutation.isError ? "关闭" : "取消"}
               </button>
               {!rebuildMutation.isError && !rebuildMutation.isPending && !rebuildBatchId ? (
-                <button
-                  type="button"
-                  disabled={!selectedCourseId}
-                  onClick={() => rebuildMutation.mutate()}
-                  className="rounded-full border border-cyan-200/24 bg-cyan-300/[0.08] px-4 py-2 text-sm text-cyan-50/82 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
-                >
-                  确认重建
-                </button>
+                <>
+                  <button
+                    type="button"
+                    disabled={!selectedCourseId || dryRunMutation.isPending}
+                    onClick={() => dryRunMutation.mutate()}
+                    className="rounded-full border border-white/12 px-4 py-2 text-sm text-white/70 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
+                  >
+                    {dryRunMutation.isPending ? "检查中..." : "先做 dry-run"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!selectedCourseId || dryRunMutation.isPending}
+                    onClick={() => rebuildMutation.mutate()}
+                    className="rounded-full border border-cyan-200/24 bg-cyan-300/[0.08] px-4 py-2 text-sm text-cyan-50/82 transition hover:text-white disabled:pointer-events-none disabled:opacity-45"
+                  >
+                    确认重建
+                  </button>
+                </>
               ) : null}
             </div>
           </div>
@@ -528,7 +672,18 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
                 {rebuildFailureDialog.details}
               </pre>
             ) : null}
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setRebuildMode("incremental");
+                  setRebuildFailureDialog(null);
+                  rebuildMutation.mutate();
+                }}
+                className="rounded-full border border-cyan-200/24 bg-cyan-300/10 px-4 py-2 text-sm text-cyan-50 transition hover:bg-cyan-300/16"
+              >
+                继续生成图谱
+              </button>
               <button type="button" onClick={() => setRebuildFailureDialog(null)} className="rounded-full border border-rose-200/20 px-4 py-2 text-sm text-rose-50/78 transition hover:text-white">
                 关闭
               </button>
@@ -547,6 +702,7 @@ function GraphPanelContent({ selectedCourseId }: { selectedCourseId: string | nu
             }}
             onClose={() => setDetailNodeId(null)}
           />
+          {!detailNodeId ? <GraphNodeSummary node={selectedGraphNode} graphType={graphType} /> : null}
         </motion.section>
       ) : null}
     </div>
@@ -668,5 +824,39 @@ function NodeDetail({
         </div>
       )}
     </>
+  );
+}
+
+function GraphNodeSummary({ node, graphType }: { node: GraphResponse["nodes"][number] | null; graphType: GraphType }) {
+  if (!node) {
+    return (
+      <div className="mt-6 rounded-[24px] border border-white/8 bg-white/[0.03] p-5 text-sm leading-7 text-white/58">
+        选择一个节点查看当前图层中的基础信息。
+      </div>
+    );
+  }
+  const rows = [
+    ["类型", node.entity_type ?? node.category],
+    ["章节", node.chapter ?? "n/a"],
+    ["证据", node.evidence_count ?? node.support_count ?? "n/a"],
+    ["页码", node.page_number ?? "n/a"],
+    ["文档版本", node.document_version_id ?? "n/a"],
+  ];
+  return (
+    <div className="mt-6 space-y-4">
+      <div className="rounded-[24px] border border-white/8 bg-white/[0.03] p-5">
+        <p className="break-words text-xs uppercase tracking-[0.26em] text-white/45">{graphType}</p>
+        <p className="mt-3 break-words text-2xl font-semibold text-white">{node.name}</p>
+        <div className="mt-4 grid grid-cols-1 gap-2 text-sm text-white/62">
+          {rows.map(([label, value]) => (
+            <div key={label} className="flex min-w-0 items-center justify-between gap-3">
+              <span className="shrink-0 text-white/42">{label}</span>
+              <span className="min-w-0 break-words text-right">{String(value)}</span>
+            </div>
+          ))}
+        </div>
+        {node.snippet ? <p className="mt-4 break-words text-sm leading-7 text-white/68">{node.snippet}</p> : null}
+      </div>
+    </div>
   );
 }

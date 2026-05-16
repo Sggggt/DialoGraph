@@ -47,8 +47,14 @@ class Settings(BaseSettings):
     chat_model: str = "qwen-plus"
     embedding_dimensions: int = 1024
     embedding_batch_size: int = Field(default=10, ge=1, le=10)
-    graph_extraction_chunk_limit: int = Field(default=72, ge=1, le=200)
-    graph_extraction_chunks_per_document: int = Field(default=2, ge=1, le=10)
+    graph_extraction_strategy: str = "adaptive_best_first"
+    graph_extraction_soft_start_budget: int | None = Field(default=None, ge=1)
+    graph_extraction_max_input_tokens_per_run: int | None = Field(default=None, ge=1)
+    graph_extraction_max_model_calls_per_run: int | None = Field(default=None, ge=1)
+    graph_extraction_min_marginal_gain: float = Field(default=0.03, ge=0.0, le=1.0)
+    graph_extraction_stall_rounds: int = Field(default=2, ge=1, le=20)
+    graph_extraction_concurrency: int = Field(default=2, ge=1, le=8)
+    graph_extraction_resume_batch_size: int = Field(default=24, ge=1, le=100)
     enable_model_fallback: bool = False
     retrieval_recall_k_default: int = Field(default=64, ge=1, le=200)
     retrieval_recall_k_formula: int = Field(default=80, ge=1, le=200)

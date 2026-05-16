@@ -26,9 +26,15 @@ COPY apps/api/app ./app
 COPY apps/api/tests ./tests
 COPY .env.example /app/.env.example
 
-# 构建时预下载 cross-encoder 模型（如果网络可用）
-# 模型约 22MB；若构建时无网络，将在容器首次启动时自动下载
-RUN python -c "import os; os.environ['TRANSFORMERS_OFFLINE']='0'; from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512); print('Cross-encoder model pre-downloaded')" 2>/dev/null || echo "Model pre-download skipped (no network or already cached)"
+# 默认不在构建阶段访问 Hugging Face，避免常规 rebuild 卡在网络下载。
+# 如需把 reranker 模型预热进镜像，构建时传入：
+#   docker build --build-arg PRELOAD_RERANK_MODEL=true ...
+ARG PRELOAD_RERANK_MODEL=false
+RUN if [ "$PRELOAD_RERANK_MODEL" = "true" ]; then \
+      python -c "import os; os.environ['TRANSFORMERS_OFFLINE']='0'; from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512); print('Cross-encoder model pre-downloaded')"; \
+    else \
+      echo "Model pre-download skipped; set PRELOAD_RERANK_MODEL=true to bake it into the image"; \
+    fi
 
 EXPOSE 8000
 

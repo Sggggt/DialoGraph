@@ -7,11 +7,11 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import AgentRun, AgentTraceEvent, IngestionBatch, QASession
+from app.models import AgentRun, AgentTraceEvent, Concept, ConceptRelation, Document, IngestionBatch, QASession
 from app.core.config import get_settings
 from app.schemas import (
     AgentRequest,
@@ -77,9 +77,9 @@ from app.services.ingestion_logs import (
 )
 from app.services.maintenance import MaintenanceConflict, cleanup_stale_data, cleanup_stale_graph, delete_course_data
 from app.services.retrieval import (
+    evidence_first_search_chunks_with_audit,
     get_dashboard_snapshot,
     get_job_status,
-    graph_enhanced_search,
     list_course_files,
     search_chunks_with_audit,
 )
@@ -196,6 +196,23 @@ async def rebuild_graph_endpoint(
     from app.services.ingestion import active_batch_for_course
 
     course = get_requested_course(db, course_id)
+    if request.mode not in {"incremental", "full"}:
+        raise HTTPException(status_code=400, detail="mode must be incremental or full")
+    if request.mode == "full" and not request.dry_run and not request.confirm_destructive:
+        raise HTTPException(status_code=400, detail="confirm_destructive is required for full semantic KG rebuild")
+    affected_documents = db.scalar(select(func.count(Document.id)).where(Document.course_id == course.id)) or 0
+    semantic_entities = db.scalar(select(func.count(Concept.id)).where(Concept.course_id == course.id)) or 0
+    semantic_relations = db.scalar(select(func.count(ConceptRelation.id)).where(ConceptRelation.course_id == course.id)) or 0
+    if request.dry_run:
+        return {
+            "batch_id": None,
+            "state": "dry_run",
+            "mode": request.mode,
+            "affected_documents": affected_documents,
+            "dry_run": True,
+            "semantic_entities": semantic_entities,
+            "semantic_relations": semantic_relations,
+        }
     active = active_batch_for_course(db, course.id)
     if active is not None:
         raise HTTPException(status_code=409, detail=f"课程已有活跃批次：{active.id}")
@@ -209,20 +226,32 @@ async def rebuild_graph_endpoint(
     db.commit()
     db.refresh(batch)
     background_tasks.add_task(run_graph_rebuild, batch.id, course.id, request.mode)
-    return {"batch_id": batch.id, "state": "extracting_graph", "mode": request.mode}
+    return {
+        "batch_id": batch.id,
+        "state": "extracting_graph",
+        "mode": request.mode,
+        "affected_documents": affected_documents,
+        "dry_run": False,
+        "semantic_entities": semantic_entities,
+        "semantic_relations": semantic_relations,
+    }
 
 
 @router.get("/courses/current/graph", response_model=GraphResponse)
 @router.get("/courses/default/graph", response_model=GraphResponse, include_in_schema=False)
-def course_graph(course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+def course_graph(course_id: str | None = None, graph_type: str | None = None, db: Session = Depends(get_db)) -> dict:
+    if graph_type not in {"semantic", "structural", "evidence"}:
+        raise HTTPException(status_code=400, detail="graph_type is required and must be one of: semantic, structural, evidence")
     course = get_requested_course(db, course_id)
-    return get_graph_payload(db, course.id)
+    return get_graph_payload(db, course.id, graph_type=graph_type)
 
 
 @router.get("/graph/chapters/{chapter}", response_model=GraphResponse)
-def chapter_graph(chapter: str, course_id: str | None = None, db: Session = Depends(get_db)) -> dict:
+def chapter_graph(chapter: str, course_id: str | None = None, graph_type: str | None = None, db: Session = Depends(get_db)) -> dict:
+    if graph_type not in {"semantic", "structural", "evidence"}:
+        raise HTTPException(status_code=400, detail="graph_type is required and must be one of: semantic, structural, evidence")
     course = get_requested_course(db, course_id)
-    return get_graph_payload(db, course.id, chapter=chapter)
+    return get_graph_payload(db, course.id, chapter=chapter if graph_type in {"semantic", "evidence"} else None, graph_type=graph_type)
 
 
 @router.get("/graph/nodes/{concept_id}", response_model=GraphNodeDetail)
@@ -488,14 +517,18 @@ async def search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
 async def graph_search(request: SearchRequest, db: Session = Depends(get_db)) -> dict:
     course = get_requested_course(db, request.course_id)
     try:
-        results = await graph_enhanced_search(db, course.id, request.query, request.filters, request.top_k)
+        results, audit = await evidence_first_search_chunks_with_audit(
+            db,
+            course.id,
+            request.query,
+            request.filters,
+            request.top_k,
+            route="multi_hop_research",
+        )
     except Exception as exc:
         message = str(exc) or type(exc).__name__
         raise HTTPException(status_code=502, detail={"code": "graph_search_failed", "message": message}) from exc
-    model_audit = next(
-        (item.get("metadata", {}).get("model_audit") for item in results if item.get("metadata", {}).get("model_audit")),
-        {},
-    )
+    model_audit = audit
     return {"query": request.query, "results": results, "degraded_mode": is_degraded_mode(), "model_audit": model_audit}
 
 

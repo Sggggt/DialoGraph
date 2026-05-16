@@ -6,65 +6,165 @@ import pytest
 from sqlalchemy import select
 
 
-def make_chunk(chunk_id: str, document_id: str, content: str, content_kind: str = "pdf_page"):
+def make_chunk(chunk_id: str, document_id: str, content: str, content_kind: str = "pdf_page", metadata: dict | None = None):
     return SimpleNamespace(
         id=chunk_id,
         document_id=document_id,
         content=content,
         chapter="Lecture 1",
         source_type="pdf",
-        metadata_json={"content_kind": content_kind},
+        metadata_json={"content_kind": content_kind, **(metadata or {})},
     )
 
 
-def test_choose_llm_graph_chunks_spreads_across_documents(no_fallback_env):
-    from app.services.concept_graph import choose_llm_graph_chunks
-
-    chunks = [
-        make_chunk("a1", "doc-a", "short"),
-        make_chunk("a2", "doc-a", "long " * 400),
-        make_chunk("b1", "doc-b", "medium " * 120),
-        make_chunk("c1", "doc-c", "medium " * 80),
-    ]
-
-    selected = choose_llm_graph_chunks(chunks, limit=3, chunks_per_document=1)
-
-    assert len(selected) == 3
-    assert "a2" in selected
-    assert len({chunk.document_id for chunk in chunks if chunk.id in selected}) == 3
-
-
-def test_choose_llm_graph_chunks_fills_remaining_slots(no_fallback_env):
-    from app.services.concept_graph import choose_llm_graph_chunks
-
-    chunks = [
-        make_chunk("a1", "doc-a", "short"),
-        make_chunk("a2", "doc-a", "long " * 400),
-        make_chunk("a3", "doc-a", "medium " * 120),
-    ]
-
-    selected = choose_llm_graph_chunks(chunks, limit=2, chunks_per_document=1)
-
-    assert selected == {"a2", "a3"}
-
-
-def test_choose_llm_graph_chunks_uses_runtime_settings(no_fallback_env, monkeypatch):
+def test_adaptive_graph_extraction_plan_has_no_fixed_chunk_cap(no_fallback_env, monkeypatch):
     from app.core.config import get_settings
-    from app.services.concept_graph import choose_llm_graph_chunks
+    from app.services.concept_graph import plan_adaptive_graph_extraction_chunks
 
-    monkeypatch.setenv("GRAPH_EXTRACTION_CHUNK_LIMIT", "5")
-    monkeypatch.setenv("GRAPH_EXTRACTION_CHUNKS_PER_DOCUMENT", "2")
+    monkeypatch.setenv("GRAPH_EXTRACTION_SOFT_START_BUDGET", "3")
+    monkeypatch.delenv("GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN", raising=False)
+    monkeypatch.delenv("GRAPH_EXTRACTION_MAX_INPUT_TOKENS_PER_RUN", raising=False)
     get_settings.cache_clear()
     chunks = [
-        make_chunk(f"{document}-{index}", document, "content " * (50 + index))
-        for document in ("doc-a", "doc-b", "doc-c")
-        for index in range(3)
+        make_chunk(f"a-{index}", "doc-a", "Residual Network is defined as remaining capacity and augmenting path evidence. " * 8)
+        for index in range(6)
+    ] + [
+        make_chunk(f"b-{index}", "doc-b", "1 2 3 4 5 6 7 8", metadata={"quality_action": "evidence_only", "quality_retain": True})
+        for index in range(2)
+    ]
+    for chunk in chunks[:6]:
+        chunk.chapter = "Dense Chapter"
+        chunk.section = f"Dense Section {chunk.id}"
+    for chunk in chunks[6:]:
+        chunk.chapter = "Sparse Chapter"
+        chunk.section = "Sparse"
+
+    plan = plan_adaptive_graph_extraction_chunks(chunks)
+
+    assert len(plan.selected_chunk_ids) > 3
+    assert plan.budget["soft_start_budget"] == 3
+    assert plan.coverage["chapters"]["covered"] >= 2
+
+
+def test_adaptive_graph_extraction_plan_respects_optional_model_call_budget(no_fallback_env, monkeypatch):
+    from app.core.config import get_settings
+    from app.services.concept_graph import plan_adaptive_graph_extraction_chunks
+
+    monkeypatch.setenv("GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN", "2")
+    get_settings.cache_clear()
+    chunks = [
+        make_chunk(f"doc-{index}", f"doc-{index}", "Maximum Flow is defined by feasible flow and residual network. " * 10)
+        for index in range(5)
     ]
 
-    selected = choose_llm_graph_chunks(chunks)
+    plan = plan_adaptive_graph_extraction_chunks(chunks)
 
-    assert len(selected) == 5
-    assert len({chunk.document_id for chunk in chunks if chunk.id in selected}) >= 3
+    assert len(plan.selected_chunk_ids) == 2
+    assert plan.stop_reason == "model_call_budget_reached"
+
+
+def test_adaptive_specificity_threshold_uses_distribution_with_fallback():
+    from app.services.concept_graph import adaptive_specificity_threshold
+
+    fallback = adaptive_specificity_threshold([0.41, 0.52, 0.66])
+    assert fallback["enabled"] is False
+    assert fallback["threshold"] == 0.55
+    assert fallback["fallback_reason"] == "insufficient_samples"
+
+    profile = adaptive_specificity_threshold([0.42] * 5 + [0.48] * 10 + [0.72] * 10)
+    assert profile["enabled"] is True
+    assert 0.42 <= profile["threshold"] <= 0.48
+    assert profile["p25"] <= profile["p50"] <= profile["p75"]
+
+
+def test_record_entity_mention_merges_duplicate_pending_mentions(db_session, sample_course, indexed_chunks):
+    from app.models import EntityMention
+    from app.services.concept_graph import StagedConcept, _record_entity_mention
+
+    _document, chunks = indexed_chunks
+    group = StagedConcept(
+        key="edgelist::concept",
+        name="Edgelist",
+        concept_type="concept",
+        confidence=0.8,
+        evidence_spans={"edge list representation"},
+    )
+
+    _record_entity_mention(db_session, course_id=sample_course.id, chunk=chunks[0], group=group, surface="Edgelist")
+    group.confidence = 0.92
+    group.evidence_spans.add("edgelist format")
+    _record_entity_mention(db_session, course_id=sample_course.id, chunk=chunks[0], group=group, surface="Edgelist")
+
+    db_session.flush()
+    mentions = db_session.query(EntityMention).filter_by(course_id=sample_course.id, chunk_id=chunks[0].id, surface="Edgelist", entity_type="concept").all()
+
+    assert len(mentions) == 1
+    assert mentions[0].confidence == 0.92
+    assert set(mentions[0].evidence_spans) == {"edge list representation", "edgelist format"}
+
+
+@pytest.mark.asyncio
+async def test_extract_llm_graph_payloads_uses_configured_concurrency(no_fallback_env, monkeypatch):
+    from app.core.config import get_settings
+    from app.services import concept_graph
+
+    observed_values: list[int] = []
+
+    class RecordingSemaphore:
+        def __init__(self, value: int):
+            observed_values.append(value)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setenv("GRAPH_EXTRACTION_CONCURRENCY", "4")
+    get_settings.cache_clear()
+    monkeypatch.setattr(concept_graph.asyncio, "Semaphore", RecordingSemaphore)
+
+    await concept_graph.extract_llm_graph_payloads([])
+
+    assert observed_values == [4]
+
+
+def test_adaptive_graph_extraction_run_reuses_completed_chunk_payloads(db_session, sample_course, indexed_chunks, no_fallback_env):
+    from app.models import GraphExtractionChunkTask
+    from app.services.concept_graph import (
+        create_graph_extraction_run_from_plan,
+        plan_adaptive_graph_extraction_chunks,
+    )
+
+    _document, chunks = indexed_chunks
+    plan = plan_adaptive_graph_extraction_chunks(chunks)
+    first = create_graph_extraction_run_from_plan(
+        db_session,
+        course_id=sample_course.id,
+        batch_id=None,
+        chunks=chunks,
+        plan=plan,
+        profile_version="quality_profile_v1:test",
+    )
+    db_session.flush()
+    first_task = db_session.query(GraphExtractionChunkTask).filter_by(run_id=first.id).first()
+    first_task.status = "completed"
+    first_task.payload_json = {"concepts": [{"name": "Residual Network", "aliases": [], "summary": "", "concept_type": "concept", "importance_score": 0.9}], "relations": []}
+    db_session.commit()
+
+    second = create_graph_extraction_run_from_plan(
+        db_session,
+        course_id=sample_course.id,
+        batch_id=None,
+        chunks=chunks,
+        plan=plan,
+        profile_version="quality_profile_v1:test",
+    )
+    db_session.flush()
+    reused = db_session.query(GraphExtractionChunkTask).filter_by(run_id=second.id, status="completed").all()
+
+    assert reused
+    assert second.stats_json["reused_completed_chunks"] >= 1
 
 
 @pytest.mark.asyncio
@@ -73,8 +173,7 @@ async def test_rebuild_course_graph_reports_real_llm_selection_stats(db_session,
     from app.models import Chunk, Document, DocumentVersion
     from app.services import concept_graph
 
-    monkeypatch.setenv("GRAPH_EXTRACTION_CHUNK_LIMIT", "5")
-    monkeypatch.setenv("GRAPH_EXTRACTION_CHUNKS_PER_DOCUMENT", "2")
+    monkeypatch.setenv("GRAPH_EXTRACTION_MAX_MODEL_CALLS_PER_RUN", "5")
     get_settings.cache_clear()
 
     for document_index in range(3):
@@ -121,13 +220,21 @@ async def test_rebuild_course_graph_reports_real_llm_selection_stats(db_session,
     async def fake_extract_payloads(chunks, concurrency=4):
         return {chunk.id: {"concepts": [{"name": f"Concept {chunk.id}", "aliases": [], "summary": "", "concept_type": "concept", "importance_score": 0.8}], "relations": []} for chunk in chunks}
 
+    async def fake_community_summaries(db, course_id, batch_id=None):
+        return {
+            "community_summary_count": 0,
+            "community_summary_prompt_version": "community_summary_v1",
+        }
+
     monkeypatch.setattr(concept_graph, "upsert_concepts_from_chunk", fake_upsert)
     monkeypatch.setattr(concept_graph, "extract_llm_graph_payloads", fake_extract_payloads)
+    monkeypatch.setattr(concept_graph, "rebuild_graph_community_summaries", fake_community_summaries)
+    monkeypatch.setattr(concept_graph, "_backup_course_graph_tables", lambda db, cid: None)
 
     stats = await concept_graph.rebuild_course_graph(db_session, sample_course.id)
 
-    assert stats["graph_extraction_chunk_limit"] == 5
-    assert stats["graph_extraction_chunks_per_document"] == 2
+    assert stats["graph_extraction_strategy"] == "adaptive_best_first"
+    assert stats["graph_extraction_selected_chunks"] == 5
     assert stats["graph_llm_selected_chunks"] == 5
     assert stats["graph_llm_success_chunks"] == 5
     assert stats["graph_llm_source_documents"] == 3
@@ -157,13 +264,74 @@ def test_choose_graph_probe_chunks_samples_short_middle_long():
 
 
 @pytest.mark.asyncio
+async def test_rebuild_graph_community_summaries_persists_active_summary(db_session, sample_course, indexed_chunks, monkeypatch):
+    from app.models import Concept, ConceptRelation, GraphCommunitySummary
+    from app.services import concept_graph
+    from app.services.embeddings import ChatProvider
+
+    _, chunks = indexed_chunks
+    source = Concept(
+        course_id=sample_course.id,
+        canonical_name="Degree Centrality",
+        normalized_name="degree centrality",
+        evidence_count=2,
+        community_louvain=7,
+        graph_rank_score=0.9,
+    )
+    target = Concept(
+        course_id=sample_course.id,
+        canonical_name="Shortest Paths",
+        normalized_name="shortest paths",
+        evidence_count=2,
+        community_louvain=7,
+        graph_rank_score=0.8,
+    )
+    db_session.add_all([source, target])
+    db_session.flush()
+    db_session.add(
+        ConceptRelation(
+            course_id=sample_course.id,
+            source_concept_id=source.id,
+            target_concept_id=target.id,
+            target_name=target.canonical_name,
+            relation_type="used_for",
+            evidence_chunk_id=chunks[0].id,
+            confidence=0.9,
+            weight=0.9,
+            relation_source="llm",
+            is_validated=True,
+            metadata_json={"evidence_source_match": True, "evidence_target_match": True},
+        )
+    )
+    db_session.commit()
+
+    async def fake_classify_json(self, system_prompt, user_prompt, fallback=None):
+        return {
+            "summary": "Centrality community summary.",
+            "key_concepts": ["Degree Centrality", "Shortest Paths"],
+            "routing_hints": ["centrality"],
+            "quality_notes": [],
+        }
+
+    monkeypatch.setattr(ChatProvider, "classify_json", fake_classify_json)
+
+    stats = await concept_graph.rebuild_graph_community_summaries(db_session, sample_course.id)
+    db_session.commit()
+
+    assert stats["community_summary_count"] == 1
+    summary = db_session.query(GraphCommunitySummary).filter_by(course_id=sample_course.id, is_active=True).one()
+    assert summary.community_id == 7
+    assert summary.summary == "Centrality community summary."
+    assert summary.representative_chunk_ids == [chunks[0].id]
+
+
+@pytest.mark.asyncio
 async def test_rebuild_course_graph_fails_fast_when_probe_fails(db_session, sample_course, monkeypatch):
     from app.core.config import get_settings
     from app.models import Chunk, Document, DocumentVersion
     from app.services import concept_graph
 
-    monkeypatch.setenv("GRAPH_EXTRACTION_CHUNK_LIMIT", "5")
-    monkeypatch.setenv("GRAPH_EXTRACTION_CHUNKS_PER_DOCUMENT", "2")
+    monkeypatch.setenv("GRAPH_EXTRACTION_SOFT_START_BUDGET", "5")
     get_settings.cache_clear()
 
     document = Document(
@@ -216,6 +384,113 @@ async def test_rebuild_course_graph_fails_fast_when_probe_fails(db_session, samp
         await concept_graph.rebuild_course_graph(db_session, sample_course.id)
 
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_rebuild_course_graph_rolls_back_failed_backup_before_graph_delete(db_session, sample_course, monkeypatch):
+    from sqlalchemy import text
+
+    from app.models import Chunk, Concept, ConceptRelation, Document, DocumentVersion
+    from app.services import concept_graph
+
+    document = Document(
+        course_id=sample_course.id,
+        title="Lecture 1",
+        source_path="Lecture 1.pdf",
+        source_type="pdf",
+        tags=["Lecture 1"],
+        checksum="backup-failure-checksum",
+    )
+    db_session.add(document)
+    db_session.flush()
+    version = DocumentVersion(
+        document_id=document.id,
+        version=1,
+        checksum=document.checksum,
+        storage_path=document.source_path,
+        extracted_path=None,
+        is_active=True,
+    )
+    db_session.add(version)
+    db_session.flush()
+    chunk = Chunk(
+        course_id=sample_course.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        content="Residual Network is defined as remaining capacity in maximum flow. " * 8,
+        snippet="Residual Network is defined as remaining capacity.",
+        chapter="Lecture 1",
+        section="Residual Network",
+        source_type="pdf",
+        metadata_json={"content_kind": "pdf_page"},
+        embedding_status="ready",
+    )
+    chunk_two = Chunk(
+        course_id=sample_course.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        content="Maximum Flow uses residual networks to find augmenting paths. " * 8,
+        snippet="Maximum Flow uses residual networks.",
+        chapter="Lecture 1",
+        section="Maximum Flow",
+        source_type="pdf",
+        metadata_json={"content_kind": "pdf_page"},
+        embedding_status="ready",
+    )
+    old_source = Concept(course_id=sample_course.id, canonical_name="Old Source", normalized_name="old source")
+    old_target = Concept(course_id=sample_course.id, canonical_name="Old Target", normalized_name="old target")
+    db_session.add_all([chunk, chunk_two, old_source, old_target])
+    db_session.flush()
+    old_relation = ConceptRelation(
+        course_id=sample_course.id,
+        source_concept_id=old_source.id,
+        target_concept_id=old_target.id,
+        target_name=old_target.canonical_name,
+        relation_type="defined_by",
+        evidence_chunk_id=chunk.id,
+        confidence=0.9,
+        relation_source="llm",
+    )
+    db_session.add(old_relation)
+    db_session.commit()
+
+    async def fake_extract_payloads(chunks, concurrency=4, batch_id=None):
+        return {
+            item.id: {
+                "concepts": [
+                    {"name": "Residual Network", "aliases": [], "summary": "", "concept_type": "concept", "importance_score": 0.9},
+                    {"name": "Maximum Flow", "aliases": [], "summary": "", "concept_type": "concept", "importance_score": 0.9},
+                ],
+                "relations": [
+                    {"source": "Residual Network", "target": "Maximum Flow", "relation_type": "used_for", "confidence": 0.9},
+                ],
+            }
+            for item in chunks
+        }, {}
+
+    def failing_backup(db, course_id):
+        db.execute(text("SELECT * FROM definitely_missing_graph_backup_table"))
+
+    async def fake_community_summaries(db, course_id, batch_id=None):
+        return {
+            "community_summary_count": 0,
+            "community_summary_prompt_version": "community_summary_v1",
+        }
+
+    rollback_count = 0
+    original_rollback = db_session.rollback
+
+    def tracked_rollback():
+        nonlocal rollback_count
+        rollback_count += 1
+        original_rollback()
+
+    monkeypatch.setattr(concept_graph, "extract_llm_graph_payloads", fake_extract_payloads)
+    monkeypatch.setattr(concept_graph, "_backup_course_graph_tables", failing_backup)
+    monkeypatch.setattr(concept_graph, "rebuild_graph_community_summaries", fake_community_summaries)
+
+    with pytest.raises(RuntimeError, match="图谱备份失败"):
+        await concept_graph.rebuild_course_graph(db_session, sample_course.id)
 
 
 def test_invalid_chapter_refs_are_not_added_to_concepts(db_session, sample_course):
@@ -282,9 +557,9 @@ def test_merge_graph_candidates_ignores_non_text_model_fields():
                 },
             ],
             "relations": [
-                {"source": 123, "target": "Posterior Distribution", "relation_type": "relates_to", "confidence": 0.9},
+                {"source": 123, "target": "Posterior Distribution", "relation_type": "related_to", "confidence": 0.9},
                 {"source": "Posterior Distribution", "target": "Bayesian Inference", "relation_type": 5, "confidence": "bad"},
-                {"source": "Posterior Distribution", "target": "Bayesian Inference", "relation_type": "relates_to", "confidence": "bad"},
+                {"source": "Posterior Distribution", "target": "Bayesian Inference", "relation_type": "related_to", "confidence": "bad"},
             ],
         },
         {
@@ -297,17 +572,14 @@ def test_merge_graph_candidates_ignores_non_text_model_fields():
 
     assert [concept["name"] for concept in merged["concepts"]] == ["Bayesian Inference", "Posterior Distribution"]
     posterior = next(concept for concept in merged["concepts"] if concept["name"] == "Posterior Distribution")
-    assert posterior["aliases"] == ["Posterior"]
+    assert set(posterior["aliases"]) == {"Posterior", "Posterior Distribution"}
     assert posterior["concept_type"] == "concept"
     assert posterior["importance_score"] == 0.0
-    assert merged["relations"] == [
-        {
-            "source": "Posterior Distribution",
-            "target": "Bayesian Inference",
-            "relation_type": "relates_to",
-            "confidence": 0.5,
-        }
-    ]
+    assert len(merged["relations"]) == 1
+    assert merged["relations"][0]["source"] == "Posterior Distribution"
+    assert merged["relations"][0]["target"] == "Bayesian Inference"
+    assert merged["relations"][0]["source_key"] == "posterior distribution::concept"
+    assert merged["relations"][0]["target_key"] == "bayesian inference::concept"
 
 
 def test_merge_graph_candidates_treats_non_mapping_payload_as_empty():
@@ -323,19 +595,254 @@ def test_merge_graph_candidates_treats_non_mapping_payload_as_empty():
         },
     )
 
-    assert merged["concepts"] == [
-        {
-            "name": "Bayesian Inference",
-            "aliases": ["Bayesian Inference"],
-            "summary": "",
-            "concept_type": "concept",
-            "importance_score": 0.7,
-        }
-    ]
+    assert len(merged["concepts"]) == 1
+    assert merged["concepts"][0]["name"] == "Bayesian Inference"
+    assert merged["concepts"][0]["aliases"] == ["Bayesian Inference"]
+    assert merged["concepts"][0]["concept_type"] == "concept"
+    assert merged["concepts"][0]["entity_type"] == "concept"
     assert merged["relations"] == []
 
 
-def test_validate_graph_payload_drops_relations_with_unknown_endpoints():
+def test_concept_quality_filters_structural_noise_generically():
+    from app.services.concept_graph import concept_quality, is_valid_concept
+
+    context_terms = {"Unit Test Course", "Lecture 3", "Networks overview.pdf"}
+    rejected = [
+        "Chapter 1",
+        "Lecture 3",
+        "Week 2 Solutions",
+        "20260425",
+        "slides.pdf",
+        "data/storage/course/file.md",
+        "cafÃ©",
+        "Homework",
+    ]
+    for value in rejected:
+        assert concept_quality(value, context_terms)["valid"] is False, value
+
+    accepted = [
+        "Bayesian Inference",
+        "Menger's Theorem",
+        "PageRank",
+        "O(n log n)",
+        "P vs NP",
+        "残差网络",
+    ]
+    for value in accepted:
+        assert is_valid_concept(value, context_terms), value
+
+
+def test_concept_normalization_handles_general_variants():
+    from app.services.concept_graph import normalize_concept_name
+
+    assert normalize_concept_name("Minimum-Spanning_Trees") == "minimum spanning tree"
+    assert normalize_concept_name("PageRanks") == "pagerank"
+    assert normalize_concept_name("Normal–Normal Conjugacy") == "normal normal conjugacy"
+
+
+def test_concept_gate_requires_batch_evidence_and_specificity():
+    from app.services.concept_graph import StagedConcept, concept_gate_decision
+
+    chunks = [
+        make_chunk("c1", "doc-a", "Residual Network is defined as remaining capacity in maximum flow."),
+        make_chunk("c2", "doc-b", "Residual Network is used by augmenting path algorithms."),
+    ]
+    for chunk in chunks:
+        chunk.section = "Residual Network"
+        chunk.snippet = chunk.content
+
+    accepted_group = StagedConcept(
+        key="residual network",
+        name="Residual Network",
+        importance_score=0.84,
+        chunk_ids={"c1", "c2"},
+        heading_hits=1,
+        definition_hits=1,
+    )
+    accepted, audit = concept_gate_decision(accepted_group, chunks)
+
+    assert accepted is True
+    assert audit["specificity_score"] >= 0.55
+    assert audit["evidence_chunk_count"] == 2
+
+    generic_group = StagedConcept(
+        key="algorithm",
+        name="Algorithm",
+        importance_score=0.95,
+        chunk_ids={"c1", "c2"},
+        heading_hits=1,
+        definition_hits=1,
+    )
+    generic_accepted, generic_audit = concept_gate_decision(generic_group, chunks)
+
+    assert generic_accepted is False
+    assert generic_audit["gate_reason"] == "generic_low_specificity"
+
+    singleton_group = StagedConcept(
+        key="minimum cut::theorem",
+        name="Minimum Cut",
+        concept_type="theorem",
+        importance_score=0.95,
+        confidence=0.95,
+        chunk_ids={"c1"},
+        heading_hits=0,
+        definition_hits=1,
+    )
+    singleton_accepted, singleton_audit = concept_gate_decision(singleton_group, chunks)
+
+    assert singleton_accepted is True
+    assert singleton_audit["gate_reason"] == "strong_singleton_evidence"
+
+    heading_singleton_group = StagedConcept(
+        key="lecture 1::concept",
+        name="Lecture 1",
+        concept_type="concept",
+        importance_score=0.95,
+        confidence=0.95,
+        chunk_ids={"c1"},
+        heading_hits=1,
+        definition_hits=1,
+    )
+    heading_singleton_accepted, _heading_audit = concept_gate_decision(heading_singleton_group, chunks)
+
+    assert heading_singleton_accepted is False
+
+
+def test_staged_merge_combines_obvious_alias_variants():
+    from app.services.concept_graph import StagedConcept, merge_staged_concept_groups
+
+    groups = {
+        "maximum flow": StagedConcept(
+            key="maximum flow",
+            name="Maximum Flow",
+            aliases={"Max Flow"},
+            chunk_ids={"c1"},
+        ),
+        "maximum flow problem": StagedConcept(
+            key="maximum flow problem",
+            name="Maximum-Flow Problem",
+            aliases=set(),
+            chunk_ids={"c2"},
+        ),
+    }
+
+    merged, key_map = merge_staged_concept_groups(groups)
+
+    assert len(merged) == 1
+    assert key_map["maximum flow problem"] == "maximum flow"
+    group = next(iter(merged.values()))
+    assert group.chunk_ids == {"c1", "c2"}
+    assert "Maximum-Flow Problem" in group.aliases
+
+
+@pytest.mark.asyncio
+async def test_llm_verified_staged_merge_requires_structured_confidence(monkeypatch):
+    from app.services import concept_graph
+    from app.services.concept_graph import StagedConcept, apply_llm_verified_staged_merges
+
+    class FakeChatProvider:
+        async def classify_json(self, system_prompt, user_prompt, fallback=None):
+            return {
+                "should_merge": True,
+                "canonical_name": "Posterior Distribution",
+                "reason": "same statistical concept",
+                "confidence": 0.81,
+            }
+
+    class FakeFuzz:
+        @staticmethod
+        def token_set_ratio(left, right):
+            return 30
+
+        @staticmethod
+        def token_sort_ratio(left, right):
+            return 30
+
+    monkeypatch.setattr(concept_graph, "ChatProvider", FakeChatProvider)
+    monkeypatch.setattr(concept_graph, "fuzz", FakeFuzz)
+    groups = {
+        "posterior distribution": StagedConcept(
+            key="posterior distribution",
+            name="Posterior Distribution",
+            aliases=set(),
+            chunk_ids={"c1"},
+            chapter_refs={"L1"},
+        ),
+        "bayesian posterior": StagedConcept(
+            key="bayesian posterior",
+            name="Bayesian Posterior",
+            aliases=set(),
+            chunk_ids={"c1", "c2"},
+            chapter_refs={"L1"},
+        ),
+    }
+
+    merged, key_map, verified = await apply_llm_verified_staged_merges(groups)
+
+    assert verified == 1
+    assert len(merged) == 1
+    assert key_map["bayesian posterior"] == "posterior distribution"
+    group = next(iter(merged.values()))
+    assert any(item.startswith("llm:") for item in group.merged_from)
+
+
+def test_get_or_create_concept_merges_alias_variants_within_course(db_session, sample_course):
+    from app.services.concept_graph import get_or_create_concept
+
+    concept, created = get_or_create_concept(
+        db_session,
+        sample_course.id,
+        name="Minimum Spanning Tree",
+        chapter="Lecture 1",
+        summary="A tree that connects all vertices with minimum total edge weight.",
+        aliases=["MST"],
+        concept_type="concept",
+        importance_score=0.8,
+    )
+    assert created is True
+
+    same_concept, created_again = get_or_create_concept(
+        db_session,
+        sample_course.id,
+        name="minimum-spanning trees",
+        chapter="Lecture 2",
+        summary="Plural and hyphenated spelling.",
+        aliases=[],
+        concept_type="concept",
+        importance_score=0.7,
+    )
+    assert created_again is False
+    assert same_concept.id == concept.id
+    assert sorted(same_concept.chapter_refs) == ["Lecture 1", "Lecture 2"]
+
+    acronym_match, acronym_created = get_or_create_concept(
+        db_session,
+        sample_course.id,
+        name="MST",
+        chapter="Lecture 3",
+        summary="Common abbreviation.",
+        aliases=[],
+        concept_type="concept",
+        importance_score=0.6,
+    )
+    assert acronym_created is False
+    assert acronym_match.id == concept.id
+
+    separate, separate_created = get_or_create_concept(
+        db_session,
+        sample_course.id,
+        name="Minimum Cut",
+        chapter="Lecture 4",
+        summary="Different graph optimization concept.",
+        aliases=[],
+        concept_type="concept",
+        importance_score=0.6,
+    )
+    assert separate_created is True
+    assert separate.id != concept.id
+
+
+def test_validate_graph_payload_synthesizes_relation_endpoint_candidates():
     from app.services.concept_graph import validate_graph_payload
 
     payload, warnings = validate_graph_payload(
@@ -347,14 +854,15 @@ def test_validate_graph_payload_drops_relations_with_unknown_endpoints():
                 {
                     "source": "Bayesian Inference",
                     "target": "Missing Concept",
-                    "relation_type": "relates_to",
+                    "relation_type": "related_to",
                     "confidence": 0.9,
                 }
             ],
         }
     )
 
-    assert payload["relations"] == []
+    assert payload["relations"][0]["target"] == "Missing Concept"
+    assert "Missing Concept" in {concept["name"] for concept in payload["concepts"]}
     assert payload["_validation_warnings"] == warnings
     assert "Missing Concept" in warnings[0]
 
@@ -420,7 +928,7 @@ async def test_extract_llm_graph_payloads_keeps_relation_warning_out_of_failures
                     {
                         "source": "Bayesian Inference",
                         "target": "Missing Concept",
-                        "relation_type": "relates_to",
+                        "relation_type": "related_to",
                         "confidence": 0.9,
                     }
                 ],
@@ -431,7 +939,8 @@ async def test_extract_llm_graph_payloads_keeps_relation_warning_out_of_failures
     payloads, errors = await concept_graph.extract_llm_graph_payloads([make_chunk("warn", "doc-a", "content")])
 
     assert errors == {}
-    assert payloads["warn"]["relations"] == []
+    assert payloads["warn"]["relations"][0]["target"] == "Missing Concept"
+    assert "Missing Concept" in {concept["name"] for concept in payloads["warn"]["concepts"]}
     assert "Missing Concept" in payloads["warn"]["_validation_warnings"][0]
 
 
@@ -544,6 +1053,27 @@ def test_get_or_create_concept_tracks_source_document_ids(db_session, sample_cou
     assert sorted(concept2.source_document_ids) == ["doc-1", "doc-2"]
 
 
+def test_get_or_create_concept_can_allow_valid_entity_matching_chapter_context(db_session, sample_course):
+    from app.services.concept_graph import get_or_create_concept
+
+    concept, created = get_or_create_concept(
+        db_session,
+        sample_course.id,
+        "Centrality",
+        "Centralities",
+        "A graph measure family for node importance.",
+        aliases=["Centrality"],
+        concept_type="concept",
+        importance_score=0.8,
+        document_id=None,
+        context_terms=set(),
+    )
+
+    assert created is True
+    assert concept.canonical_name == "Centrality"
+    assert concept.normalized_name == "centrality::concept"
+
+
 def test_sync_graph_chapter_labels_normalizes_existing_refs(db_session, sample_course):
     from app.models import Chunk, Concept, ConceptRelation, Document, DocumentVersion
     from app.services.concept_graph import sync_graph_chapter_labels
@@ -604,7 +1134,7 @@ def test_sync_graph_chapter_labels_normalizes_existing_refs(db_session, sample_c
             source_concept_id=concept.id,
             target_concept_id=empty_ref_concept.id,
             target_name=empty_ref_concept.canonical_name,
-            relation_type="relates_to",
+            relation_type="related_to",
             evidence_chunk_id=chunk.id,
             confidence=0.9,
             extraction_method="llm",
@@ -623,3 +1153,139 @@ def test_sync_graph_chapter_labels_normalizes_existing_refs(db_session, sample_c
     assert chunk.chapter == "Lab Solutions"
     assert concept.chapter_refs == ["Lab Solutions"]
     assert empty_ref_concept.chapter_refs == ["Lab Solutions"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_graph_candidates_accumulates_support_count(db_session, sample_course, monkeypatch):
+    """Regression: StagedRelation must merge evidence across chunks so support_count > 1."""
+    from app.models import Chunk, ConceptRelation, Document, DocumentVersion
+    from app.services.concept_graph import upsert_graph_candidates_from_chunks
+
+    document = Document(
+        course_id=sample_course.id,
+        title="Test Doc",
+        source_path="test.md",
+        source_type="markdown",
+        checksum="checksum",
+        is_active=True,
+    )
+    db_session.add(document)
+    db_session.flush()
+    version = DocumentVersion(
+        document_id=document.id,
+        version=1,
+        checksum="checksum",
+        storage_path="test.md",
+        is_active=True,
+    )
+    db_session.add(version)
+    db_session.flush()
+
+    chunk1 = Chunk(
+        course_id=sample_course.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        content="Node A is related to Node B.",
+        snippet="Node A is related to Node B.",
+        chapter="Lecture 1",
+        section="Section 1",
+        source_type="markdown",
+        metadata_json={"content_kind": "markdown"},
+        embedding_status="ready",
+        is_active=True,
+    )
+    chunk2 = Chunk(
+        course_id=sample_course.id,
+        document_id=document.id,
+        document_version_id=version.id,
+        content="Node A and Node B are connected.",
+        snippet="Node A and Node B are connected.",
+        chapter="Lecture 1",
+        section="Section 2",
+        source_type="markdown",
+        metadata_json={"content_kind": "markdown"},
+        embedding_status="ready",
+        is_active=True,
+    )
+    db_session.add_all([chunk1, chunk2])
+    db_session.commit()
+
+    llm_payloads = {
+        str(chunk1.id): {
+            "concepts": [
+                {"name": "Node A", "aliases": [], "summary": "", "concept_type": "concept", "confidence": 0.8},
+                {"name": "Node B", "aliases": [], "summary": "", "concept_type": "concept", "confidence": 0.8},
+            ],
+            "relations": [
+                {"source": "Node A", "target": "Node B", "relation_type": "related_to", "confidence": 0.7},
+            ],
+        },
+        str(chunk2.id): {
+            "concepts": [
+                {"name": "Node A", "aliases": [], "summary": "", "concept_type": "concept", "confidence": 0.8},
+                {"name": "Node B", "aliases": [], "summary": "", "concept_type": "concept", "confidence": 0.8},
+            ],
+            "relations": [
+                {"source": "Node A", "target": "Node B", "relation_type": "related_to", "confidence": 0.75},
+            ],
+        },
+    }
+
+    stats = await upsert_graph_candidates_from_chunks(
+        db_session,
+        sample_course.id,
+        [chunk1, chunk2],
+        llm_payloads=llm_payloads,
+        run_llm_merge=False,
+    )
+
+    relations = db_session.scalars(
+        select(ConceptRelation).where(ConceptRelation.course_id == sample_course.id)
+    ).all()
+
+    assert len(relations) == 1
+    assert relations[0].support_count == 2
+    assert set(relations[0].source_document_ids) == {str(document.id)}
+
+
+@pytest.mark.asyncio
+async def test_rebuild_course_graph_aborts_on_backup_failure(db_session, sample_course, monkeypatch):
+    """Regression: backup failure must abort rebuild instead of silently deleting the graph."""
+    from app.services import concept_graph
+    from app.services.concept_graph import rebuild_course_graph
+
+    monkeypatch.setattr(concept_graph, "sync_graph_chapter_labels", lambda db, cid: None)
+    monkeypatch.setattr(
+        concept_graph,
+        "plan_adaptive_graph_extraction_chunks",
+        lambda chunks: SimpleNamespace(selected_chunk_ids=[], coverage={}, stop_reason="empty", budget={}),
+    )
+    import app.services.quality.profiles as quality_profiles
+    monkeypatch.setattr(
+        quality_profiles,
+        "rebuild_domain_quality_profile",
+        lambda db, cid: SimpleNamespace(version="v1"),
+    )
+    monkeypatch.setattr(
+        concept_graph,
+        "create_graph_extraction_run_from_plan",
+        lambda db, **kwargs: SimpleNamespace(id="run-1"),
+    )
+    async def fake_execute(db, **kwargs):
+        return {}, {}, {}
+
+    monkeypatch.setattr(
+        concept_graph,
+        "execute_graph_extraction_run",
+        fake_execute,
+    )
+    monkeypatch.setattr(
+        concept_graph,
+        "_backup_course_graph_tables",
+        lambda db, cid: (_ for _ in ()).throw(RuntimeError("disk full")),
+    )
+    monkeypatch.setattr(concept_graph, "enrich_course_graph", lambda db, cid: {})
+    monkeypatch.setattr(concept_graph, "rebuild_graph_community_summaries", lambda db, cid, **kw: {})
+
+    with pytest.raises(RuntimeError, match="图谱备份失败"):
+        await rebuild_course_graph(db_session, sample_course.id, batch_id=None)

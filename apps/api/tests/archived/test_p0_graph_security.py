@@ -6,10 +6,10 @@ from app.schemas import SearchFilters
 
 
 @pytest.mark.asyncio
-async def test_graph_enhanced_search_adds_one_hop_evidence_chunk(db_session, sample_course, indexed_chunks, monkeypatch):
+async def test_evidence_first_search_adds_verified_path_evidence_chunk(db_session, sample_course, indexed_chunks, monkeypatch):
     from app.models import Chunk, Concept, ConceptRelation, DocumentVersion
     from app.services import retrieval
-    from app.services.retrieval import graph_enhanced_search
+    from app.services.retrieval import evidence_first_search_chunks_with_audit
 
     document, chunks = indexed_chunks
     version = db_session.query(DocumentVersion).filter(DocumentVersion.document_id == document.id).first()
@@ -57,7 +57,14 @@ async def test_graph_enhanced_search_adds_one_hop_evidence_chunk(db_session, sam
         summary="Closeness",
         importance_score=0.7,
     )
-    db_session.add_all([source, target])
+    bridge = Concept(
+        course_id=sample_course.id,
+        canonical_name="Shortest Path Distance",
+        normalized_name="shortest path distance",
+        summary="Distance",
+        importance_score=0.6,
+    )
+    db_session.add_all([source, target, bridge])
     db_session.flush()
     db_session.add_all(
         [
@@ -69,45 +76,70 @@ async def test_graph_enhanced_search_adds_one_hop_evidence_chunk(db_session, sam
                 relation_type="related_to",
                 evidence_chunk_id=chunks[0].id,
                 confidence=0.9,
+                weight=0.9,
+                is_validated=True,
+                relation_source="llm",
+                metadata_json={"evidence_source_match": True, "evidence_target_match": True},
             ),
             ConceptRelation(
                 course_id=sample_course.id,
                 source_concept_id=target.id,
-                target_concept_id=source.id,
-                target_name=source.canonical_name,
+                target_concept_id=bridge.id,
+                target_name=bridge.canonical_name,
                 relation_type="contrasts_with",
                 evidence_chunk_id=related_chunk.id,
                 confidence=0.8,
+                weight=0.8,
+                is_validated=True,
+                relation_source="llm",
+                metadata_json={"evidence_source_match": True, "evidence_target_match": True},
             ),
         ]
     )
     db_session.commit()
 
-    async def fake_hybrid(db, course_id, query, filters, top_k):
-        return [
-            {
-                "chunk_id": chunks[0].id,
-                "snippet": chunks[0].snippet,
-                "score": 1.0,
-                "citations": [],
-                "metadata": {"scores": {"dense": 1.0}},
-                "content": chunks[0].content,
-                "document_title": document.title,
-                "source_path": document.source_path,
-                "chapter": chunks[0].chapter,
-                "source_type": chunks[0].source_type,
-            }
-        ]
+    async def fake_hybrid_with_audit(db, course_id, query, filters, top_k):
+        return (
+            [
+                {
+                    "chunk_id": chunks[0].id,
+                    "snippet": chunks[0].snippet,
+                    "score": 1.0,
+                    "citations": [],
+                    "metadata": {
+                        "scores": {"dense": 1.0, "fused": 1.0},
+                        "route_eligibility": {"retrieval": True, "graph_extraction": True},
+                    },
+                    "content": chunks[0].content,
+                    "document_title": document.title,
+                    "source_path": document.source_path,
+                    "chapter": chunks[0].chapter,
+                    "source_type": chunks[0].source_type,
+                }
+            ],
+            {"retrieval_pipeline": "base_test"},
+        )
 
-    monkeypatch.setattr(retrieval, "hybrid_search_chunks", fake_hybrid)
+    monkeypatch.setattr(retrieval, "hybrid_search_chunks_with_audit", fake_hybrid_with_audit)
 
-    results = await graph_enhanced_search(db_session, sample_course.id, "compare centrality", SearchFilters(), 2)
+    results, audit = await evidence_first_search_chunks_with_audit(
+        db_session,
+        sample_course.id,
+        "compare centrality",
+        SearchFilters(),
+        2,
+        route="multi_hop_research",
+    )
     result_ids = {item["chunk_id"] for item in results}
 
     assert chunks[0].id in result_ids
     assert related_chunk.id in result_ids
     expanded = next(item for item in results if item["chunk_id"] == related_chunk.id)
-    assert expanded["metadata"]["graph_expanded"] is True
+    assert audit["retrieval_pipeline"] == "evidence_first_v1"
+    assert audit["paths"]["planned_paths"] >= 1
+    assert expanded["metadata"]["retrieval_stage"] == "evidence_assembler"
+    assert expanded["metadata"]["evidence_role"] == "path_edge"
+    assert expanded["metadata"]["graph_verified"] is True
     assert expanded["metadata"]["parent_chunk_id"] == related_parent.id
     assert expanded["metadata"]["parent_content"] == related_parent.content
     assert expanded["metadata"]["retrieval_granularity"] == "child_with_parent_context"
@@ -116,33 +148,23 @@ async def test_graph_enhanced_search_adds_one_hop_evidence_chunk(db_session, sam
 
 
 @pytest.mark.asyncio
-async def test_hybrid_retriever_uses_graph_search_only_for_multi_hop(db_session, sample_course, monkeypatch):
+async def test_default_retriever_runs_base_retrieval_before_graph_planning(db_session, sample_course, monkeypatch):
     from app.models import AgentRun
     from app.services import agent_graph
-    from app.services.agent_graph import RetrievalExecutor as HybridRetriever
+    from app.services.agent_graph import BaseRetrieval
 
     run = AgentRun(course_id=sample_course.id, question="compare centralities", status="queued")
     db_session.add(run)
     db_session.commit()
-    calls = {"graph": 0, "hybrid": 0}
-
-    async def fake_graph(*args, **kwargs):
-        calls["graph"] += 1
-        return []
+    calls = {"hybrid": 0}
 
     async def fake_hybrid(*args, **kwargs):
         calls["hybrid"] += 1
         return []
 
-    async def fake_layered(*args, **kwargs):
-        calls["hybrid"] += 1
-        return [], {"layer": 2}
-
-    monkeypatch.setattr(agent_graph, "graph_enhanced_search", fake_graph)
     monkeypatch.setattr(agent_graph, "hybrid_search_chunks", fake_hybrid)
-    monkeypatch.setattr(agent_graph, "layered_search_chunks", fake_layered)
 
-    await HybridRetriever()(
+    await BaseRetrieval()(
         {
             "db": db_session,
             "run_id": run.id,
@@ -153,7 +175,7 @@ async def test_hybrid_retriever_uses_graph_search_only_for_multi_hop(db_session,
             "top_k": 3,
         }
     )
-    await HybridRetriever()(
+    await BaseRetrieval()(
         {
             "db": db_session,
             "run_id": run.id,
@@ -165,8 +187,7 @@ async def test_hybrid_retriever_uses_graph_search_only_for_multi_hop(db_session,
         }
     )
 
-    assert calls["graph"] == 1
-    assert calls["hybrid"] > 0
+    assert calls["hybrid"] >= 2
 
 
 def test_api_key_middleware_rejects_missing_key(monkeypatch):

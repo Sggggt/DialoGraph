@@ -16,7 +16,19 @@ const palette: Record<string, string> = {
   course: "#a5e9ff",
   chapter: "#8f97ff",
   document: "#6be2bf",
+  section: "#7dd3fc",
+  chunk: "#94a3b8",
+  semantic_entity: "#63cbff",
+  evidence_chunk: "#fbbf24",
+  document_version: "#6be2bf",
   concept: "#63cbff",
+  method: "#5eead4",
+  formula: "#facc15",
+  metric: "#fb7185",
+  algorithm: "#60a5fa",
+  definition: "#c084fc",
+  theorem: "#f59e0b",
+  problem_type: "#34d399",
 };
 const communityPalette = [
   "#5eead4",
@@ -34,10 +46,26 @@ const communityPalette = [
 ];
 
 function colorForNode(node: GraphResponse["nodes"][number]): string {
-  if (node.category === "concept" && typeof node.community_louvain === "number") {
+  if (node.category === "semantic_entity" && typeof node.community_louvain === "number") {
     return communityPalette[Math.abs(node.community_louvain) % communityPalette.length];
   }
+  if (node.category === "semantic_entity" && node.entity_type) {
+    return palette[node.entity_type] ?? palette.semantic_entity;
+  }
   return palette[node.category] ?? "#63cbff";
+}
+
+function symbolSizeForNode(node: GraphResponse["nodes"][number]): number {
+  if (node.category === "semantic_entity") {
+    return 14 + Math.min(26, Math.max((node.value ?? 2) * 0.75, (node.centrality_score ?? 0) * 48, (node.graph_rank_score ?? 0) * 34));
+  }
+  if (node.category === "evidence_chunk" || node.category === "chunk") {
+    return 10 + Math.min(10, (node.value ?? 1) * 2);
+  }
+  if (node.category === "document" || node.category === "document_version") {
+    return 16;
+  }
+  return 20;
 }
 
 export type NetworkCanvasHandle = {
@@ -99,7 +127,7 @@ type RuntimeChart = {
   getViewOfSeriesModel?: (seriesModel: RuntimeSeriesModel) => RuntimeGraphView | undefined;
 };
 
-function buildBaseOption(graph: GraphResponse): EChartsOption {
+export function buildBaseOption(graph: GraphResponse): EChartsOption {
   return {
     animationDuration: 420,
     animationEasing: "cubicOut",
@@ -169,18 +197,13 @@ function buildBaseOption(graph: GraphResponse): EChartsOption {
           ...node,
           draggable: true,
           fixed: false,
-          symbolSize:
-            node.category === "concept"
-              ? 14 + Math.min(26, Math.max((node.value ?? 2) * 0.75, (node.centrality_score ?? 0) * 48, (node.graph_rank_score ?? 0) * 34))
-              : node.category === "document"
-                ? 16
-                : 20,
+          symbolSize: symbolSizeForNode(node),
           itemStyle: {
             color: colorForNode(node),
-            borderWidth: node.category === "concept" && (node.centrality_score ?? 0) > 0.18 ? 1.8 : 0.8,
-            borderColor: node.category === "concept" && (node.centrality_score ?? 0) > 0.18 ? "rgba(255,255,255,0.72)" : "rgba(255,255,255,0.14)",
-            shadowBlur: node.category === "concept" ? 10 + Math.min(16, (node.centrality_score ?? 0) * 44) : 7,
-            shadowColor: node.category === "concept" ? "rgba(255, 255, 255, 0.16)" : "rgba(99, 203, 255, 0.08)",
+            borderWidth: node.category === "semantic_entity" && (node.centrality_score ?? 0) > 0.18 ? 1.8 : 0.8,
+            borderColor: node.category === "semantic_entity" && (node.centrality_score ?? 0) > 0.18 ? "rgba(255,255,255,0.72)" : "rgba(255,255,255,0.14)",
+            shadowBlur: node.category === "semantic_entity" ? 10 + Math.min(16, (node.centrality_score ?? 0) * 44) : 7,
+            shadowColor: node.category === "semantic_entity" ? "rgba(255, 255, 255, 0.16)" : "rgba(99, 203, 255, 0.08)",
           },
           label: {
             color: "#dff7ff",
