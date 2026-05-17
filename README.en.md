@@ -1,14 +1,14 @@
 **English** | [中文](./README.md)
 
 <p align="center">
-  <img src="./assets/diagraph-logo.svg" alt="DialoGraph logo" width="132" height="132">
+  <img src="./assets/diagraph-logo.svg" alt="SymboGraph logo" width="132" height="132">
 </p>
 
-<h1 align="center">DialoGraph</h1>
+<h1 align="center">SymboGraph</h1>
 
-DialoGraph is a general-purpose GraphRAG knowledge infrastructure for local private documents. The system parses PDFs, slides, documents, web pages, Notebooks, images, and Markdown into searchable text chunks, Qdrant dense vectors, PostgreSQL sparse knowledge graphs, and citation-backed question-answering results. Whether your materials are in Chinese or English, the system retrieves them uniformly; all data stays local without uploading to third parties.
+SymboGraph is a general-purpose GraphRAG knowledge infrastructure for local private documents. The system parses PDFs, slides, documents, web pages, Notebooks, images, and Markdown into searchable text chunks, Qdrant dense vectors, PostgreSQL sparse knowledge graphs, and citation-backed question-answering results. Whether your materials are in Chinese or English, the system retrieves them uniformly; all data stays local without uploading to third parties.
 
-As a general GraphRAG platform, DialoGraph's knowledge-base concept is not limited to any single document type—you can use it for course materials, research literature, technical manuals, legal contracts, or any text collection that requires structured decomposition and semantic linking.
+As a general GraphRAG platform, SymboGraph's knowledge-base concept is not limited to any single document type—you can use it for course materials, research literature, technical manuals, legal contracts, or any text collection that requires structured decomposition and semantic linking.
 
 ## At A Glance
 
@@ -163,7 +163,7 @@ Ingestion detects duplicates by knowledge base, normalized title, and checksum. 
 
 ## Quality System
 
-DialoGraph incorporates a four-tier quality architecture—Signals, Policies, Profiles, and Judge—for differentiated tiered filtering and adaptive routing of chunks, concepts, and relations. The quality system is not a simple pass/fail binary; it computes multidimensional signals for each object, outputs structured decisions, and allows downstream pipelines to take different actions based on the decision.
+SymboGraph incorporates a four-tier quality architecture—Signals, Policies, Profiles, and Judge—for differentiated tiered filtering and adaptive routing of chunks, concepts, and relations. The quality system is not a simple pass/fail binary; it computes multidimensional signals for each object, outputs structured decisions, and allows downstream pipelines to take different actions based on the decision.
 
 ```mermaid
 flowchart LR
@@ -219,7 +219,7 @@ $$S_{\text{relation}} = 0.40 \cdot c + 0.25 \cdot \mathbf{1}_{\text{src}} + 0.25
 
 Where *c* is LLM confidence, **1**<sub>src</sub> / **1**<sub>tgt</sub> indicate whether the source/target concept appears in the evidence text. `inferred` or `related_to` relations are forced to `candidate_only`.
 
-> **Design Intent (Why we do this)**: Traditional RAG/GraphRAG systems often apply only coarse-grained filtering before graph construction, allowing TOC pages, garbled text, and repeated extraction noise to pollute the vector store and knowledge graph. DialoGraph's tiered quality routing sends different content types to their proper destinations—noise is discarded, structural labels are summary-only, high-semantic-density blocks join the graph, and ordinary blocks handle retrieval—guaranteeing downstream quality from the data source.
+> **Design Intent (Why we do this)**: Traditional RAG/GraphRAG systems often apply only coarse-grained filtering before graph construction, allowing TOC pages, garbled text, and repeated extraction noise to pollute the vector store and knowledge graph. SymboGraph's tiered quality routing sends different content types to their proper destinations—noise is discarded, structural labels are summary-only, high-semantic-density blocks join the graph, and ordinary blocks handle retrieval—guaranteeing downstream quality from the data source.
 
 ### 3. Profile Layer (Domain Quality Profile)
 
@@ -245,7 +245,7 @@ The judge layer is an optional LLM-as-judge enhancement:
 
 ## Graph Construction
 
-DialoGraph builds graphs with an evidence-first policy: the LLM produces candidate entities and explicit relations, while chunk vectors and graph algorithms decide the final structure. PostgreSQL is the source of truth for the sparse graph; Qdrant provides chunk vectors and similarity signals. All candidates are filtered by the quality system's concept and relation policies before persistence.
+SymboGraph builds graphs with an evidence-first policy: the LLM produces candidate entities and explicit relations, while chunk vectors and graph algorithms decide the final structure. PostgreSQL is the source of truth for the sparse graph; Qdrant provides chunk vectors and similarity signals. All candidates are filtered by the quality system's concept and relation policies before persistence.
 
 ```mermaid
 flowchart LR
@@ -329,7 +329,7 @@ The frontend colors graph nodes by Louvain community, sizes nodes by centrality 
 
 ## Retrieval And QA
 
-DialoGraph's QA pipeline uses a **Perception → Retrieval Planning → Base Retrieval → Evidence Navigation → EvidenceEvaluator → Generation** evidence-first agent architecture orchestrated by LangGraph. Every node writes to `agent_trace_events`, and the frontend renders the live trace via SSE.
+SymboGraph's QA pipeline uses a **Perception → Retrieval Planning → Base Retrieval → Evidence Navigation → EvidenceEvaluator → Generation** evidence-first agent architecture orchestrated by LangGraph. Every node writes to `agent_trace_events`, and the frontend renders the live trace via SSE.
 
 ```mermaid
 flowchart LR
@@ -437,7 +437,7 @@ The cross-lingual bridge gate solves a critical problem: a Chinese query "最大
 
 ### EvidenceEvaluator
 
-**Before answer generation**, the EvidenceEvaluator assesses whether retrieved evidence is sufficient. This is DialoGraph's **pre-generation reflection** mechanism:
+**Before answer generation**, the EvidenceEvaluator assesses whether retrieved evidence is sufficient. This is SymboGraph's **pre-generation reflection** mechanism:
 
 For each graded document, extract `grade_score` and compute:
 
@@ -702,10 +702,10 @@ Validation focus:
 
 ## Core Innovations
 
-DialoGraph's core innovations in the general GraphRAG direction can be summarized in six points:
+SymboGraph's core innovations in the general GraphRAG direction can be summarized in six points:
 
 **1. Four-Tier Adaptive Quality Architecture**
-Unlike traditional systems with single-threshold filtering, DialoGraph establishes a signal-policy-profile-judge four-tier quality system. Chunks are no longer limited to "keep/discard" binary fates; instead, they are routed to one of six downstream paths (`discard`, `summary_only`, `evidence_only`, `retrieval_candidate`, `graph_candidate`, `embed_only`). Concepts and relations undergo differentiated policy filtering as well. Domain quality profiles give each knowledge base an adaptive quality baseline rather than relying on global fixed thresholds.
+Unlike traditional systems with single-threshold filtering, SymboGraph establishes a signal-policy-profile-judge four-tier quality system. Chunks are no longer limited to "keep/discard" binary fates; instead, they are routed to one of six downstream paths (`discard`, `summary_only`, `evidence_only`, `retrieval_candidate`, `graph_candidate`, `embed_only`). Concepts and relations undergo differentiated policy filtering as well. Domain quality profiles give each knowledge base an adaptive quality baseline rather than relying on global fixed thresholds.
 
 **2. Concept Vector Centroidization and Dynamic Sparse Graph Construction**
 Concept vectors are generated as centroids of their supporting chunk vectors, not by embedding the LLM-extracted concept name directly, fundamentally eliminating concept drift. The dynamic R-NN + K-NN sparse graph algorithm applies bidirectional send/receive limits based on evidence volume *m*<sub>i</sub> and chapter coverage *r*<sub>i</sub>, guaranteeing near-linear edge growth with node count and naturally suppressing the Hubness Problem.

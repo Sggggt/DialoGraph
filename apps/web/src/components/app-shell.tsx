@@ -80,7 +80,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <aside className="fixed inset-y-0 left-0 z-40 hidden w-[76px] border-r border-white/7 bg-[rgba(3,7,20,0.55)] backdrop-blur-2xl lg:flex lg:flex-col lg:items-center lg:gap-7 lg:py-6">
         <Image
           src="/diagraph-logo.svg"
-          alt="DialoGraph"
+          alt="SymboGraph"
           width={44}
           height={44}
           className="size-11 rounded-2xl border border-white/10 shadow-[0_0_28px_rgba(255,255,255,0.12)]"
@@ -123,7 +123,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <div className="flex min-w-0 items-center gap-3">
               <Image
                 src="/diagraph-logo.svg"
-                alt="DialoGraph"
+                alt="SymboGraph"
                 width={44}
                 height={44}
                 className="size-11 shrink-0 rounded-2xl border border-white/10 shadow-[0_0_28px_rgba(255,255,255,0.1)] lg:hidden"
